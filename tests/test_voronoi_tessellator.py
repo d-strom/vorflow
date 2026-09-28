@@ -4,7 +4,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from vorflow.blueprint import ConceptualMesh
@@ -471,3 +471,34 @@ def test_missing_embed_values_are_treated_as_embedded():
     grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate()
 
     assert set(grid["zone_id"]) == {42}
+
+
+def test_multipart_clip_keeps_node_ids_unique():
+    """Catches clip-then-explode duplicating node_id when a cell reaches across a notch."""
+    cm = ConceptualMesh()
+    u_shape = Polygon([(0, 0), (3, 0), (3, 3), (2, 3), (2, 1), (1, 1), (1, 3), (0, 3)])
+    cm.add_polygon(u_shape, zone_id=7)
+    clean_polys, _, _ = cm.generate()
+    # Node 3 sits in the left prong but its raw cell also covers most of the
+    # empty right prong, so clipping yields a larger detached part.
+    nodes = np.array([[1.2, 0.6], [0.3, 1.7], [0.9, 2.0], [0.6, 2.8], [1.1, 0.3]])
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate()
+
+    assert grid["node_id"].is_unique
+    assert (grid.geom_type == "Polygon").all()
+    assert grid.geometry.area.sum() == pytest.approx(u_shape.area)
+    fresh_ids = sorted(set(grid["node_id"]) - set(tags))
+    assert len(fresh_ids) >= 1
+    assert fresh_ids == list(range(6, 6 + len(fresh_ids)))
+    generator_cell = grid[grid["node_id"] == 3].iloc[0]
+    assert generator_cell.geometry.covers(Point(0.9, 2.0))
+    assert (generator_cell["x"], generator_cell["y"]) == (0.9, 2.0)
+    detached = grid[grid.geometry.covers(Point(2.5, 2.3))].iloc[0]
+    assert detached["node_id"] in fresh_ids
+    assert detached.geometry.area > generator_cell.geometry.area
+    assert detached["x"] == pytest.approx(detached.geometry.centroid.x)
+    assert detached["y"] == pytest.approx(detached.geometry.centroid.y)
+    assert detached["zone_id"] == 7

@@ -13,6 +13,43 @@ from shapely.validation import make_valid
 logger = logging.getLogger(__name__)
 
 
+def _primary_piece_position(pieces, generator):
+    """Return the position of the piece that keeps the node_id: the largest covering the generator, else the largest."""
+    covering = [i for i, piece in enumerate(pieces) if piece.covers(generator)]
+    candidates = covering if covering else range(len(pieces))
+    return max(candidates, key=lambda i: pieces[i].area)
+
+
+def _explode_with_unique_ids(grid_gdf):
+    """Explode multipart cells into polygons, giving every non-primary part a fresh node_id."""
+    exploded = grid_gdf.explode(index_parts=False)
+    # GeometryCollections from clipping can carry line/point slivers; drop them.
+    exploded = exploded[exploded.geom_type == 'Polygon'].reset_index(drop=True)
+    duplicated = exploded['node_id'].duplicated(keep=False).to_numpy()
+    if not duplicated.any():
+        return exploded
+
+    secondary = []
+    for _, group in exploded[duplicated].groupby('node_id', sort=False):
+        pieces = list(group.geometry)
+        generator = Point(float(group['x'].iloc[0]), float(group['y'].iloc[0]))
+        primary = _primary_piece_position(pieces, generator)
+        secondary.extend(label for i, label in enumerate(group.index) if i != primary)
+
+    # Python ints avoid NumPy scalar overflow for large (e.g. uint64) node IDs.
+    node_ids = exploded['node_id'].to_numpy(copy=True)
+    max_id = int(node_ids.max())
+    new_ids = [max_id + 1 + i for i in range(len(secondary))]
+    node_ids[secondary] = np.array(new_ids, dtype=node_ids.dtype)
+    exploded['node_id'] = node_ids
+    # Detached parts have no generator of their own, so x/y fall back to the centroid.
+    centroids = exploded.geometry.iloc[secondary].centroid
+    exploded.loc[secondary, 'x'] = centroids.x.to_numpy()
+    exploded.loc[secondary, 'y'] = centroids.y.to_numpy()
+    logger.info(f"  -> Re-numbered {len(secondary)} detached cell parts")
+    return exploded
+
+
 class VoronoiTessellator:
     def __init__(
         self,
@@ -557,15 +594,16 @@ class VoronoiTessellator:
         
         logger.info(f"  -> Zones Assigned: {len(zoned_grid)}")
         
-        # Clipping can sometimes create MultiPolygons; explode them into single parts.
-        zoned_grid = zoned_grid.explode(index_parts=True).reset_index(drop=True)
-        
+        # Clipping can create MultiPolygons; explode them into single parts
+        # while keeping node_id unique (it is the merge key for zones).
+        zoned_grid = _explode_with_unique_ids(zoned_grid)
+
         # Enforce barriers by splitting cells.
         self.final_grid = self._enforce_barriers(zoned_grid)
         logger.info(f"  -> After Barrier Cuts: {len(self.final_grid)}")
-        
+
         # Final cleanup after potential splits.
-        self.final_grid = self.final_grid.explode(index_parts=True).reset_index(drop=True)
+        self.final_grid = _explode_with_unique_ids(self.final_grid)
 
         # The 'x' and 'y' columns should always refer to the generator point
         # coordinates, which are essential for quality analysis. We add separate
