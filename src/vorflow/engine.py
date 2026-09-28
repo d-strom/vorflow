@@ -1,3 +1,24 @@
+"""Gmsh meshing engine: clean ConceptualMesh features -> 2D triangular/quad mesh.
+
+Geometry transfer (``MeshGenerator._build_occ_model``) runs in a fixed order,
+because the order in which OCC entities are created determines their tags:
+
+1. point features;
+2. protection corridors, the barrier zone and quad-buffer plans (pure
+   geometry, see ``vorflow.buffer``);
+3. lines: quad-buffer strip surfaces, straddle point pairs for barrier and
+   straddle lines, or plain curves trimmed off the barrier zone;
+4. polygons: quad-buffer bands first, then every embedded polygon minus the
+   buffer footprints; field-only (embed=False) polygons are deferred;
+5. ``fragment`` + ``removeAllDuplicates`` (+ optional ``healShapes``), with
+   the fragment map remapped by coordinates wherever OCC renumbers entities;
+6. deferred field-only polygons, the rebuilt feature map, orphan-surface
+   recovery and the transfinite/recombine buffer constraints.
+
+The resulting ``gmsh_map`` (feature id -> dimtags, per kind) drives
+``_embed_features`` and ``_setup_fields``; the quad-buffer crossings are
+passed on to ``_setup_fields`` as Ball refinement fields.
+"""
 from __future__ import annotations
 
 import logging
@@ -120,6 +141,43 @@ def _assign_zones_to_elements(grid, zones_gdf):
     if "z_order" in joined.columns:
         merge_cols.append("z_order")
     return grid.merge(joined[merge_cols], on="element_tag", how="left")
+
+
+def _accumulate_nodes(dim, ent_tag, tag_to_xy):
+    """Add the (x, y) of an entity's mesh nodes, boundary included, to ``tag_to_xy`` (first seen wins)."""
+    nt, nc, _ = gmsh.model.mesh.getNodes(dim, int(ent_tag), includeBoundary=True)
+    if len(nt) == 0:
+        return
+    pts = np.array(nc, dtype=float).reshape(-1, 3)
+    for t, p in zip(nt, pts):
+        tt = int(t)
+        if tt not in tag_to_xy:
+            tag_to_xy[tt] = (float(p[0]), float(p[1]))
+
+
+def _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
+    """Yield (dim, tag) of embedded point features, line curves and straddle points."""
+    if clean_points is not None and not clean_points.empty and 'embed' in clean_points.columns:
+        for fid, row in clean_points.iterrows():
+            if not is_embedded(row):
+                continue
+            for dimtag in gmsh_map.get('points', {}).get(int(fid), []):
+                if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
+                    yield 0, int(dimtag[1])
+
+    if clean_lines is not None and not clean_lines.empty and 'embed' in clean_lines.columns:
+        for fid, row in clean_lines.iterrows():
+            if not is_embedded(row):
+                continue
+            if int(fid) in gmsh_map.get('lines', {}):
+                for dimtag in gmsh_map['lines'][int(fid)]:
+                    if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 1:
+                        yield 1, int(dimtag[1])
+            # Straddle/barrier lines are represented by point pairs.
+            elif int(fid) in gmsh_map.get('straddle_points', {}):
+                for dimtag in gmsh_map['straddle_points'][int(fid)]:
+                    if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
+                        yield 0, int(dimtag[1])
 
 
 # gmsh_map key for each fragment-input kind recorded in _GeometryInventory.
@@ -318,13 +376,9 @@ class MeshGenerator:
         standalone entities, but they are not part of the deliverable mesh and
         must not pollute element/quality/node collection.
         """
-        def is_embedded_row(row):
-            val = row.get('embed', True)
-            return True if pd.isna(val) else bool(val)
-
         if clean_polys is not None and not clean_polys.empty:
             if 'embed' in clean_polys.columns:
-                poly_ids = [int(i) for i, r in clean_polys.iterrows() if is_embedded_row(r)]
+                poly_ids = [int(i) for i, r in clean_polys.iterrows() if is_embedded(r)]
             else:
                 poly_ids = [int(i) for i in clean_polys.index]
         else:
@@ -2466,120 +2520,26 @@ class MeshGenerator:
             gmsh_map, crossings = self._build_occ_model(
                 clean_polys, clean_lines, clean_points, launch_gmsh_gui=launch_gmsh_gui
             )
-            
+
             # Ensure features are correctly embedded in surfaces before meshing
             self._embed_features(gmsh_map, clean_polys, clean_lines, clean_points)
-
             self._log_post_embed_diagnostics(gmsh_map)
 
             logger.info("Setting up Resolution Fields...")
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points, crossings=crossings)
-            
-            # Set the core meshing algorithm.
-            gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm) 
-            
-            # Set the number of internal smoothing steps.
-            gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
 
-            # Tolerance for the initial Delaunay insertion — helps with
-            # "Could not insert point" from near-degenerate geometry.
-            gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", self.tolerance_initial_delaunay)
-
-            logger.info("Generating Triangular Mesh...")
-            gmsh.model.mesh.generate(2)
-            
-            # Run explicit optimization passes after generation for higher quality.
-            if self.optimization_cycles > 0:
-                if self._verbosity > 0:
-                    logger.info(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
-                
-                for i in range(self.optimization_cycles):
-                    if self._verbosity > 1:
-                        logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
-                    # Moves nodes to improve element shape (compactness).
-                    gmsh.model.mesh.optimize("Relocate2D",niter=1)
-                    # Smooths the mesh to relax gradients (reduces drift).
-                    gmsh.model.mesh.optimize("Laplace2D",niter=1)
+            self._mesh_2d()
 
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
             self.triangular_quality = self._collect_triangular_quality(meshed_surface_tags)
             self._element_data = self._capture_element_data(meshed_surface_tags)
-            
+
             if output_file:
                 gmsh.write(output_file)
 
-            # --- Node extraction (domain-only) ---
-            # Do NOT use gmsh.model.mesh.getNodes() without args here.
-            # That returns nodes from all entities, including standalone 1D meshes
-            # on curves (e.g. field-only rivers) and any non-fragmented 2D surfaces.
-            # Those extra nodes can unintentionally constrain downstream Voronoi
-            # tessellation.
-
-            def _is_embedded_row(row) -> bool:
-                val = row.get('embed', True)
-                if pd.isna(val):
-                    return True
-                return bool(val)
-
-            def _accumulate_nodes(dim: int, ent_tag: int, include_boundary: bool, tag_to_xy: dict[int, tuple[float, float]]):
-                nt, nc, _ = gmsh.model.mesh.getNodes(dim, int(ent_tag), includeBoundary=bool(include_boundary))
-                if len(nt) == 0:
-                    return
-                pts = np.array(nc, dtype=float).reshape(-1, 3)
-                for t, p in zip(nt, pts):
-                    tt = int(t)
-                    if tt not in tag_to_xy:
-                        tag_to_xy[tt] = (float(p[0]), float(p[1]))
-
-            tag_to_xy: dict[int, tuple[float, float]] = {}
-
-            # 1) Surfaces of the meshed domain: embedded polygons plus
-            # straddle/structured-buffer strips (their nodes are Voronoi
-            # generators too). Field-only surfaces are excluded.
-            domain_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
-
-            # If we cannot determine domain surfaces from the map, fall back to
-            # all 2D nodes (still avoids 1D-only nodes).
-            if not domain_surface_tags:
-                node_tags, coords, _ = gmsh.model.mesh.getNodes(2, -1, includeBoundary=True)
-                nodes_3d = np.array(coords, dtype=float).reshape(-1, 3)
-                self.nodes = nodes_3d[:, :2]
-                self.node_tags = node_tags
-            else:
-                for s in domain_surface_tags:
-                    _accumulate_nodes(2, s, True, tag_to_xy)
-
-                # 2) Embedded constraints (optional safety)
-                if clean_points is not None and not clean_points.empty and 'embed' in clean_points.columns:
-                    for fid, row in clean_points.iterrows():
-                        if not _is_embedded_row(row):
-                            continue
-                        if int(fid) in gmsh_map.get('points', {}):
-                            for dimtag in gmsh_map['points'][int(fid)]:
-                                if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
-                                    _accumulate_nodes(0, int(dimtag[1]), True, tag_to_xy)
-
-                if clean_lines is not None and not clean_lines.empty and 'embed' in clean_lines.columns:
-                    for fid, row in clean_lines.iterrows():
-                        if not _is_embedded_row(row):
-                            continue
-
-                        if int(fid) in gmsh_map.get('lines', {}):
-                            for dimtag in gmsh_map['lines'][int(fid)]:
-                                if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 1:
-                                    _accumulate_nodes(1, int(dimtag[1]), True, tag_to_xy)
-                        # Straddle/barrier lines may have been converted into points.
-                        elif int(fid) in gmsh_map.get('straddle_points', {}):
-                            for dimtag in gmsh_map['straddle_points'][int(fid)]:
-                                if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
-                                    _accumulate_nodes(0, int(dimtag[1]), True, tag_to_xy)
-
-                # Finalize de-duplicated node arrays
-                node_tags = np.array(list(tag_to_xy.keys()), dtype=np.uint64)
-                nodes_xy = np.array([tag_to_xy[int(t)] for t in node_tags], dtype=float)
-                self.nodes = nodes_xy
-                self.node_tags = node_tags
-
+            self.nodes, self.node_tags = self._collect_domain_nodes(
+                gmsh_map, meshed_surface_tags, clean_points, clean_lines
+            )
             self.zones_gdf = clean_polys
             if launch_gmsh_gui:
                 gmsh.fltk.run()
@@ -2587,6 +2547,55 @@ class MeshGenerator:
             return True
 
         except Exception as e:
+            # Broad on purpose: gmsh is process-global state and must be
+            # finalized whatever failed, before the error is re-raised.
             logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
             raise e
+
+    def _mesh_2d(self):
+        """Set the meshing options, generate the 2D mesh and run the optimization cycles."""
+        gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm)
+        # Number of internal smoothing steps.
+        gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
+        # Tolerance for the initial Delaunay insertion - helps with
+        # "Could not insert point" from near-degenerate geometry.
+        gmsh.option.setNumber("Mesh.ToleranceInitialDelaunay", self.tolerance_initial_delaunay)
+
+        logger.info("Generating Triangular Mesh...")
+        gmsh.model.mesh.generate(2)
+
+        if self.optimization_cycles > 0:
+            if self._verbosity > 0:
+                logger.info(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
+            for i in range(self.optimization_cycles):
+                if self._verbosity > 1:
+                    logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
+                # Moves nodes to improve element shape (compactness).
+                gmsh.model.mesh.optimize("Relocate2D", niter=1)
+                # Smooths the mesh to relax gradients (reduces drift).
+                gmsh.model.mesh.optimize("Laplace2D", niter=1)
+
+    @staticmethod
+    def _collect_domain_nodes(gmsh_map, domain_surface_tags, clean_points, clean_lines):
+        """Unique mesh nodes of the domain surfaces and embedded constraints; returns (nodes_xy, node_tags).
+
+        gmsh.model.mesh.getNodes() without arguments is avoided on purpose: it
+        also returns nodes of standalone 1D meshes on curves (e.g. field-only
+        rivers) and of non-fragmented 2D surfaces, which would constrain the
+        Voronoi tessellation. Without known domain surfaces, all 2D nodes are
+        used (still avoiding 1D-only nodes).
+        """
+        if not domain_surface_tags:
+            node_tags, coords, _ = gmsh.model.mesh.getNodes(2, -1, includeBoundary=True)
+            nodes_3d = np.array(coords, dtype=float).reshape(-1, 3)
+            return nodes_3d[:, :2], node_tags
+
+        tag_to_xy = {}
+        for surf_tag in domain_surface_tags:
+            _accumulate_nodes(2, surf_tag, tag_to_xy)
+        for dim, tag in _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
+            _accumulate_nodes(dim, tag, tag_to_xy)
+        node_tags = np.array(list(tag_to_xy.keys()), dtype=np.uint64)
+        nodes_xy = np.array([tag_to_xy[int(t)] for t in node_tags], dtype=float)
+        return nodes_xy, node_tags
