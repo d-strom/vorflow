@@ -10,6 +10,8 @@ from shapely.geometry import Polygon, LineString, MultiPolygon
 from shapely.ops import unary_union, snap, polygonize
 from shapely.prepared import prep
 from shapely.validation import make_valid
+
+from ._features import line_parts as _line_parts
 from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
@@ -44,17 +46,6 @@ def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance
     if value < 0:
         raise ValueError(f"{parameter_name} must be non-negative. Got {value}.")
     return float(value)
-
-
-def _line_parts(geom):
-    """LineString parts of any geometry (points and polygons are dropped)."""
-    if geom.is_empty:
-        return []
-    if geom.geom_type in ("LineString", "LinearRing"):
-        return [LineString(geom.coords)]
-    if hasattr(geom, "geoms"):
-        return [part for g in geom.geoms for part in _line_parts(g)]
-    return []
 
 
 def _simplify_keeping_shared_edges(geom, tol, neighbours):

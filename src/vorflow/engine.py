@@ -2551,7 +2551,7 @@ class MeshGenerator:
             # finalized whatever failed, before the error is re-raised.
             logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
-            raise e
+            raise
 
     def _mesh_2d(self):
         """Set the meshing options, generate the 2D mesh and run the optimization cycles."""
