@@ -11,6 +11,19 @@ pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
 
 
+def _capture_crossings(mesher, monkeypatch):
+    """Record the crossings generate() hands to _setup_fields."""
+    captured = []
+    setup_fields = mesher._setup_fields
+
+    def spy(*args, crossings=(), **kwargs):
+        captured.extend(crossings)
+        return setup_fields(*args, crossings=crossings, **kwargs)
+
+    monkeypatch.setattr(mesher, "_setup_fields", spy)
+    return captured
+
+
 def _generate_line_buffer_mesh(*, thickness=1, add_crossing_line=False, return_context=False):
     cm = ConceptualMesh(crs=None)
     cm.add_polygon(
@@ -646,7 +659,7 @@ def test_winner_strip_stays_transfinite_through_crossing():
     assert not winner_row[winner_row["centroid_x"].sub(6).abs() < 0.6].empty
 
 
-def test_partial_crossing_t_junction_records_refinement():
+def test_partial_crossing_t_junction_records_refinement(monkeypatch):
     # A vertical buffer that terminates ON a horizontal buffer (a T-junction)
     # must mesh cleanly, conserve area, and register a crossing refinement disk.
     cm = ConceptualMesh(crs=None)
@@ -667,9 +680,10 @@ def test_partial_crossing_t_junction_records_refinement():
     )
     clean_polys, clean_lines, clean_points = cm.generate()
     mesher = MeshGenerator(background_lc=1.5, verbosity=0, smoothing_steps=0, optimization_cycles=0)
+    crossings = _capture_crossings(mesher, monkeypatch)
     assert mesher.generate(clean_polys, clean_lines, clean_points)
     assert abs(mesher.get_element_grid().geometry.area.sum() - 96.0) < 0.01
-    assert len(mesher._quad_buffer_crossings) >= 1
+    assert len(crossings) >= 1
 
 
 def test_tangential_overlap_drops_sliver():
@@ -697,7 +711,7 @@ def test_tangential_overlap_drops_sliver():
         assert mesher.generate(clean_polys, clean_lines, clean_points)
 
 
-def test_crossing_refinement_limits_size_jump():
+def test_crossing_refinement_limits_size_jump(monkeypatch):
     # With a coarse background, the trimmed gap would fill with large triangles
     # next to the dense strip rows. The Ball refinement field pins it to the
     # feature size, so elements near the crossing stay close to lc, not
@@ -723,8 +737,9 @@ def test_crossing_refinement_limits_size_jump():
     )
     clean_polys, clean_lines, clean_points = cm.generate()
     mesher = MeshGenerator(background_lc=3.0, verbosity=0, smoothing_steps=0, optimization_cycles=0)
+    crossings = _capture_crossings(mesher, monkeypatch)
     assert mesher.generate(clean_polys, clean_lines, clean_points)
-    assert len(mesher._quad_buffer_crossings) >= 1
+    assert len(crossings) >= 1
 
     grid = mesher.get_element_grid()
     centroids = grid.geometry.centroid

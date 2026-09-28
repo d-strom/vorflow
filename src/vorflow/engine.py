@@ -841,6 +841,13 @@ class MeshGenerator:
 
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=False):
         """Transfer the clean features into the OCC model and fragment them; returns gmsh_map."""
+        gmsh_map, _ = self._build_occ_model(
+            polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=launch_gmsh_gui
+        )
+        return gmsh_map
+
+    def _build_occ_model(self, polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=False):
+        """Build and fragment the OCC model; returns (gmsh_map, quad-buffer crossings for _setup_fields)."""
         inventory = _GeometryInventory()
         domain = buffer.domain_union_geometry(polygons_gdf)
 
@@ -849,7 +856,7 @@ class MeshGenerator:
         corridors = buffer.protected_corridors(polygons_gdf, lines_gdf, self.background_lc)
         barrier_zone = self._build_barrier_zone(corridors)
         plans = buffer.plan_quad_buffers(polygons_gdf, lines_gdf, self.background_lc, domain)
-        self._quad_buffer_crossings = buffer.find_all_crossings(plans)
+        crossings = buffer.find_all_crossings(plans)
 
         line_strips = self._add_line_features(
             lines_gdf, inventory, plans, corridors, barrier_zone, domain
@@ -868,7 +875,7 @@ class MeshGenerator:
         object_tags = inventory.object_tags()
         if not object_tags:
             logger.warning("Warning: No geometry to mesh.")
-            return inventory.feature_map()
+            return inventory.feature_map(), crossings
 
         # "Fragment" combines all the individual geometries into a single,
         # topologically consistent model. Only embedded geometry takes part.
@@ -885,7 +892,7 @@ class MeshGenerator:
         self._log_final_map_diagnostics(final_map)
         self._recover_orphan_surfaces(final_map, polygons_gdf)
         self._apply_structured_buffer_meshing(final_map, inventory.structured_buffer_specs)
-        return final_map
+        return final_map, crossings
 
     def _add_point_features(self, points_gdf, inventory):
         """Add one OCC point per point feature."""
@@ -1786,7 +1793,7 @@ class MeshGenerator:
                       f"({transfinite_count} transfinite, {recombine_only_count} recombine-only)."
             )
     
-    def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
+    def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf, crossings=()):
         """
         Configures Gmsh mesh size fields based on the input features.
 
@@ -1794,7 +1801,9 @@ class MeshGenerator:
         `MathEval`) to control the mesh element size across the domain. It uses
         the parameters (e.g., `lc`, `dist_min`, `dist_max`) from the
         original conceptual model features to define how the mesh should be
-        refined near points, along lines, and within polygons.
+        refined near points, along lines, and within polygons. ``crossings``
+        are the quad-buffer crossing disks from ``_build_occ_model``; each
+        becomes a Ball refinement field.
         """
         if self._verbosity > 0:
             logger.info("--- Setup Fields Debug ---")
@@ -2076,24 +2085,7 @@ class MeshGenerator:
             if f_id is not None:
                 field_list.append(f_id)
 
-        # Crossing refinement: where two quad buffers cross, the lower-priority
-        # one is trimmed away, leaving a small gap that the unstructured mesher
-        # would otherwise fill at the background size right next to the dense
-        # strip rows -- the size jump and quality crater the user sees. Pin each
-        # crossing region to min(lc) of the two features with a Ball field
-        # (rotation-agnostic, no OCC geometry added). The Min field below takes
-        # the smallest requested size, and transfinite strips ignore size fields,
-        # so the continuous winner is unaffected.
-        for crossing in getattr(self, '_quad_buffer_crossings', []):
-            ball = gmsh.model.mesh.field.add("Ball")
-            gmsh.model.mesh.field.setNumber(ball, "Radius", float(crossing.radius))
-            gmsh.model.mesh.field.setNumber(ball, "XCenter", float(crossing.x))
-            gmsh.model.mesh.field.setNumber(ball, "YCenter", float(crossing.y))
-            gmsh.model.mesh.field.setNumber(ball, "ZCenter", 0.0)
-            gmsh.model.mesh.field.setNumber(ball, "VIn", float(crossing.size))
-            gmsh.model.mesh.field.setNumber(ball, "VOut", global_max_lc)
-            gmsh.model.mesh.field.setNumber(ball, "Thickness", 3.0 * float(crossing.size))
-            field_list.append(ball)
+        field_list.extend(self._add_crossing_fields(crossings, global_max_lc))
 
         #now lets add the background constant field if specified
         if self.background_lc is not None:
@@ -2120,6 +2112,31 @@ class MeshGenerator:
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
 
+
+    @staticmethod
+    def _add_crossing_fields(crossings, background_lc):
+        """Add one Ball field per quad-buffer crossing; returns the field ids.
+
+        Where two quad buffers cross, the lower-priority one is trimmed away,
+        leaving a small gap the unstructured mesher would otherwise fill at the
+        background size right next to the dense strip rows. Each Ball pins the
+        crossing region to min(lc) of the two features (rotation-agnostic, no
+        OCC geometry added). The Min field takes the smallest requested size,
+        and transfinite strips ignore size fields, so the continuous winner is
+        unaffected.
+        """
+        field_ids = []
+        for crossing in crossings:
+            ball = gmsh.model.mesh.field.add("Ball")
+            gmsh.model.mesh.field.setNumber(ball, "Radius", float(crossing.radius))
+            gmsh.model.mesh.field.setNumber(ball, "XCenter", float(crossing.x))
+            gmsh.model.mesh.field.setNumber(ball, "YCenter", float(crossing.y))
+            gmsh.model.mesh.field.setNumber(ball, "ZCenter", 0.0)
+            gmsh.model.mesh.field.setNumber(ball, "VIn", float(crossing.size))
+            gmsh.model.mesh.field.setNumber(ball, "VOut", background_lc)
+            gmsh.model.mesh.field.setNumber(ball, "Thickness", 3.0 * float(crossing.size))
+            field_ids.append(ball)
+        return field_ids
 
     def _embed_features(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
         """
@@ -2446,7 +2463,9 @@ class MeshGenerator:
         self._initialize_gmsh()
         try:
             logger.info("Transferring Geometry to Gmsh...")
-            gmsh_map = self._add_geometry(clean_polys, clean_lines, clean_points, launch_gmsh_gui=launch_gmsh_gui)
+            gmsh_map, crossings = self._build_occ_model(
+                clean_polys, clean_lines, clean_points, launch_gmsh_gui=launch_gmsh_gui
+            )
             
             # Ensure features are correctly embedded in surfaces before meshing
             self._embed_features(gmsh_map, clean_polys, clean_lines, clean_points)
@@ -2454,7 +2473,7 @@ class MeshGenerator:
             self._log_post_embed_diagnostics(gmsh_map)
 
             logger.info("Setting up Resolution Fields...")
-            self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
+            self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points, crossings=crossings)
             
             # Set the core meshing algorithm.
             gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm) 
