@@ -375,6 +375,63 @@ class GeometricGrowthField(MeshField):
         )
 
 
+class _BorderGradingField(MeshField):
+    """Fine polygon border graded up to the polygon resolution.
+
+    Internal — backs the deprecated ``add_polygon(border_density=...)``,
+    reproducing its pre-0.1 sizing. Inside the polygon the size ramps
+    linearly from ``border_size`` at the boundary to the polygon resolution
+    between ``dist_min`` and ``dist_max``; outside it grows from
+    ``border_size`` at DEFAULT_GROWTH_FACTOR, so the border is fine on both
+    sides.
+    """
+
+    def __init__(self, border_size, dist_min=0.0, dist_max=None, sampling=20):
+        self.border_size = _positive_finite(border_size, "border_size")
+        self.dist_min = float(dist_min)
+        self.dist_max = None if dist_max is None else float(dist_max)
+        self.sampling = _positive_integer(sampling, "sampling")
+
+    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
+        interior = float(background_lc) if feature_lc is None else min(float(feature_lc), float(background_lc))
+        surfaces = _polygon_surface_tags(tags_dict)
+        if self.border_size >= interior or not surfaces:
+            return None
+        curves = _surface_boundary_curves(gmsh_api, surfaces)
+        if not curves:
+            return None
+
+        dist_max = self.dist_max
+        if dist_max is None or dist_max <= self.dist_min:
+            dist_max = max(
+                self.dist_min + 5.0 * self.border_size,
+                self.dist_min + 0.2 * (interior - self.border_size),
+            )
+
+        field = gmsh_api.model.mesh.field
+        f_dist = DistanceField(include_surfaces=False, sampling=self.sampling).create(
+            gmsh_api, {"lines": curves}
+        )
+        f_thresh = field.add("Threshold")
+        field.setNumber(f_thresh, "InField", f_dist)
+        field.setNumber(f_thresh, "SizeMin", self.border_size)
+        field.setNumber(f_thresh, "SizeMax", interior)
+        field.setNumber(f_thresh, "DistMin", self.dist_min)
+        field.setNumber(f_thresh, "DistMax", dist_max)
+
+        f_inside = field.add("Restrict")
+        field.setNumber(f_inside, "InField", f_thresh)
+        field.setNumbers(f_inside, "SurfacesList", [float(t) for t in surfaces])
+
+        gradient = format(DEFAULT_GROWTH_FACTOR - 1.0, ".15g")
+        f_outside = field.add("MathEval")
+        field.setString(f_outside, "F", f"{self.border_size} + {gradient} * F{f_dist}")
+
+        f_min = field.add("Min")
+        field.setNumbers(f_min, "FieldsList", [float(f_inside), float(f_outside)])
+        return f_min
+
+
 class AutoExponentialField(GeometricGrowthField):
     """Deprecated compatibility name for :class:`GeometricGrowthField`."""
 

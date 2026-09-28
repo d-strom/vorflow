@@ -1,5 +1,6 @@
 import warnings
 
+import numpy as np
 import pytest
 from geopandas.testing import assert_geodataframe_equal
 from shapely.geometry import LineString, Point, Polygon
@@ -339,6 +340,62 @@ def test_point_deduplication():
     kept_point = clean_points_merged.iloc[0]
     assert kept_point['lc'] == 0.5
     assert kept_point['point_id'] == "p2"
+
+def _wavy_neighbours():
+    """Two polygons sharing a wavy edge that simplification would flatten."""
+    xs = np.linspace(0, 10, 101)
+    wave = [(x, 5 + 0.3 * np.sin(3 * x)) for x in xs]
+    lower = Polygon([(0, 0), (10, 0)] + wave[::-1])
+    upper = Polygon(wave + [(10, 10), (0, 10)])
+    return lower, upper
+
+
+@pytest.mark.parametrize("upper_tol", [None, 0.5])
+def test_polygon_simplification_keeps_shared_edges_gap_free(upper_tol):
+    lower, upper = _wavy_neighbours()
+    cm = ConceptualMesh()
+    cm.add_polygon(lower, zone_id=1, resolution=1, simplify_tolerance=0.5)
+    cm.add_polygon(upper, zone_id=2, resolution=1, z_order=1, simplify_tolerance=upper_tol)
+    clean_polys, _, _ = cm.generate()
+
+    domain = unary_union([lower, upper])
+    covered = unary_union(list(clean_polys.geometry))
+    assert domain.difference(covered).area < 1e-9
+
+
+def test_polygon_simplification_still_simplifies_free_edges():
+    # The wavy top edge is shared with nobody, so it is simplified; the
+    # straight shared bottom edge is kept.
+    xs = np.linspace(0, 10, 101)
+    wavy_top = [(x, 10 + 0.01 * np.sin(3 * x)) for x in xs]
+    top = Polygon([(0, 5), (10, 5)] + wavy_top[::-1])
+    bottom = Polygon([(0, 0), (10, 0), (10, 5), (0, 5)])
+    cm = ConceptualMesh()
+    cm.add_polygon(bottom, zone_id=1)
+    cm.add_polygon(top, zone_id=2, simplify_tolerance=0.1)
+    clean_polys, _, _ = cm.generate()
+
+    simplified = clean_polys.loc[clean_polys["zone_id"] == 2].geometry.iloc[0]
+    assert len(simplified.exterior.coords) < 10
+    assert unary_union([top, bottom]).difference(unary_union(list(clean_polys.geometry))).area < 0.2
+
+
+@pytest.mark.parametrize("coarse_tol, fine_tol", [(0.01, None), (None, 0.01), (0.01, 0.01)])
+def test_point_deduplication_does_not_depend_on_which_point_has_the_tolerance(coarse_tol, fine_tol):
+    cm = ConceptualMesh()
+    cm.add_point(Point(0, 0), "coarse", resolution=1.0, simplify_tolerance=coarse_tol)
+    cm.add_point(Point(0.0001, 0), "fine", resolution=0.5, simplify_tolerance=fine_tol)
+    _, _, clean_points = cm.generate()
+    assert clean_points["point_id"].tolist() == ["fine"]
+
+
+def test_point_order_is_preserved_without_deduplication():
+    cm = ConceptualMesh()
+    for point_id, x, lc in [("coarse", 0, 5.0), ("fine", 10, 1.0), ("unset", 20, None)]:
+        cm.add_point(Point(x, 0), point_id, resolution=lc)
+    _, _, clean_points = cm.generate()
+    assert clean_points["point_id"].tolist() == ["coarse", "fine", "unset"]
+
 
 def test_line_densification_options():
     """Test the three modes of line densification: False, True, and float."""

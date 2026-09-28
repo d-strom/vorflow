@@ -17,6 +17,7 @@ from .fields import (
     GeometricGrowthField,
     MeshField,
     ThresholdField,
+    _BorderGradingField,
 )
 from ._log import current_verbosity, verbosity_scope
 
@@ -174,6 +175,20 @@ class MeshGenerator:
         self.element_grid = None
         self._element_data = None
         self.diagnostics = {}
+
+    def _validate_background_lc(self):
+        """Fail before any Gmsh work if background_lc is missing or not positive."""
+        if self.background_lc is None:
+            raise ValueError(
+                "MeshGenerator.background_lc must be provided. "
+                "If you don't want to constrain the mesh, pass a very large value."
+            )
+        value = float(self.background_lc)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "MeshGenerator.background_lc must be a positive finite number. "
+                f"Got {self.background_lc!r}."
+            )
 
     def _resolve_verbosity(self) -> int:
         """Verbosity in effect: the explicit setting, else the package level."""
@@ -2240,17 +2255,8 @@ class MeshGenerator:
         
         # The global background mesh size is always required.
         # We create a Constant field for it and always set a background mesh.
-        if self.background_lc is None:
-            raise ValueError(
-                "MeshGenerator.background_lc must be provided. "
-                "If you don't want to constrain the mesh, pass a very large value."
-            )
+        self._validate_background_lc()
         global_max_lc = float(self.background_lc)
-        if not math.isfinite(global_max_lc) or global_max_lc <= 0.0:
-            raise ValueError(
-                "MeshGenerator.background_lc must be a positive finite number. "
-                f"Got {self.background_lc!r}."
-            )
 
         def extract_tags(entry_list):
             """Return a clean list of integer tags from Gmsh's dimtag-ish output.
@@ -2349,6 +2355,17 @@ class MeshGenerator:
             growth = float(growth)
             return GeometricGrowthField(growth_factor=growth)
 
+        def _border_field_from_row(row):
+            """Border grading backing the deprecated add_polygon(border_density=...)."""
+            border_lc = row.get('border_lc', None)
+            if border_lc is None or pd.isna(border_lc):
+                return None
+            return _BorderGradingField(
+                border_size=float(border_lc),
+                dist_min=get_row_param(row, 'dist_min', 0.0),
+                dist_max=None if pd.isna(row.get('dist_max_in', None)) else float(row['dist_max_in']),
+            )
+
         # Configure mesh size fields using MeshField objects attached to features.
         #
         # Data model expectations:
@@ -2385,6 +2402,10 @@ class MeshGenerator:
                 )
                 if auto_field is not None:
                     row_fields.append(auto_field)
+                if geom_type == 'surfaces':
+                    border_field = _border_field_from_row(row)
+                    if border_field is not None:
+                        row_fields.append(border_field)
 
                 if not row_fields:
                     continue
@@ -2851,6 +2872,7 @@ class MeshGenerator:
         Raises:
             Exception: If any step in the Gmsh process fails.
         """
+        self._validate_background_lc()
         with verbosity_scope(self.verbosity):
             self._verbosity = self._resolve_verbosity()
             return self._generate(clean_polys, clean_lines, clean_points,

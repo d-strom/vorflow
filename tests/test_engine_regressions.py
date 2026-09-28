@@ -1,5 +1,6 @@
 """Regression tests for MeshGenerator bookkeeping, logging and lazy exports."""
 import logging
+import warnings
 
 import numpy as np
 import pytest
@@ -89,3 +90,46 @@ def test_mesh_generator_verbosity_scopes_generate_output(caplog):
         assert any("Generating Triangular Mesh" in r.getMessage() for r in caplog.records)
     finally:
         vorflow.set_verbosity(1)
+
+
+def _legacy_zone_mesh(**legacy_kwargs):
+    """Mesh a domain holding one zone added with pre-0.1 add_polygon keywords."""
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 60, 60), zone_id="domain", resolution=8)
+    with pytest.warns(DeprecationWarning):
+        cm.add_polygon(box(20, 20, 40, 40), zone_id="zone", resolution=4, z_order=1, **legacy_kwargs)
+    mg = MeshGenerator(background_lc=8, verbosity=0)
+    with warnings.catch_warnings():
+        # dist_max (via dist_max_out) also warns from the engine's legacy path.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        assert mg.generate(*cm.generate())
+    return mg
+
+
+def test_legacy_polygon_keywords_are_accepted_with_deprecation_warnings():
+    mg = _legacy_zone_mesh(mesh_refinement=True, dist_max_out=10.0)
+    assert len(mg.nodes) > 0
+
+
+def test_legacy_border_density_grades_from_fine_border_to_resolution():
+    # Densified boundary vertices alone force tiny edges on the border with an
+    # abrupt jump inward (mean gamma ~0.77 there); the border field grades the
+    # size smoothly into the zone.
+    mg = _legacy_zone_mesh(border_density=1.0, dist_max_in=4.0)
+    grid = mg.get_element_grid().merge(
+        mg.get_triangular_quality()[["element_tag", "gamma"]], on="element_tag"
+    )
+    zone = box(20, 20, 40, 40)
+    distance_to_border = grid.geometry.centroid.apply(zone.exterior.distance)
+    transition = grid[(distance_to_border > 1) & (distance_to_border < 3)]
+    assert transition.geometry.area.mean() < 1.5
+    assert grid[distance_to_border < 3]["gamma"].mean() > 0.9
+
+
+def test_generate_rejects_missing_background_lc_before_touching_gmsh():
+    import gmsh
+
+    mg = MeshGenerator(verbosity=0)
+    with pytest.raises(ValueError, match="background_lc must be provided"):
+        mg.generate(*_barrier_model(with_point=False))
+    assert not gmsh.is_initialized()
