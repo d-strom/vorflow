@@ -2,6 +2,7 @@ import logging
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 from shapely.geometry import LineString, Polygon
 from shapely.ops import unary_union
@@ -405,3 +406,68 @@ class TestExportToShapefile:
         path = tmp_path / "grid.shp"
         tess.export_to_shapefile(str(path))
         assert not path.exists()
+
+
+def _lattice_nodes(minx, miny, maxx, maxy, n):
+    """Return an n x n lattice of generator nodes over a bounding box."""
+    xs = np.linspace(minx, maxx, n)
+    ys = np.linspace(miny, maxy, n)
+    return np.array([[x, y] for x in xs for y in ys])
+
+
+def test_field_only_polygon_does_not_assign_zones():
+    """Catches a sizing-only (embed=False) polygon stamping its zone_id onto cells."""
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]), zone_id=1)
+    cm.add_polygon(
+        Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+        zone_id=99,
+        z_order=5,
+        resolution=0.5,
+        embed=False,
+    )
+    clean_polys, _, _ = cm.generate()
+    assert 99 in set(clean_polys["zone_id"])
+
+    nodes = _lattice_nodes(0.0, 0.0, 4.0, 4.0, 9)
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate()
+
+    assert set(grid["zone_id"]) == {1}
+    assert grid.geometry.area.sum() == pytest.approx(16.0)
+
+
+def test_field_only_polygon_does_not_extend_clip_domain():
+    """Catches a field-only polygon outside the embedded domain enlarging the clip."""
+    cm = _build_conceptual_mesh()
+    cm.generate()
+    field_only = gpd.GeoDataFrame(
+        {"zone_id": [99], "z_order": [5], "embed": [False]},
+        geometry=[Polygon([(1, 0), (2, 0), (2, 1), (1, 1)])],
+    )
+    cm.clean_polygons = gpd.GeoDataFrame(
+        pd.concat([cm.clean_polygons, field_only], ignore_index=True)
+    )
+
+    nodes = _lattice_nodes(0.0, 0.0, 2.0, 1.0, 5)
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=cm.clean_polygons)
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate()
+
+    assert grid.geometry.area.sum() == pytest.approx(1.0)
+    assert set(grid["zone_id"]) == {42}
+
+
+def test_missing_embed_values_are_treated_as_embedded():
+    """Catches NaN embed flags dropping real zones from the zone join."""
+    cm = _build_conceptual_mesh()
+    cm.generate()
+    cm.clean_polygons["embed"] = None
+
+    nodes = _lattice_nodes(0.1, 0.1, 0.9, 0.9, 3)
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=cm.clean_polygons)
+    grid = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True).generate()
+
+    assert set(grid["zone_id"]) == {42}

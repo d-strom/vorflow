@@ -71,10 +71,20 @@ class VoronoiTessellator:
         self.boundary_corner_angle = float(boundary_corner_angle)
         self.boundary_tolerance = boundary_tolerance
 
+    def _embedded_polygons(self):
+        """Return the clean polygons that define the domain and zones (embed=True)."""
+        polygons = self.cm.clean_polygons
+        if 'embed' not in polygons.columns:
+            return polygons
+        # Missing embed values default to embedded, matching MeshGenerator.
+        embedded = polygons['embed'].map(lambda value: True if pd.isna(value) else bool(value))
+        return polygons[embedded.astype(bool)]
+
     def _domain_geometry(self):
         """Return the current meshing domain geometry."""
-        if not self.cm.clean_polygons.empty:
-            domain_geom = unary_union(self.cm.clean_polygons.geometry)
+        polygons = self._embedded_polygons()
+        if not polygons.empty:
+            domain_geom = unary_union(polygons.geometry)
             if not domain_geom.is_valid:
                 domain_geom = make_valid(domain_geom)
             return domain_geom
@@ -500,8 +510,10 @@ class VoronoiTessellator:
             bounded_voronoi = raw_gdf
 
         logger.info("Enforcing Hydrogeological Zones (Optimization: Point Sampling)...")
-        zones = self.cm.clean_polygons[['geometry', 'zone_id', 'z_order']]
-        
+        # Field-only (embed=False) polygons only size the mesh; they must not
+        # stamp their zone_id onto cells.
+        zones = self._embedded_polygons()[['geometry', 'zone_id', 'z_order']]
+
         # To assign a zone ID to each Voronoi cell, we perform a spatial join
         # between the cell's generator point and the zone polygons. This is much
         # faster than doing a polygon-on-polygon overlay.
