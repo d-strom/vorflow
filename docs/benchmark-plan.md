@@ -411,6 +411,15 @@ gives NCPL 6440. Findings from VOROGRIDGEN's first results:
   `lloyd_fac` 0.1, then 0.05, the program's documented remedy, and records
   the value used. `v3_thiem` also missed the matched count (3 851 against
   3 000 after 8 builds).
+- **Second run (36479497679):** the `lloyd_fac` retry fixed the "missing
+  triangle" case (0.2 failed, 0.1 built). The other three still failed at all
+  three values. In each, the first build (`build_00`, 0.2) succeeded; the
+  second, at the finer matching scale, failed. A lower `lloyd_fac` only made
+  it fail sooner. The failures are specific to particular spacings, not to the
+  cases. Matching (`bench/matching.py`) now retries a failed step at 1.02×,
+  0.98× and 1.05× its planned scale. If no build lands within tolerance, it
+  keeps the successful build closest to the target (`matched = False`).
+  `n_failed_builds` is recorded for every tool.
 - **Centres:** written centres give exactly the same errors as centroids, which
   confirms the DISV carries centroids. Without XT3D, V1 linear gives 4.3e-3,
   ten times worse than the other tools' centroid rows, because the unconverged

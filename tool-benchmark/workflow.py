@@ -86,6 +86,7 @@ def build_one(case, tool: str, target: int, kwargs: dict, run_models: bool,
     grid = result["grid"]
     row = {"case": case.id, "tool": tool, "target": target, "status": result["status"],
            "matched": result["matched"], "scale": result["scale"], "n_builds": len(result["history"]),
+           "n_failed_builds": len(result["failures"]),
            "wall_s": result.get("wall_s"), "peak_rss_mb": result.get("peak_rss_mb"),
            "build_rss_mb": result.get("build_rss_mb"),
            "error": result["error"].strip().splitlines()[-1] if result["error"] else ""}
