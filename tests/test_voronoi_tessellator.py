@@ -4,6 +4,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
+import shapely
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
@@ -347,6 +348,38 @@ def test_boundary_inset_mirror_skips_sharp_corners():
     assert not bool(corner_row["boundary_centered"])
     assert corner_row["boundary_inset"] == 0.0
     assert np.allclose(prepared[0], nodes[0])
+
+
+def test_boundary_inset_mirror_keeps_node_when_ghost_lands_inside_domain():
+    """Catches mirror ghosts placed back inside the domain across a narrow hole."""
+    slit = [(1.0, 1.95), (3.0, 1.95), (3.0, 2.05), (1.0, 2.05)]
+    domain = Polygon([(0, 0), (4, 0), (4, 4), (0, 4)], [slit])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, densify=False)
+    clean_polys, _, _ = cm.generate()
+
+    # Two nodes on the slit's lower face are 1.0 apart, so their inset (0.5)
+    # and mirror ghost reach across the 0.1-wide slit into the domain.
+    slit_nodes = [[1.5, 1.95], [2.5, 1.95]]
+    outer_nodes = [[2.0, 0.0], [0.0, 2.0], [4.0, 2.0], [2.0, 4.0]]
+    interior_nodes = [[1.0, 1.0], [3.0, 1.0], [1.0, 3.0], [3.0, 3.0]]
+    nodes = np.array(slit_nodes + outer_nodes + interior_nodes, dtype=float)
+    tags = np.arange(1, len(nodes) + 1)
+    mesh_gen = DummyMeshGenerator(nodes=nodes, tags=tags, zones_gdf=clean_polys)
+    tessellator = VoronoiTessellator(mesh_gen, cm, boundary_centering="inset_mirror")
+
+    prepared, _, ghosts, metadata = tessellator._prepare_boundary_centered_nodes(nodes, tags)
+
+    assert not metadata.loc[:1, "boundary_centered"].any()
+    assert (metadata.loc[:1, "boundary_inset"] == 0.0).all()
+    assert np.array_equal(prepared[:2], nodes[:2])
+    assert metadata.loc[2:5, "boundary_centered"].all()
+    assert len(ghosts) == int(metadata["boundary_centered"].sum())
+    assert not shapely.contains_xy(domain, ghosts[:, 0], ghosts[:, 1]).any()
+
+    grid = tessellator.generate()
+    assert grid["node_id"].is_unique
+    assert grid.geometry.area.sum() == pytest.approx(domain.area)
 
 
 def _staggered_lattice_nodes():

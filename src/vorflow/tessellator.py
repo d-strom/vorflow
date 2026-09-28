@@ -116,6 +116,14 @@ def _probe_inside(domain_geom, probe_xy):
     return inside
 
 
+def _strictly_inside(domain_geom, points_xy):
+    """Return whether each point lies in the domain interior (False for NaN points)."""
+    inside = np.zeros(len(points_xy), dtype=bool)
+    finite = np.isfinite(points_xy).all(axis=1)
+    inside[finite] = shapely.contains_xy(domain_geom, points_xy[finite, 0], points_xy[finite, 1])
+    return inside
+
+
 def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
     """Return the polygon pieces of a cell split by a line, or [] when the line does not straddle it."""
     pieces = [piece for piece in split(cell_poly, line).geoms if isinstance(piece, (Polygon, MultiPolygon))]
@@ -259,6 +267,9 @@ class VoronoiTessellator:
         """
         Shift non-corner boundary nodes inward and add mirrored outside ghosts.
 
+        A node whose mirror ghost would land inside the domain (e.g. across
+        a narrow hole) keeps its original position and gets no ghost.
+
         Returns prepared nodes, prepared tags, and a metadata frame keyed by
         node_id. Tags only cover real nodes; appended ghosts receive -1 in
         _build_raw_voronoi.
@@ -301,7 +312,13 @@ class VoronoiTessellator:
         tangents = _boundary_tangents(boundary, points[candidates], spacing[candidates])
         normals = _inward_normals(domain_geom, nodes[candidates], tangents, inset)
         ghosts = nodes[candidates] - normals * inset[:, None]
-        keep = ~np.isnan(normals).any(axis=1)
+        has_normal = ~np.isnan(normals).any(axis=1)
+        # In narrow holes or concave spots the mirror ghost can land back
+        # inside the domain; keep those nodes at their original position.
+        ghost_inside = _strictly_inside(domain_geom, ghosts)
+        keep = has_normal & ~ghost_inside
+        if ghost_inside.any():
+            logger.info(f"  -> Left {int(ghost_inside.sum())} boundary nodes in place: mirror ghost inside domain")
 
         centered_indices = candidates[keep]
         prepared = nodes.astype(float, copy=True)
