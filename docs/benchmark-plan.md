@@ -398,9 +398,34 @@ CI: `.github/workflows/benchmark.yml` runs three jobs:
 - **vorogridgen** (Windows): downloads the freeware at run time and checks its
   shipped example.
 - **others** (Linux).
-- **report**: merges the per-(case, tool, target) JSON rows.
+- **report**: merges the per-(case, tool, target) JSON rows, and fails if
+  there are none.
 
-It has not run yet; it needs a push.
+First full run (run 36466904249): all green, and VOROGRIDGEN's shipped example
+gives NCPL 6440. Findings from VOROGRIDGEN's first results:
+
+- **Builds:** 7 of 11 finished. The other four stopped during the Lloyd
+  iterations (`c0` n3000, `v2_mms_uniform` n2000 and n8000, `v2_mms_graded`
+  n9000). Three failed with "consider reducing the LLOYD_FAC" and one with
+  "Missing triangle local neighbour". The adapter now retries with
+  `lloyd_fac` 0.1, then 0.05, the program's documented remedy, and records
+  the value used. `v3_thiem` also missed the matched count (3 851 against
+  3 000 after 8 builds).
+- **Centres:** written centres give exactly the same errors as centroids, which
+  confirms the DISV carries centroids. Without XT3D, V1 linear gives 4.3e-3,
+  ten times worse than the other tools' centroid rows, because the unconverged
+  Lloyd iterations leave 19° p95 non-orthogonality.
+- **With XT3D** it is exact on every linear case and best or near-best on
+  smooth fields: V2 graded 1 000 cells 9.6e-4 against 1.2e-3 to 1.7e-3 for the
+  others; V3 Thiem 8.9e-5. For VOROGRIDGEN grids the guide should say to turn
+  XT3D on.
+- **Run time:** 1.5–100 s per grid on the Windows runner, against under 3 s for
+  the other tools. That is not a like-for-like machine comparison.
+
+Linux CI and local vorflow results differ on V4. CI gives 1.2e-6 with 4
+zero-length edges; locally it was 5e-10 with 2. Presumably the conda-forge
+Gmsh builds differ. XT3D makes every tool's V4 barrier error worse or no
+better (vorflow 2.3e-4), so the barrier headline is XT3D off.
 
 ## Risks and caveats
 

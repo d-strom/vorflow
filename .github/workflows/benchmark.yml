@@ -67,7 +67,7 @@ jobs:
             tool-benchmark/results/rows
             tool-benchmark/work/**/grid.pkl
             tool-benchmark/work/**/vg.in
-            tool-benchmark/work/**/vorogridgen.log
+            tool-benchmark/work/**/vorogridgen*.log
 
   others:
     runs-on: ubuntu-latest
