@@ -54,6 +54,7 @@ dev = [
     "jupyter",
     "matplotlib",
     "build>=1.2",
+    "packaging",          # scripts/check_dist.py
     "twine>=6",
     "tomli>=2; python_version < '3.11'",
 ]
