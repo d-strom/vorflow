@@ -7,6 +7,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import shapely
 from shapely.geometry import Point, LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.ops import linemerge, unary_union
 from shapely.validation import make_valid
@@ -17,7 +18,7 @@ from .fields import (
     MeshField,
     ThresholdField,
 )
-from ._log import set_verbosity
+from ._log import current_verbosity, verbosity_scope
 
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,14 @@ def _to_key(dim, tag):
     return (int(dim), int(tag))
 
 
+def _embedded_zones(zones_gdf):
+    """Zones that belong to the meshed domain (drops field-only polygons)."""
+    if zones_gdf is None or zones_gdf.empty or "embed" not in zones_gdf.columns:
+        return zones_gdf
+    embed = zones_gdf["embed"].fillna(True).astype(bool)
+    return zones_gdf[embed]
+
+
 def _assign_zones_to_elements(grid, zones_gdf):
     """Assign a zone to each element by spatially joining element centroids.
 
@@ -97,7 +106,7 @@ def _assign_zones_to_elements(grid, zones_gdf):
 
 
 class MeshGenerator:
-    def __init__(self, background_lc=None, verbosity=0, mesh_algorithm=6,
+    def __init__(self, background_lc=None, verbosity=None, mesh_algorithm=6,
                  smoothing_steps=10, optimization_cycles=2,
                  tolerance_initial_delaunay=1e-8,
                  heal_shapes=False, heal_tolerance=1e-8,
@@ -112,7 +121,11 @@ class MeshGenerator:
         Args:
             background_lc (float, optional): The default target mesh size for areas
                 not controlled by a specific refinement field.
-            verbosity (int): Gmsh verbosity level (0=silent, 1=basic, 2=debug).
+            verbosity (int, optional): Output level while ``generate()`` runs
+                (0=warnings only, 1=progress, 2=debug diagnostics). It applies to
+                both vorflow's logger and Gmsh, and only for the duration of
+                ``generate()``. None (default) follows the package-wide level set
+                with ``vorflow.set_verbosity()``.
             mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
                 5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
             smoothing_steps (int): Number of internal Lloyd smoothing iterations
@@ -140,9 +153,8 @@ class MeshGenerator:
         """
         self.background_lc = background_lc
         self.verbosity = verbosity
-        # The documented verbosity scale (0=silent, 1=basic, 2=debug) also
-        # drives the package logger so console output honors it.
-        set_verbosity(verbosity)
+        # Resolved level used by internal gates; refreshed at each generate().
+        self._verbosity = self._resolve_verbosity()
         self.mesh_algorithm = mesh_algorithm
         self.smoothing_steps = smoothing_steps
         self.optimization_cycles = optimization_cycles
@@ -160,7 +172,14 @@ class MeshGenerator:
         self.zones_gdf = None
         self.triangular_quality = None
         self.element_grid = None
+        self._element_data = None
         self.diagnostics = {}
+
+    def _resolve_verbosity(self) -> int:
+        """Verbosity in effect: the explicit setting, else the package level."""
+        if self.verbosity is None:
+            return current_verbosity()
+        return int(self.verbosity)
 
     def _sanitize_coords(self, coords, *, min_spacing=1e-5, require_closed=False, min_points=2):
         """Remove invalid and near-duplicate coordinates before OCC creation."""
@@ -219,7 +238,7 @@ class MeshGenerator:
         if gmsh.is_initialized():
             gmsh.finalize()
         gmsh.initialize()
-        gmsh.option.setNumber("General.Verbosity", self.verbosity)
+        gmsh.option.setNumber("General.Verbosity", self._verbosity)
         gmsh.option.setNumber("Geometry.Tolerance", 1e-6)
         gmsh.option.setNumber("Geometry.OCCBooleanPreserveNumbering", 1)
         gmsh.model.add("mesh_model")
@@ -234,7 +253,7 @@ class MeshGenerator:
     def _meshed_surface_tags(gmsh_map, clean_polys):
         """Surface tags composing the meshed domain.
 
-        Embedded polygon surfaces plus straddle and structured-buffer strips.
+        Embedded polygon surfaces plus structured-buffer strips.
         Field-only (embed=False) surfaces are excluded: gmsh meshes them as
         standalone entities, but they are not part of the deliverable mesh and
         must not pollute element/quality/node collection.
@@ -263,9 +282,8 @@ class MeshGenerator:
 
         for fid in poly_ids:
             add_dimtags(gmsh_map.get('surfaces', {}).get(fid, []))
-        for map_key in ('straddle_surfs', 'structured_buffer_surfs'):
-            for dimtags in gmsh_map.get(map_key, {}).values():
-                add_dimtags(dimtags)
+        for dimtags in gmsh_map.get('structured_buffer_surfs', {}).values():
+            add_dimtags(dimtags)
         return tags
 
     @staticmethod
@@ -384,103 +402,126 @@ class MeshGenerator:
             crs=crs,
         )
 
-    def _collect_element_grid(self, zones_gdf=None, surface_tags=None):
-        """Collect gmsh 2D element polygons while the model is live."""
-        crs = getattr(zones_gdf, "crs", None)
+    def _capture_element_data(self, surface_tags=None):
+        """Copy raw 2D element connectivity and node coordinates while gmsh is live."""
         element_types, element_tags, element_node_tags = self._get_2d_elements(surface_tags)
-        if len(element_tags) == 0:
-            warnings.warn("gmsh returned no 2D elements; element grid is empty.")
-            return self._empty_element_grid(crs)
-
         node_tags, node_coords, _ = gmsh.model.mesh.getNodes()
-        coords_3d = np.asarray(node_coords, dtype=float).reshape(-1, 3)
-        node_xy = {
-            int(tag): (float(coord[0]), float(coord[1]))
-            for tag, coord in zip(node_tags, coords_3d)
-        }
-
-        records = []
+        blocks = []
         for element_type, tags_for_type, nodes_for_type in zip(
-            element_types,
-            element_tags,
-            element_node_tags,
+            element_types, element_tags, element_node_tags
         ):
             element_name, _, _, num_nodes, _, num_primary_nodes = gmsh.model.mesh.getElementProperties(
                 int(element_type)
             )
             num_nodes = int(num_nodes)
             num_primary_nodes = int(num_primary_nodes) if int(num_primary_nodes) > 0 else num_nodes
-            if num_nodes <= 0 or num_primary_nodes < 3:
-                continue
-
             tags = np.asarray(tags_for_type, dtype=np.int64)
             flat_nodes = np.asarray(nodes_for_type, dtype=np.int64)
-            if len(tags) == 0 or len(flat_nodes) == 0:
+            if num_nodes <= 0 or num_primary_nodes < 3 or len(tags) == 0 or len(flat_nodes) == 0:
                 continue
+            connectivity = flat_nodes.reshape((len(tags), num_nodes))[:, :num_primary_nodes]
+            blocks.append({
+                "element_type": int(element_type),
+                "element_name": element_name,
+                "tags": tags,
+                "connectivity": connectivity.copy(),
+            })
+        return {
+            "blocks": blocks,
+            "node_tags": np.asarray(node_tags, dtype=np.int64),
+            "node_xy": np.asarray(node_coords, dtype=float).reshape(-1, 3)[:, :2].copy(),
+        }
 
-            connectivity = flat_nodes.reshape((len(tags), num_nodes))
-            element_name_lower = element_name.lower()
-            is_triangle = "triangle" in element_name_lower
-            is_quad = "quadrangle" in element_name_lower or "quadrilateral" in element_name_lower
+    @staticmethod
+    def _element_block_frame(block, node_index, node_xy, crs):
+        """Build the element polygons of one gmsh element type."""
+        connectivity = block["connectivity"]
+        known = np.isin(connectivity, node_index.index.to_numpy()).all(axis=1)
+        tags = block["tags"][known]
+        connectivity = connectivity[known]
+        if len(tags) == 0:
+            return None
+        rows = node_index.loc[connectivity.ravel()].to_numpy().reshape(connectivity.shape)
+        polygons = shapely.polygons(node_xy[rows])
+        invalid = ~shapely.is_valid(polygons)
+        if invalid.any():
+            polygons[invalid] = shapely.make_valid(polygons[invalid])
+        usable = (
+            (shapely.get_type_id(polygons) == shapely.GeometryType.POLYGON)
+            & ~shapely.is_empty(polygons)
+            & (shapely.area(polygons) > 0)
+        )
+        polygons, tags, connectivity = polygons[usable], tags[usable], connectivity[usable]
+        if len(tags) == 0:
+            return None
+        name = block["element_name"]
+        name_lower = name.lower()
+        centroids = shapely.centroid(polygons)
+        return gpd.GeoDataFrame(
+            {
+                "element_tag": tags,
+                "element_type": block["element_type"],
+                "element_name": name,
+                "is_triangle": "triangle" in name_lower,
+                "is_quad": "quadrangle" in name_lower or "quadrilateral" in name_lower,
+                "node_tags": [tuple(int(t) for t in row) for row in connectivity],
+                "centroid_x": shapely.get_x(centroids),
+                "centroid_y": shapely.get_y(centroids),
+            },
+            geometry=polygons,
+            crs=crs,
+        )
 
-            for element_tag, element_nodes in zip(tags, connectivity):
-                primary_nodes = [int(tag) for tag in element_nodes[:num_primary_nodes]]
-                try:
-                    coords = [node_xy[int(tag)] for tag in primary_nodes]
-                except KeyError:
-                    continue
+    def _build_element_grid(self, element_data, zones_gdf=None):
+        """Turn captured element data into a zoned element-polygon GeoDataFrame."""
+        crs = getattr(zones_gdf, "crs", None)
+        if not element_data["blocks"]:
+            warnings.warn("gmsh returned no 2D elements; element grid is empty.")
+            return self._empty_element_grid(crs)
 
-                polygon = Polygon(coords)
-                if polygon.is_empty or polygon.area <= 0:
-                    continue
-                if not polygon.is_valid:
-                    polygon = make_valid(polygon)
-                if polygon.geom_type != "Polygon" or polygon.is_empty or polygon.area <= 0:
-                    continue
-
-                centroid = polygon.centroid
-                records.append(
-                    {
-                        "element_tag": int(element_tag),
-                        "element_type": int(element_type),
-                        "element_name": element_name,
-                        "is_triangle": bool(is_triangle),
-                        "is_quad": bool(is_quad),
-                        "node_tags": tuple(primary_nodes),
-                        "centroid_x": float(centroid.x),
-                        "centroid_y": float(centroid.y),
-                        "geometry": polygon,
-                    }
-                )
-
-        if not records:
+        node_index = pd.Series(
+            np.arange(len(element_data["node_tags"])), index=element_data["node_tags"]
+        )
+        node_index = node_index[~node_index.index.duplicated()]
+        frames = [
+            self._element_block_frame(block, node_index, element_data["node_xy"], crs)
+            for block in element_data["blocks"]
+        ]
+        frames = [frame for frame in frames if frame is not None]
+        if not frames:
             warnings.warn("gmsh returned no usable 2D elements; element grid is empty.")
             return self._empty_element_grid(crs)
 
-        grid = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
+        grid = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=crs)
         grid = grid.sort_values("element_tag").reset_index(drop=True)
-
-        return _assign_zones_to_elements(grid, zones_gdf)
+        return _assign_zones_to_elements(grid, _embedded_zones(zones_gdf))
 
     def get_element_grid(self, element_filter="all"):
         """
-        Return cached gmsh 2D element polygons for the generated mesh.
+        Return gmsh 2D element polygons for the generated mesh.
+
+        The raw element data is captured during ``generate()``; the polygons
+        are built on the first call and cached, so users who only need the
+        Voronoi grid do not pay for them.
 
         ``element_filter`` may be ``"all"``, ``"triangles"``, or ``"quads"``.
         The exporter is independent of the Voronoi tessellator and can represent
         mixed tri/quad meshes produced by future structured-buffer workflows.
 
         Each element is assigned the zone whose polygon intersects the element
-        centroid. Ties (overlapping zones or centroids on shared borders) are
+        centroid; field-only (``embed=False``) polygons never assign zones. Ties (overlapping zones or centroids on shared borders) are
         broken deterministically: highest ``z_order`` wins, then the zone that
         appears earliest in the conceptual-mesh polygon table.
         """
-        if self.element_grid is None:
+        if self.element_grid is None and self._element_data is None:
             raise RuntimeError(
                 "Element grid is not available. Call MeshGenerator.generate() first."
             )
         if element_filter not in {"all", "triangles", "quads"}:
             raise ValueError("element_filter must be one of 'all', 'triangles', or 'quads'.")
+        if self.element_grid is None:
+            self.element_grid = self._build_element_grid(self._element_data, self.zones_gdf)
+            self._element_data = None
 
         grid = self.element_grid
         if element_filter == "triangles":
@@ -565,7 +606,7 @@ class MeshGenerator:
                 logger.info(f"removeAllDuplicates: remapped {_dup_remapped}, pruned {_dup_pruned} tag(s) from fragment map.")
 
             # DIAG: Per-feature point tracking after dedup
-            if self.verbosity >= 2:
+            if self._verbosity >= 2:
                 _pt_feat_status = []
                 for i, input_dimtag in enumerate(object_tags):
                     key = _to_key(input_dimtag[0], input_dimtag[1])
@@ -708,7 +749,7 @@ class MeshGenerator:
                 logger.info(f"Heal post-processing: remapped {_heal_remapped}, pruned {_heal_pruned} tag(s) from fragment map.")
 
             # DIAG: Per-feature point tracking after heal
-            if self.verbosity >= 2:
+            if self._verbosity >= 2:
                 _pt_feat_heal = []
                 for i, input_dimtag in enumerate(object_tags):
                     key = _to_key(input_dimtag[0], input_dimtag[1])
@@ -759,6 +800,9 @@ class MeshGenerator:
         # We still track it so mesh-size fields can be applied later.
         nonembedded_point_tags = {}
         nonembedded_line_tags = {}
+        # Straddle point pairs are keyed by their *line* feature id, so they
+        # live apart from point features (whose ids share the same 0..n range).
+        nonembedded_straddle_tags = {}
         nonembedded_surface_tags = {}
         # For non-embedded polygons, we track their boundary curves so size
         # fields can be applied without forcing the polygon to cut/fragment the domain.
@@ -1193,7 +1237,7 @@ class MeshGenerator:
                 corridor_geometry(basis, eps)
                 for basis, eps in corridors_by_feature.values()
             ]))
-            if self.verbosity > 0:
+            if self._verbosity > 0:
                 logger.info(f"Constructed Barrier Zone from {len(corridors_by_feature)} protected features.")
 
         # --- Quad-buffer crossing priority -------------------------------
@@ -1333,7 +1377,7 @@ class MeshGenerator:
                         'strips': [info for _, info in created],
                         'n_surfaces_created': len(created),
                     }
-                elif self.verbosity > 0:
+                elif self._verbosity > 0:
                     logger.warning(f"Warning: Structured buffer requested for line {idx}, but no buffer surface was created.")
 
             elif use_virtual_straddle:
@@ -1364,20 +1408,20 @@ class MeshGenerator:
                     lx, ly = p.x + nx*epsilon, p.y + ny*epsilon
                     lt = gmsh.model.occ.addPoint(lx, ly, 0)
                     k_l = to_key(0, lt)
-                    if embedded:#TODO probably this always true for barriers
-                        input_tag_info[k_l] = {'type': 'point', 'id': idx}
+                    if embedded:
+                        input_tag_info[k_l] = {'type': 'straddle_point', 'id': idx}
                         embedded_point_tags.append(k_l)
                     else:
-                        nonembedded_point_tags.setdefault(int(idx), []).append(k_l)
+                        nonembedded_straddle_tags.setdefault(int(idx), []).append(k_l)
                     
                     rx, ry = p.x - nx*epsilon, p.y - ny*epsilon
                     rt = gmsh.model.occ.addPoint(rx, ry, 0)
                     k_r = to_key(0, rt)
                     if embedded:
-                        input_tag_info[k_r] = {'type': 'point', 'id': idx}
+                        input_tag_info[k_r] = {'type': 'straddle_point', 'id': idx}
                         embedded_point_tags.append(k_r)
                     else:
-                        nonembedded_point_tags.setdefault(int(idx), []).append(k_r)
+                        nonembedded_straddle_tags.setdefault(int(idx), []).append(k_r)
 
             else:
                 # This is a standard line feature that will act as a constraint
@@ -1391,7 +1435,7 @@ class MeshGenerator:
                             original_len = geom.length
                             geom = geom.difference(barrier_zone)
                             
-                            if self.verbosity > 1:
+                            if self._verbosity > 1:
                                 logger.info(f"  Line {idx} trimmed by barrier (Len: {original_len:.2f} -> {geom.length:.2f})")
                                 
                         except Exception as e:
@@ -1415,7 +1459,7 @@ class MeshGenerator:
 
                     coords = self._sanitize_coords(list(part.coords), min_points=2)
                     if len(coords) < 2:
-                        if self.verbosity > 0:
+                        if self._verbosity > 0:
                             logger.warning(f"Warning: Skipping degenerate line part for feature {idx} after coordinate cleanup.")
                         continue
 
@@ -1440,7 +1484,7 @@ class MeshGenerator:
                         else:
                             nonembedded_line_tags.setdefault(int(idx), []).append(key)
 
-                    if created_segments == 0 and self.verbosity > 0:
+                    if created_segments == 0 and self._verbosity > 0:
                         logger.warning(f"Warning: No valid line segments were created for feature {idx}.")
 
         def push_ring_vertices_off_strips(poly):
@@ -1481,7 +1525,7 @@ class MeshGenerator:
                 adjusted = make_valid(adjusted)
             if adjusted.geom_type != 'Polygon' or adjusted.is_empty:
                 return poly
-            if self.verbosity > 0:
+            if self._verbosity > 0:
                 logger.info(f"Moved {moved} zone-ring vertex(es) off structured buffer strips.")
             return adjusted
 
@@ -1505,7 +1549,7 @@ class MeshGenerator:
                         'n_surfaces_created': len(created),
                     }
                     polygon_band_geoms.append(band_geom)
-                elif self.verbosity > 0:
+                elif self._verbosity > 0:
                     logger.warning(f"Warning: Structured buffer requested for polygon {idx}, but no buffer surface was created.")
             buffer_footprints = polygon_band_geoms + line_strip_polygons
             buffer_footprints_union = (
@@ -1559,12 +1603,12 @@ class MeshGenerator:
                     input_tag_info[key] = {'type': 'surface', 'id': idx}
                     embedded_surface_tags.append(key)
         #call the gui before fragmentation for debugging
-        if self.verbosity > 1 and launch_gmsh_gui:
+        if self._verbosity > 1 and launch_gmsh_gui:
             gmsh.model.occ.synchronize()
             gmsh.fltk.run()
 
         # >>> DIAG: Pre-fragment inventory (summary)
-        if self.verbosity >= 2:
+        if self._verbosity >= 2:
             _line_feats = sorted(set(
                 input_tag_info.get(to_key(dt[0], dt[1]), {}).get('id', '?')
                 for dt in embedded_line_tags
@@ -1584,9 +1628,9 @@ class MeshGenerator:
             logger.warning("Warning: No geometry to mesh.")
             return {
                 'points': nonembedded_point_tags,
+                'straddle_points': nonembedded_straddle_tags,
                 'lines': nonembedded_line_tags,
                 'surfaces': nonembedded_surface_tags,
-                'straddle_surfs': {},
                 'structured_buffer_surfs': {},
                 'poly_curves': nonembedded_poly_curve_tags,
             }
@@ -1599,7 +1643,7 @@ class MeshGenerator:
         self._heal_and_remap_fragment_map(out_map, object_tags, input_tag_info)
 
         # >>> DIAG: Post-fragment summary
-        if self.verbosity >= 2:
+        if self._verbosity >= 2:
             all_surfs_post = gmsh.model.getEntities(2)
             all_lines_post = gmsh.model.getEntities(1)
             all_pts_post   = gmsh.model.getEntities(0)
@@ -1650,12 +1694,12 @@ class MeshGenerator:
         # <<< DIAG
 
         if pending_nonembedded_polys:
-            if self.verbosity > 0:
+            if self._verbosity > 0:
                 logger.info(f"Adding {len(pending_nonembedded_polys)} field-only polygon surface(s)...")
             for idx, poly in pending_nonembedded_polys:
                 s_tag, boundary_curve_tags = create_polygon_surface(poly)
                 if s_tag is None:
-                    if self.verbosity > 0:
+                    if self._verbosity > 0:
                         logger.warning(f"Warning: Skipping degenerate field-only polygon {idx}")
                     continue
                 nonembedded_surface_tags.setdefault(int(idx), []).append(to_key(2, s_tag))
@@ -1668,9 +1712,9 @@ class MeshGenerator:
         # feature corresponds to which new Gmsh tags.
         final_map = {
             'points': dict(nonembedded_point_tags),
+            'straddle_points': dict(nonembedded_straddle_tags),
             'lines': dict(nonembedded_line_tags),
             'surfaces': dict(nonembedded_surface_tags),
-            'straddle_surfs': {},
             'structured_buffer_surfs': {},
             'poly_curves': dict(nonembedded_poly_curve_tags),
         }
@@ -1708,10 +1752,10 @@ class MeshGenerator:
                         final_map['surfaces'][feat_id] = []
                     final_map['surfaces'][feat_id].extend(res_tags)
                     
-                elif kind == 'straddle_surf':
-                    if feat_id not in final_map['straddle_surfs']:
-                        final_map['straddle_surfs'][feat_id] = []
-                    final_map['straddle_surfs'][feat_id].extend(res_tags)
+                elif kind == 'straddle_point':
+                    if feat_id not in final_map['straddle_points']:
+                        final_map['straddle_points'][feat_id] = []
+                    final_map['straddle_points'][feat_id].extend(res_tags)
 
                 elif kind == 'structured_buffer_surf':
                     if feat_id not in final_map['structured_buffer_surfs']:
@@ -1721,7 +1765,7 @@ class MeshGenerator:
                 logger.warning(f"Warning: Tag {key} lost during fragmentation mapping.")
 
         # DIAG: Final map point summary
-        if self.verbosity >= 2:
+        if self._verbosity >= 2:
             _n_pt_feats = len(final_map.get('points', {}))
             _empty_feats = []
             _stale_feats = []
@@ -1750,7 +1794,7 @@ class MeshGenerator:
         # would silently lose its mesh nodes and field sizing downstream, so
         # re-attach each orphan to the embedded polygon feature containing it.
         claimed_surfaces = set()
-        for map_key in ('surfaces', 'straddle_surfs', 'structured_buffer_surfs'):
+        for map_key in ('surfaces', 'structured_buffer_surfs'):
             for dimtags in final_map.get(map_key, {}).values():
                 for dt in dimtags:
                     if isinstance(dt, (tuple, list)) and len(dt) >= 2 and int(dt[0]) == 2:
@@ -2107,7 +2151,7 @@ class MeshGenerator:
             ]
 
             n_created = int(spec.get('n_surfaces_created', 0) or 0)
-            if n_created and len(surf_tags) > n_created and self.verbosity > 0:
+            if n_created and len(surf_tags) > n_created and self._verbosity > 0:
                 logger.info(
                           f"Structured buffer for feature {feat_id} was split by fragmentation "
                           f"({n_created} surface(s) became {len(surf_tags)}); applying the "
@@ -2160,7 +2204,7 @@ class MeshGenerator:
                 else:
                     recombine_only_count += 1
 
-        if self.verbosity > 0:
+        if self._verbosity > 0:
             logger.info(
                       f"Applied structured quad-buffer meshing to "
                       f"{transfinite_count + recombine_only_count} surface(s) "
@@ -2177,7 +2221,7 @@ class MeshGenerator:
         original conceptual model features to define how the mesh should be
         refined near points, along lines, and within polygons.
         """
-        if self.verbosity > 0:
+        if self._verbosity > 0:
             logger.info("--- Setup Fields Debug ---")
             logger.info(f"Polygons GDF: {len(polygons_gdf)} rows")
             logger.info(f"Gmsh Surface Map: {len(gmsh_map.get('surfaces', {}))} entries")
@@ -2394,9 +2438,9 @@ class MeshGenerator:
             for fid in feature_ids_by_geom.get('lines', []):
                 if fid in gmsh_map.get('lines', {}):
                     tags_dict['lines'].extend(extract_tags(gmsh_map['lines'][fid]))
-                # Straddle/barrier lines may have been converted into points.
-                elif fid in gmsh_map.get('points', {}):
-                    tags_dict['points'].extend(extract_tags(gmsh_map['points'][fid]))
+                # Straddle/barrier lines are represented by point pairs.
+                elif fid in gmsh_map.get('straddle_points', {}):
+                    tags_dict['points'].extend(extract_tags(gmsh_map['straddle_points'][fid]))
                 elif ('line', fid) in gmsh_map.get('structured_buffer_surfs', {}):
                     # Buffer strips are embedded surfaces; list them as such so
                     # distance-growth fields target their boundary curves
@@ -2438,7 +2482,7 @@ class MeshGenerator:
 
             # Private metadata for built-in field helpers; custom MeshField
             # implementations can ignore it because tag lists remain unchanged.
-            tags_dict['_verbosity'] = self.verbosity
+            tags_dict['_verbosity'] = self._verbosity
             
             # Create the Gmsh field using the provided MeshField object.
             f_id = field.create(
@@ -2503,7 +2547,7 @@ class MeshGenerator:
         This handles cases where fragmentation splits surfaces, requiring
         geometric discovery to find the correct surface for points/lines.
         """
-        if self.verbosity > 0:
+        if self._verbosity > 0:
             logger.info("Explicitly embedding features into domain surfaces...")
 
         def is_embedded(row):
@@ -2523,7 +2567,7 @@ class MeshGenerator:
                             domain_surface_tags.add(dt[1])
 
         # >>> DIAG: domain surface collection summary
-        if self.verbosity >= 2:
+        if self._verbosity >= 2:
             _gdf_idxs = list(polygons_gdf.index) if not polygons_gdf.empty else []
             _map_keys = list(gmsh_map.get('surfaces', {}).keys())
             _matching = [i for i in _gdf_idxs if i in gmsh_map.get('surfaces', {})]
@@ -2728,13 +2772,13 @@ class MeshGenerator:
                             if dt[0] == 1:
                                 embed_entity(1, dt[1])
                     # Barrier/Straddle Points (these are points derived from lines)
-                    if idx in gmsh_map.get('points', {}): 
-                        for dt in gmsh_map['points'][idx]:
+                    if idx in gmsh_map.get('straddle_points', {}):
+                        for dt in gmsh_map['straddle_points'][idx]:
                             if dt[0] == 0:
                                 embed_entity(0, dt[1])
 
         # >>> DIAG: Embed summary
-        if self.verbosity >= 2:
+        if self._verbosity >= 2:
             _filt = _elog.get('skip_filtered', 0)
             logger.debug(f"[DIAG] Embed results: {_elog['ok']} OK, "
                          f"{_elog['conflict']} boundary-conflicts, "
@@ -2807,8 +2851,16 @@ class MeshGenerator:
         Raises:
             Exception: If any step in the Gmsh process fails.
         """
+        with verbosity_scope(self.verbosity):
+            self._verbosity = self._resolve_verbosity()
+            return self._generate(clean_polys, clean_lines, clean_points,
+                                  output_file=output_file, launch_gmsh_gui=launch_gmsh_gui)
+
+    def _generate(self, clean_polys, clean_lines, clean_points, output_file=None, launch_gmsh_gui=False):
+        """Run the Gmsh workflow behind ``generate()``."""
         self.triangular_quality = None
         self.element_grid = None
+        self._element_data = None
         self._initialize_gmsh()
         try:
             logger.info("Transferring Geometry to Gmsh...")
@@ -2818,7 +2870,7 @@ class MeshGenerator:
             self._embed_features(gmsh_map, clean_polys, clean_lines, clean_points)
 
             # >>> DIAG: Post-embed summary
-            if self.verbosity >= 2:
+            if self._verbosity >= 2:
                 all_surfs = gmsh.model.getEntities(2)
                 _with_emb, _without_emb, _total_emb = 0, 0, 0
                 for surf_dt in all_surfs:
@@ -2871,11 +2923,11 @@ class MeshGenerator:
             
             # Run explicit optimization passes after generation for higher quality.
             if self.optimization_cycles > 0:
-                if self.verbosity > 0:
+                if self._verbosity > 0:
                     logger.info(f"Running {self.optimization_cycles} Optimization Cycles (Relocate2D & Laplace2D)...")
                 
                 for i in range(self.optimization_cycles):
-                    if self.verbosity > 1:
+                    if self._verbosity > 1:
                         logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
                     # Moves nodes to improve element shape (compactness).
                     gmsh.model.mesh.optimize("Relocate2D",niter=1)
@@ -2884,7 +2936,7 @@ class MeshGenerator:
 
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
             self.triangular_quality = self._collect_triangular_quality(meshed_surface_tags)
-            self.element_grid = self._collect_element_grid(clean_polys, meshed_surface_tags)
+            self._element_data = self._capture_element_data(meshed_surface_tags)
             
             if output_file:
                 gmsh.write(output_file)
@@ -2950,8 +3002,8 @@ class MeshGenerator:
                                 if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 1:
                                     _accumulate_nodes(1, int(dimtag[1]), True, tag_to_xy)
                         # Straddle/barrier lines may have been converted into points.
-                        elif int(fid) in gmsh_map.get('points', {}):
-                            for dimtag in gmsh_map['points'][int(fid)]:
+                        elif int(fid) in gmsh_map.get('straddle_points', {}):
+                            for dimtag in gmsh_map['straddle_points'][int(fid)]:
                                 if isinstance(dimtag, (tuple, list)) and len(dimtag) >= 2 and int(dimtag[0]) == 0:
                                     _accumulate_nodes(0, int(dimtag[1]), True, tag_to_xy)
 
@@ -2968,6 +3020,6 @@ class MeshGenerator:
             return True
 
         except Exception as e:
-            logger.info(f"Mesh Generation Failed: {e}")
+            logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
             raise e
