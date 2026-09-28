@@ -1,0 +1,17 @@
+id: v1_linear
+tier: 0
+description: >
+  Uniform 1D flow in a 2000 x 1000 m rectangle with a uniform cell size.
+  Exact head is linear in x; a two-point flux on an orthogonal Voronoi grid
+  reproduces it to roundoff, so any error is a grid (or cell-centre) defect.
+source: https://flopy.readthedocs.io/en/latest/Notebooks/dis_voronoi_example.html
+# Any projected CRS; mf6Voronoi requires one on its input files.
+crs: EPSG:32610
+# Hexagons of spacing 34 m have ~1000 m2 each -> ~2000 cells, the size of
+# FloPy's example (Triangle maximum_area=1000).
+h_max: 34.0
+growth: 1.2
+target_ncpl: 2000
+domain: POLYGON ((0 0, 2000 0, 2000 1000, 0 1000, 0 0))
+features: []
+mf6_problems: [linear]

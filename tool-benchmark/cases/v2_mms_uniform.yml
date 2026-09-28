@@ -1,0 +1,13 @@
+id: v2_mms_uniform
+tier: 0
+description: >
+  Manufactured solution h = cos(ax)cos(ay) with its source, on a 1000 x 1000 m
+  square with a uniform cell size. Convergence sweep over three cell counts.
+source: ../vorogridgen/examples/mesh_accuracy.py (mms problem)
+crs: EPSG:32610
+h_max: 25.0
+growth: 1.2
+target_ncpl: [2000, 500, 8000]
+domain: POLYGON ((0 0, 1000 0, 1000 1000, 0 1000, 0 0))
+features: []
+mf6_problems: [mms]

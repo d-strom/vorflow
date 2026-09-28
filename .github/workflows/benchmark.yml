@@ -1,0 +1,120 @@
+name: benchmark
+
+# Voronoi grid generator benchmark (tool-benchmark/, docs/benchmark-plan.md).
+#  - vorogridgen: Windows only. Downloads the VOROGRIDGEN freeware from
+#    Hydrosymple at run time (it is never committed here), checks it on the
+#    example it ships with, then runs every benchmark case.
+#  - others:      vorflow, mf6Voronoi and FloPy on Linux, in tool-benchmark/environment.yml.
+#  - report:      merges both jobs' result rows and grids, then compiles the
+#                 tables and figures into the benchmark-results artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tool-benchmark/**"
+      - ".github/workflows/benchmark.yml"
+  pull_request:
+    paths:
+      - "tool-benchmark/**"
+      - "src/vorflow/**"
+      - ".github/workflows/benchmark.yml"
+
+env:
+  VOROGRIDGEN_URL: "https://hydrosymple.com/?sdm_process_download=1&download_id=7123"
+  VOROGRIDGEN_EXAMPLE_NCPL: "6440"   # golden cell count of the shipped example
+
+jobs:
+  vorogridgen:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: tool-benchmark
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install harness dependencies (no meshing tools needed)
+        run: python -m pip install numpy pandas shapely pyyaml psutil matplotlib "flopy>=3.10"
+      - name: Install MODFLOW 6
+        run: get-modflow --subset mf6 .bin
+      - name: Download VOROGRIDGEN
+        run: |
+          curl -fsSL -o vorogridgen.zip "$VOROGRIDGEN_URL"
+          sha256sum vorogridgen.zip
+          mkdir -p .bin/vorogridgen_dist
+          unzip -q vorogridgen.zip -d .bin/vorogridgen_dist
+          exe=$(find .bin/vorogridgen_dist -iname vorogridgen.exe | head -n 1)
+          test -n "$exe" || { echo "vorogridgen.exe not found in the download"; exit 1; }
+          cp "$exe" .bin/vorogridgen.exe
+          echo "VOROGRIDGEN_EXAMPLE=$(dirname "$exe")/example" >> "$GITHUB_ENV"
+      - name: Check VOROGRIDGEN on its shipped example
+        run: |
+          cd "$VOROGRIDGEN_EXAMPLE"
+          "$GITHUB_WORKSPACE/tool-benchmark/.bin/vorogridgen.exe" vg.in < /dev/null
+          grep -Eiq "^\s*ncpl\s+$VOROGRIDGEN_EXAMPLE_NCPL\b" model.disv \
+            || { echo "example NCPL differs from $VOROGRIDGEN_EXAMPLE_NCPL"; grep -i ncpl model.disv; exit 1; }
+      - name: Run the benchmark for VOROGRIDGEN
+        run: python ci.py windows
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rows-vorogridgen
+          path: |
+            tool-benchmark/results/rows
+            tool-benchmark/work/**/grid.pkl
+            tool-benchmark/work/**/vg.in
+            tool-benchmark/work/**/vorogridgen.log
+
+  others:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -l {0}
+        working-directory: tool-benchmark
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Micromamba
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-file: tool-benchmark/environment.yml
+          cache-environment: true
+      - name: Install MODFLOW 6 and Triangle
+        run: get-modflow --subset mf6,triangle .bin
+      - name: Run the benchmark for vorflow, mf6Voronoi and FloPy
+        run: python ci.py others
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rows-others
+          path: |
+            tool-benchmark/results/rows
+            tool-benchmark/work/**/grid.pkl
+
+  report:
+    needs: [vorogridgen, others]
+    if: always()
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tool-benchmark
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install report dependencies
+        run: python -m pip install numpy pandas shapely pyyaml matplotlib "flopy>=3.10"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rows-*
+          path: tool-benchmark
+          merge-multiple: true
+      - name: Compile tables and figures
+        run: python ci.py report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: tool-benchmark/results

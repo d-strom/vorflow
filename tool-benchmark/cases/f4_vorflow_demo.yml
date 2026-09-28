@@ -1,0 +1,43 @@
+id: f4_vorflow_demo
+tier: 1
+description: >
+  vorflow comprehensive demo: 200 x 200 m domain with a square hole, a refined
+  zone, a sinusoidal river, a fault barrier that runs into the hole, and two
+  wells. Sizes follow the demo notebook; the river is clipped to the domain.
+source: examples/comprehensive_demo.ipynb
+crs: EPSG:32610
+h_max: 20.0
+growth: 1.2
+target_ncpl: 3000
+domain: >
+  POLYGON ((0 0, 200 0, 200 200, 0 200, 0 0),
+           (80 80, 80 120, 120 120, 120 80, 80 80))
+features:
+  - id: zone
+    kind: polygon
+    h: 3.0
+    wkt: POLYGON ((50 50, 75 50, 75 75, 50 75, 50 50))
+  - id: river
+    kind: line
+    h: 2.0
+    wkt: >
+      LINESTRING (-10 58.170580, 0 75.000000, 10 91.829420, 20 93.185949,
+      30 77.822400, 40 59.863950, 50 55.821515, 60 69.411690, 70 88.139732,
+      80 94.787165, 90 83.242370, 100 64.119578, 110 55.000196, 120 64.268542,
+      130 83.403341, 140 94.812147, 150 88.005757, 160 69.241934, 170 55.772050,
+      180 59.980255, 190 77.997544, 200 93.258905, 210 91.733113)
+  - id: fault
+    kind: line
+    h: 2.0
+    barrier: true
+    wkt: LINESTRING (100 0, 100 150)
+  - id: well-a
+    kind: point
+    h: 1.0
+    wkt: POINT (25 25)
+  - id: well-b
+    kind: point
+    h: 1.0
+    wkt: POINT (60 60)
+# Exact heads on every boundary cell (holes included) keep the linear solution exact.
+mf6_problems: [linear]

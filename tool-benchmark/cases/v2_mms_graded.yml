@@ -1,0 +1,18 @@
+id: v2_mms_graded
+tier: 0
+description: >
+  The V2 manufactured solution on the same square, with a refined patch in the
+  middle so the grid grades from 8 m to 50 m (growth 1.2). Error here is driven
+  by the grading transition. Convergence sweep over three cell counts.
+source: new (docs/benchmark-plan.md, V2)
+crs: EPSG:32610
+h_max: 50.0
+growth: 1.2
+target_ncpl: [3000, 1000, 9000]
+domain: POLYGON ((0 0, 1000 0, 1000 1000, 0 1000, 0 0))
+features:
+  - id: patch
+    kind: polygon
+    h: 8.0
+    wkt: POLYGON ((400 400, 650 400, 650 650, 400 650, 400 400))
+mf6_problems: [mms]
