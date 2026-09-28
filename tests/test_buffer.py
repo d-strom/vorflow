@@ -3,6 +3,7 @@ import warnings
 import gmsh
 import pytest
 from shapely.geometry import LineString, Polygon, box
+from shapely.ops import split
 
 from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
 
@@ -222,13 +223,48 @@ def test_transfinite_survives_fragmentation():
     assert round(line.length) - 2 <= len(quads) <= round(line.length) + 4
 
 
-def test_structured_quad_buffer_barrier_is_not_cut_again_by_tessellator():
+def _straddling_cell_count(grid, line, sliver_fraction=1e-6):
+    """Count cells the line splits into at least two non-sliver pieces."""
+    count = 0
+    for cell in grid.geometry[grid.geometry.intersects(line)]:
+        pieces = [p for p in split(cell, line).geoms if p.area > sliver_fraction * cell.area]
+        count += len(pieces) > 1
+    return count
+
+
+def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
     mesher, cm = _generate_line_buffer_mesh(thickness=1, return_context=True)
+    line = cm.clean_lines.iloc[0].geometry
 
     tessellator = VoronoiTessellator(mesher, cm, clip_to_boundary=True)
     grid = tessellator.generate()
 
-    assert len(grid) == len(mesher.node_tags)
+    # Buffer cells already have faces on the line and are not re-cut. Only
+    # the end caps, where the strip meets the domain boundary and nodes land
+    # on the line, straddle it and are split.
+    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
+    assert set(mesher.node_tags).issubset(set(grid["node_id"]))
+    assert grid["node_id"].is_unique
+    assert len(fragments) <= 4
+    assert (fragments.geometry.distance(line.boundary) < 1.0).all()
+    assert _straddling_cell_count(grid, line) == 0
+
+
+def test_structured_quad_buffer_thickness2_barrier_is_enforced():
+    """Catches quad-buffered barriers being skipped when a node row sits on the line."""
+    mesher, cm = _generate_line_buffer_mesh(thickness=2, return_context=True)
+    line = cm.clean_lines.iloc[0].geometry
+
+    grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
+
+    # The node row on the line gives ~one straddling cell per lc of line;
+    # each is split in two along the barrier.
+    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
+    assert len(fragments) >= 0.5 * line.length
+    assert (fragments.geometry.distance(line) < 1e-9).all()
+    assert _straddling_cell_count(grid, line) == 0
+    assert grid["node_id"].is_unique
+    assert grid.geometry.area.sum() == pytest.approx(40.0)
 
 
 def test_polygon_structured_quad_buffer_produces_quads():

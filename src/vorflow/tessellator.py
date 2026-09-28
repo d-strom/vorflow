@@ -12,6 +12,20 @@ from shapely.validation import make_valid
 
 logger = logging.getLogger(__name__)
 
+# Split pieces smaller than this fraction of the cell area are treated as
+# floating-point slivers from a barrier that runs along a cell face.
+BARRIER_SLIVER_FRACTION = 1e-6
+
+
+def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
+    """Return the polygon pieces of a cell split by a line, or [] when the line does not straddle it."""
+    pieces = [piece for piece in split(cell_poly, line).geoms if isinstance(piece, (Polygon, MultiPolygon))]
+    min_area = sliver_fraction * cell_poly.area
+    significant = [piece for piece in pieces if piece.area > min_area]
+    if len(significant) < 2:
+        return []
+    return pieces
+
 
 def _primary_piece_position(pieces, generator):
     """Return the position of the piece that keeps the node_id: the largest covering the generator, else the largest."""
@@ -353,12 +367,21 @@ class VoronoiTessellator:
 
     def _enforce_barriers(self, grid_gdf):
         """
-        Splits Voronoi cells that are crossed by barrier lines.
+        Splits Voronoi cells that are straddled by barrier lines.
 
-        This method iterates through all line features marked as `is_barrier=True`
-        (and that do not use the `straddle_width` method) and cuts any Voronoi
-        cell they intersect. The largest resulting piece of a split cell retains
-        the original cell's ID, while smaller pieces are assigned new, unique IDs.
+        Every line marked `is_barrier=True` is checked, whatever its meshing
+        method. Straddle-width and quad-buffer barriers usually already run
+        along cell faces, but not everywhere: quad_buffer_thickness=2 puts a
+        node row on the line, and end caps where a line meets the domain
+        boundary leave nodes on it. A cell is therefore split only when the
+        line leaves at least two pieces larger than BARRIER_SLIVER_FRACTION
+        of its area; cells the line merely runs along are left untouched.
+
+        The piece covering the generator point (else the largest piece)
+        keeps the original node_id and x/y. The other pieces get new,
+        unique IDs above the current maximum. These fragments have no
+        generator of their own, so their x/y are set to the fragment
+        centroid and do not denote a mesh node.
 
         Args:
             grid_gdf (gpd.GeoDataFrame): The current Voronoi grid.
@@ -368,30 +391,17 @@ class VoronoiTessellator:
         """
         if self.cm.clean_lines.empty:
             return grid_gdf
-            
-        # We only need to cut barriers that were NOT handled by the "straddle"
-        # method in the mesh generator. Straddled barriers are already aligned.
+
         # fillna keeps the old `== True` semantics: rows with a missing
         # is_barrier value are treated as non-barriers, not as errors.
         mask_barrier = self.cm.clean_lines['is_barrier'].fillna(False).astype(bool)
-        
-        if 'straddle_width' in self.cm.clean_lines.columns:
-            mask_no_straddle = (self.cm.clean_lines['straddle_width'].isna()) | (self.cm.clean_lines['straddle_width'] <= 0)
-        else:
-            mask_no_straddle = True
+        barriers_to_cut = self.cm.clean_lines[mask_barrier]
 
-        if 'quad_buffer' in self.cm.clean_lines.columns:
-            mask_no_quad_buffer = ~self.cm.clean_lines['quad_buffer'].fillna(False).astype(bool)
-        else:
-            mask_no_quad_buffer = True
-            
-        barriers_to_cut = self.cm.clean_lines[mask_barrier & mask_no_straddle & mask_no_quad_buffer]
-        
         if barriers_to_cut.empty:
             return grid_gdf
-            
-        logger.info(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines (Straddle lines skipped)...")
-        
+
+        logger.info(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines...")
+
         current_grid = grid_gdf
 
         # Keep the caller's integer dtype while assigning fragment IDs with
@@ -416,37 +426,32 @@ class VoronoiTessellator:
                     continue
                     
                 try:
-                    # Split the cell polygon by the barrier line.
-                    split_result = split(cell_poly, line)
-                    
-                    if len(split_result.geoms) > 1:
-                        valid_pieces = []
-                        
-                        # Sort the pieces by area. The largest piece will keep the original ID.
-                        sorted_pieces = sorted(list(split_result.geoms), key=lambda p: p.area, reverse=True)
-                        
-                        for i, piece in enumerate(sorted_pieces):
-                            if isinstance(piece, (Polygon, MultiPolygon)):
-                                new_row = cell_row.copy()
-                                new_row.geometry = piece
-                                
-                                if i == 0:
-                                    # The largest piece keeps the original ID and attributes.
-                                    pass 
-                                else:
-                                    # Smaller pieces get a new ID and their own centroid.
-                                    max_id += 1
-                                    new_row['node_id'] = max_id
-                                    new_row['x'] = piece.centroid.x
-                                    new_row['y'] = piece.centroid.y
-                                    
-                                valid_pieces.append(new_row)
-                        
-                        # If the split was successful, mark the original cell for removal.
-                        if valid_pieces:
-                            cells_to_remove_indices.append(cell_idx)
-                            cells_to_keep.extend(valid_pieces)
-                            
+                    pieces = _straddled_pieces(cell_poly, line)
+                    if not pieces:
+                        continue
+
+                    generator = Point(float(cell_row['x']), float(cell_row['y']))
+                    primary = _primary_piece_position(pieces, generator)
+                    # Fresh IDs follow descending area, as before.
+                    others = sorted(
+                        (piece for i, piece in enumerate(pieces) if i != primary),
+                        key=lambda p: p.area,
+                        reverse=True,
+                    )
+
+                    primary_row = cell_row.copy()
+                    primary_row.geometry = pieces[primary]
+                    cells_to_keep.append(primary_row)
+                    for piece in others:
+                        max_id += 1
+                        new_row = cell_row.copy()
+                        new_row.geometry = piece
+                        new_row['node_id'] = max_id
+                        new_row['x'] = piece.centroid.x
+                        new_row['y'] = piece.centroid.y
+                        cells_to_keep.append(new_row)
+                    cells_to_remove_indices.append(cell_idx)
+
                 except Exception as e:
                     logger.warning(f"Warning: Failed to split cell {cell_row['node_id']}: {e}")
             

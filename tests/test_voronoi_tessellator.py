@@ -60,6 +60,69 @@ def test_enforce_barriers_preserves_uint64_ids_and_split_fragments():
     assert not result.geometry.crosses(barrier).any()
 
 
+def _barrier_tessellator(line, **line_kwargs):
+    """Return a tessellator whose conceptual mesh holds one barrier line in a 2 x 1 box."""
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (2, 0), (2, 1), (0, 1)]), zone_id=1)
+    cm.add_line(line, line_id="barrier", resolution=1.0, is_barrier=True, **line_kwargs)
+    cm.generate()
+    mesh_gen = DummyMeshGenerator(nodes=np.empty((0, 2)), tags=[], zones_gdf=cm.clean_polygons)
+    return VoronoiTessellator(mesh_gen, cm)
+
+
+def _two_cell_grid():
+    """Return two unit cells sharing the face x=1."""
+    return gpd.GeoDataFrame(
+        {"node_id": np.array([1, 2], dtype=np.int64), "x": [0.5, 1.5], "y": [0.5, 0.5]},
+        geometry=[
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            Polygon([(1, 0), (2, 0), (2, 1), (1, 1)]),
+        ],
+    )
+
+
+def test_enforce_barriers_leaves_cells_whose_face_lies_on_the_barrier():
+    """Guards against splitting cells whose face merely lies on the barrier."""
+    tessellator = _barrier_tessellator(LineString([(1, 0), (1, 1)]), densify=False)
+
+    result = tessellator._enforce_barriers(_two_cell_grid())
+
+    assert sorted(result["node_id"]) == [1, 2]
+    assert result.geometry.area.tolist() == pytest.approx([1.0, 1.0])
+
+
+def test_enforce_barriers_cuts_straddle_width_barrier_crossing_a_cell():
+    """Catches straddle-width barriers being skipped where a cell still straddles them."""
+    line = LineString([(0.25, 0), (0.25, 1)])
+    tessellator = _barrier_tessellator(line, straddle_width=0.1, densify=False)
+
+    result = tessellator._enforce_barriers(_two_cell_grid())
+
+    assert sorted(result["node_id"]) == [1, 2, 3]
+    kept = result[result["node_id"] == 1].iloc[0]
+    fragment = result[result["node_id"] == 3].iloc[0]
+    assert kept.geometry.area == pytest.approx(0.75)
+    assert (kept["x"], kept["y"]) == (0.5, 0.5)
+    assert fragment.geometry.area == pytest.approx(0.25)
+    assert fragment["x"] == pytest.approx(0.125)
+    assert not result.geometry.crosses(line).any()
+
+
+def test_enforce_barriers_keeps_id_on_piece_holding_the_generator():
+    """Catches the node_id moving to a larger piece that does not hold the generator."""
+    line = LineString([(0.25, 0), (0.25, 1)])
+    tessellator = _barrier_tessellator(line, densify=False)
+    grid = _two_cell_grid()
+    grid.loc[0, "x"] = 0.1
+
+    result = tessellator._enforce_barriers(grid)
+
+    kept = result[result["node_id"] == 1].iloc[0]
+    assert kept.geometry.area == pytest.approx(0.25)
+    assert kept["x"] == 0.1
+    assert result[result["node_id"] == 3].iloc[0].geometry.area == pytest.approx(0.75)
+
+
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
     """Catches removing a cell when Shapely raises while splitting it."""
     tessellator, _ = _plain_barrier_tessellator()
