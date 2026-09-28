@@ -35,6 +35,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `MeshGenerator(verbosity=...)` no longer changes the package-wide log
   level; the setting applies only while `generate()` runs.
 - Custom `MeshField` subclasses with unhashable attributes can be grouped.
+- With `heal_shapes=True`, surfaces or curves with identical bounding boxes
+  (e.g. two triangles tiling a square) no longer swap feature ownership, which
+  gave one zone's refinement to its neighbour. Entities are matched across
+  `removeAllDuplicates`/`healShapes` by location within a tolerance, so near
+  coincident points also resolve to the nearest survivor.
 - Inset-mirror boundary centering skips nodes whose mirror ghost would land
   inside the domain, and is about 20x faster on large meshes.
 

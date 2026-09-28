@@ -4,13 +4,25 @@ import warnings
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 import vorflow
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator
+from vorflow.engine import MeshGenerator, _SurvivorIndex
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
+
+
+def test_survivor_index_picks_same_tag_then_nearest_within_tolerance():
+    survivors = _SurvivorIndex({(0, 1): (0.0, 0.0, 0.0), (0, 2): (4e-7, 0.0, 0.0),
+                                (0, 3): (0.5, 0.0, 0.0)}, tolerance=1e-6)
+    # Two survivors round to the same 6-decimal key; the nearer one wins.
+    assert survivors.match(0, 9, (3e-7, 0.0, 0.0)) == 2
+    assert survivors.match(0, 1, (3e-7, 0.0, 0.0)) == 1
+    # Offsets straddling a rounding boundary still match.
+    assert survivors.match(0, 9, (0.5000004, 0.0, 0.0)) == 3
+    assert survivors.match(0, 9, (0.25, 0.0, 0.0)) is None
+    assert survivors.match(1, 9, (0.0, 0.0, 0.0)) is None
 
 
 def _barrier_model(with_point):
@@ -133,3 +145,22 @@ def test_generate_rejects_missing_background_lc_before_touching_gmsh():
     with pytest.raises(ValueError, match="background_lc must be provided"):
         mg.generate(*_barrier_model(with_point=False))
     assert not gmsh.is_initialized()
+
+
+def test_heal_remap_keeps_surfaces_with_identical_bounding_boxes_apart():
+    # Two triangles tiling a square share a bounding box; matching healed
+    # surfaces by bbox alone gave the fine triangle's field to both.
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (10, 0), (10, 10)]), zone_id="fine", resolution=1)
+    cm.add_polygon(Polygon([(0, 0), (10, 10), (0, 10)]), zone_id="coarse", resolution=3)
+    clean = cm.generate()
+    maps = {}
+    for heal in (False, True):
+        mg = MeshGenerator(background_lc=3, heal_shapes=heal, verbosity=0)
+        mg._initialize_gmsh()
+        try:
+            maps[heal] = mg._add_geometry(*clean)["surfaces"]
+        finally:
+            mg._finalize_gmsh()
+    assert maps[True] == maps[False]
+    assert len(maps[True][0]) == len(maps[True][1]) == 1

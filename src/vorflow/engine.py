@@ -34,6 +34,7 @@ import shapely
 from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 from shapely.validation import make_valid
+from scipy.spatial import cKDTree
 from .fields import (
     DEFAULT_GROWTH_FACTOR,
     ConstantField,
@@ -87,15 +88,66 @@ def _to_key(dim, tag):
     return (int(dim), int(tag))
 
 
-# Coordinate rounding used to match OCC entities across removeAllDuplicates
-# (~nm) and healShapes (0.1 mm, absorbing its ~1e-6 drift).
-_DEDUP_COORD_DECIMALS = 6
-_HEAL_COORD_DECIMALS = 4
+# Tolerances for matching OCC entities across removeAllDuplicates (~um) and
+# healShapes (0.1 mm, absorbing its ~1e-6 drift).
+_DEDUP_MATCH_TOL = 1e-6
+_HEAL_MATCH_TOL = 1e-4
 
 
-def _rounded(values, decimals):
-    """Hashable coordinate key: ``values`` rounded to ``decimals`` places."""
-    return tuple(round(v, decimals) for v in values)
+def _entity_signature(dim, tag):
+    """Location signature of an OCC entity: point coordinates, or bbox plus centre of mass.
+
+    A bounding box alone is ambiguous for curves and surfaces (two triangles
+    tiling a square share one), so they add their centre of mass.
+    """
+    bb = gmsh.model.occ.getBoundingBox(dim, tag)
+    if dim == 0:
+        return tuple(bb[:3])
+    return tuple(bb[:6]) + tuple(gmsh.model.occ.getCenterOfMass(dim, tag))
+
+
+def _snapshot_signatures(dimtags, stage):
+    """Signatures of the given (dim, tag) entities, keyed by (dim, tag); unmeasurable ones are skipped."""
+    signatures = {}
+    for d, t in dimtags:
+        if (d, t) in signatures:
+            continue
+        try:
+            signatures[(d, t)] = _entity_signature(d, t)
+        except Exception:
+            # gmsh raises plain Exception for an entity it cannot measure;
+            # without a signature it cannot be matched across the rebuild.
+            logger.debug("%s: no signature for entity (dim %d, tag %d); it "
+                         "cannot be remapped.", stage, d, t)
+    return signatures
+
+
+class _SurvivorIndex:
+    """Entities surviving an OCC rebuild, searchable by signature within a tolerance."""
+
+    def __init__(self, signatures, tolerance):
+        self.tolerance = tolerance
+        by_dim = {}
+        for (d, t), signature in signatures.items():
+            by_dim.setdefault(d, []).append((t, signature))
+        self._trees = {
+            d: (np.array([t for t, _ in items]), cKDTree(np.array([sig for _, sig in items])))
+            for d, items in by_dim.items()
+        }
+
+    def match(self, dim, tag, signature):
+        """Surviving tag with this signature (the same tag if it qualifies, else the nearest), or None."""
+        if dim not in self._trees:
+            return None
+        tags, tree = self._trees[dim]
+        hits = tree.query_ball_point(signature, r=self.tolerance, p=np.inf)
+        if not hits:
+            return None
+        hit_tags = tags[hits]
+        if tag in hit_tags:
+            return int(tag)
+        offsets = np.abs(tree.data[hits] - np.asarray(signature)).max(axis=1)
+        return int(hit_tags[np.argmin(offsets)])
 
 
 def _embedded_zones(zones_gdf):
@@ -651,29 +703,22 @@ class MeshGenerator:
         tolerance, so it cannot destroy surfaces or turn interior lines into
         boundaries. It can merge coincident entities (changing tags) without
         returning a mapping, so point coordinates are snapshotted beforehand
-        and out_map tags that disappear are remapped to the surviving point at
-        the same location.
+        and out_map tags that disappear are remapped to the nearest surviving
+        point within _DEDUP_MATCH_TOL.
         """
-        pre_dedup_coords = self._snapshot_point_coords(out_map)
+        pre_dedup = _snapshot_signatures(
+            {(int(d), int(t)) for entries in out_map for d, t in entries if int(d) == 0},
+            "Pre-dedup snapshot",
+        )
         gmsh.model.occ.removeAllDuplicates()
         if len(out_map) == 0:
             return
 
-        occ_alive = set()
-        alive_pts_by_coord = {}  # rounded (x, y, z) -> surviving point tag
-        for dim in range(3):
-            for dt in gmsh.model.occ.getEntities(dim):
-                d, t = int(dt[0]), int(dt[1])
-                occ_alive.add((d, t))
-                if d == 0:
-                    try:
-                        bb = gmsh.model.occ.getBoundingBox(0, t)
-                        alive_pts_by_coord[_rounded(bb[:3], _DEDUP_COORD_DECIMALS)] = t
-                    except Exception:
-                        # gmsh raises plain Exception for an entity it cannot
-                        # measure; that point simply cannot be a remap target.
-                        logger.debug("Post-dedup survey: no bounding box "
-                                     "for surviving point %d.", t)
+        occ_alive = {(int(d), int(t)) for dim in range(3) for d, t in gmsh.model.occ.getEntities(dim)}
+        survivors = _SurvivorIndex(
+            _snapshot_signatures(sorted(dt for dt in occ_alive if dt[0] == 0), "Post-dedup survey"),
+            _DEDUP_MATCH_TOL,
+        )
 
         remapped = 0
         pruned = 0
@@ -683,10 +728,9 @@ class MeshGenerator:
                 d, t = int(dt[0]), int(dt[1])
                 if (d, t) in occ_alive:
                     new_entries.append(dt)
-                elif d == 0 and (d, t) in pre_dedup_coords:
+                elif (d, t) in pre_dedup:
                     # Tag was killed by dedup: find the surviving point.
-                    coord_key = _rounded(pre_dedup_coords[(d, t)], _DEDUP_COORD_DECIMALS)
-                    new_tag = alive_pts_by_coord.get(coord_key)
+                    new_tag = survivors.match(d, t, pre_dedup[(d, t)])
                     if new_tag is not None:
                         new_entries.append((0, new_tag))
                         remapped += 1
@@ -700,76 +744,37 @@ class MeshGenerator:
 
         self._log_point_survival_after_dedup(object_tags, out_map, input_tag_info, occ_alive)
 
-    @staticmethod
-    def _snapshot_point_coords(out_map):
-        """(x, y, z) of every dim-0 entity in out_map, keyed by (0, tag)."""
-        coords = {}
-        for entries in out_map:
-            for dt in entries:
-                d, t = int(dt[0]), int(dt[1])
-                if d == 0 and (d, t) not in coords:
-                    try:
-                        bb = gmsh.model.occ.getBoundingBox(0, t)
-                        coords[(d, t)] = (bb[0], bb[1], bb[2])
-                    except Exception:
-                        # gmsh raises plain Exception for an entity it cannot
-                        # measure; without coordinates it cannot be remapped.
-                        logger.debug("Pre-dedup snapshot: no bounding box for "
-                                     "point %d; it cannot be remapped if "
-                                     "removeAllDuplicates renumbers it.", t)
-        return coords
-
     def _heal_and_remap_fragment_map(self, out_map, object_tags, input_tag_info):
         """Optionally heal OCC shapes, synchronize, and remap out_map by coordinates, in place.
 
         healShapes rebuilds OCC topology - renumbering entities and even
-        reusing a tag number for a DIFFERENT entity - so remapping is done
-        purely by coordinate matching, never by tag identity. Always
+        reusing a tag number for a DIFFERENT entity - so remapping matches
+        entity signatures (location, not tag identity). Always
         synchronizes the OCC model, even when heal_shapes is off.
         """
         if not self.heal_shapes:
             gmsh.model.occ.synchronize()
             return
 
-        pre_heal_coords = self._snapshot_entity_bboxes(out_map)
-        pre_heal = set()
-        for dim in range(3):
-            for dt in gmsh.model.occ.getEntities(dim):
-                pre_heal.add((int(dt[0]), int(dt[1])))
+        pre_heal = _snapshot_signatures(
+            {(int(d), int(t)) for entries in out_map for d, t in entries if int(d) in (0, 1, 2)},
+            "Pre-heal snapshot",
+        )
+        pre_heal_entities = {(int(d), int(t)) for dim in range(3) for d, t in gmsh.model.occ.getEntities(dim)}
 
         self._heal_occ_shapes()
         gmsh.model.occ.synchronize()
         if len(out_map) == 0:
             return
 
-        surviving, remapped, pruned = self._remap_after_heal(out_map, pre_heal_coords)
+        surviving, remapped, pruned = self._remap_after_heal(out_map, pre_heal)
         if remapped > 0 or pruned > 0:
             logger.info(f"Heal post-processing: remapped {remapped}, pruned {pruned} tag(s) from fragment map.")
 
         self._log_point_survival_after_heal(
             object_tags, out_map, input_tag_info, surviving, remapped, pruned
         )
-        self._log_heal_dim0_changes(pre_heal, surviving)
-
-    @staticmethod
-    def _snapshot_entity_bboxes(out_map):
-        """Point coordinates (dim 0) or bounding boxes (dims 1-2) of out_map entities, keyed by (dim, tag)."""
-        coords = {}
-        for entries in out_map:
-            for dt in entries:
-                d, t = int(dt[0]), int(dt[1])
-                if (d, t) not in coords and d in (0, 1, 2):
-                    try:
-                        bb = gmsh.model.occ.getBoundingBox(d, t)
-                        coords[(d, t)] = tuple(bb[:3]) if d == 0 else tuple(bb[:6])
-                    except Exception:
-                        # gmsh raises plain Exception for an entity it cannot
-                        # measure; without coordinates it cannot be remapped.
-                        logger.debug("Pre-heal snapshot: no bounding box "
-                                     "for entity (dim %d, tag %d); it "
-                                     "cannot be remapped if healShapes "
-                                     "renumbers it.", d, t)
-        return coords
+        self._log_heal_dim0_changes(pre_heal_entities, surviving)
 
     def _heal_occ_shapes(self):
         """Run OCC healShapes with the configured tolerance and fix flags."""
@@ -791,28 +796,16 @@ class MeshGenerator:
         )
 
     @staticmethod
-    def _remap_after_heal(out_map, pre_heal_coords):
-        """Remap out_map entries to the healed entity at the same coordinates; returns (surviving, remapped, pruned).
+    def _remap_after_heal(out_map, pre_heal):
+        """Remap out_map entries to the healed entity with the same signature; returns (surviving, remapped, pruned).
 
-        healShapes introduces ~1e-6 coordinate drift, so coordinates are
-        rounded to _HEAL_COORD_DECIMALS -- enough to distinguish any two
-        intentionally distinct points while absorbing the drift.
+        healShapes introduces ~1e-6 coordinate drift, so signatures match
+        within _HEAL_MATCH_TOL -- enough to distinguish any two intentionally
+        distinct entities while absorbing the drift.
         """
-        surviving = set()
-        alive_by_dim = {0: {}, 1: {}, 2: {}}  # dim -> rounded coords -> tag
-        for dim in range(3):
-            for dt in gmsh.model.getEntities(dim):
-                d, t = int(dt[0]), int(dt[1])
-                surviving.add((d, t))
-                try:
-                    bb = gmsh.model.getBoundingBox(d, t)
-                    n_coords = 3 if d == 0 else 6
-                    alive_by_dim[d][_rounded(bb[:n_coords], _HEAL_COORD_DECIMALS)] = t
-                except Exception:
-                    # gmsh raises plain Exception for an entity it cannot
-                    # measure; it simply cannot be a remap target.
-                    logger.debug("Post-heal survey: no bounding box for "
-                                 "surviving entity (dim %d, tag %d).", d, t)
+        surviving = {(int(d), int(t)) for dim in range(3) for d, t in gmsh.model.getEntities(dim)}
+        survivors = _SurvivorIndex(_snapshot_signatures(sorted(surviving), "Post-heal survey"),
+                                   _HEAL_MATCH_TOL)
 
         remapped = 0
         pruned = 0
@@ -820,15 +813,14 @@ class MeshGenerator:
             new_entries = []
             for dt in out_map[i]:
                 d, t = int(dt[0]), int(dt[1])
-                if (d, t) not in pre_heal_coords:
+                if (d, t) not in pre_heal:
                     # Entity wasn't snapshotted (shouldn't happen); keep if alive.
                     if (d, t) in surviving:
                         new_entries.append(dt)
                     else:
                         pruned += 1
                     continue
-                coord_key = _rounded(pre_heal_coords[(d, t)], _HEAL_COORD_DECIMALS)
-                new_tag = alive_by_dim.get(d, {}).get(coord_key)
+                new_tag = survivors.match(d, t, pre_heal[(d, t)])
                 if new_tag is None:
                     pruned += 1
                 elif new_tag == t:
