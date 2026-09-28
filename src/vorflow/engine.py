@@ -289,6 +289,326 @@ class _GeometryInventory:
         }
 
 
+# --- Mesh-size field helpers (used by MeshGenerator._setup_fields) ---
+
+_FIELD_GEOM_TYPES = ('points', 'lines', 'surfaces')
+
+
+def _optional_float(row, key, default=None):
+    """``row[key]`` as a float, or ``default`` when it is missing or NaN."""
+    value = row.get(key, None)
+    if value is None or pd.isna(value):
+        return default
+    return float(value)
+
+
+def _dimtag_tags(entries):
+    """Integer tags from a list of (dim, tag) pairs or raw tags."""
+    return [item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
+            for item in entries]
+
+
+def _explicit_fields(value):
+    """A feature's ``fields`` value as a list of MeshField (None/NaN and non-fields dropped)."""
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+    if isinstance(value, MeshField):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return [v for v in value if isinstance(v, MeshField)]
+    return []
+
+
+def _implicit_size_field(row, background_lc, has_explicit_fields):
+    """The size field backing a feature's resolution, or None.
+
+    Default: a GeometricGrowthField that grows the mesh from the feature size
+    up to the background size at the feature's growth_factor
+    (DEFAULT_GROWTH_FACTOR when unset). Created only when the feature is finer
+    than the background and has no explicit ``fields``.
+
+    Legacy (deprecated): if dist_min/dist_max are supplied, honor them as the
+    old linear ThresholdField and emit a DeprecationWarning. This path is kept
+    (even alongside explicit fields) so existing models still mesh.
+    """
+    lc = _optional_float(row, 'lc')
+    if lc is None:
+        return None
+    dist_min = _optional_float(row, 'dist_min')
+    dist_max = _optional_float(row, 'dist_max')
+
+    if dist_min is not None or dist_max is not None:
+        warnings.warn(
+            "dist_min/dist_max are deprecated for feature size transitions; they "
+            "select the legacy linear ThresholdField. Omit them to use the default "
+            "GeometricGrowthField (tune it with growth_factor), or pass an explicit "
+            "ThresholdField in `fields` to keep a linear ramp.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+        # DistMin: at least one local element size; DistMax: broad scale.
+        if dist_min is None:
+            dist_min = lc
+        if dist_max is None:
+            dist_max = background_lc * 5.0
+        dist_min = max(dist_min, lc * 0.5)
+        # Enforce a gentle gradient relative to SizeMax.
+        min_span = 3.0 * background_lc
+        if (dist_max - dist_min) < min_span:
+            dist_max = dist_min + min_span
+        if dist_max <= dist_min:
+            dist_max = dist_min + max(background_lc, lc, 1e-3)
+        return ThresholdField(size_min=lc, dist_min=dist_min, dist_max=dist_max, size_max=background_lc)
+
+    if has_explicit_fields or lc >= background_lc:
+        return None
+    return GeometricGrowthField(growth_factor=_optional_float(row, 'growth_factor', DEFAULT_GROWTH_FACTOR))
+
+
+def _border_grading_field(row):
+    """Border grading backing the deprecated add_polygon(border_density=...), or None."""
+    border_lc = _optional_float(row, 'border_lc')
+    if border_lc is None:
+        return None
+    return _BorderGradingField(
+        border_size=border_lc,
+        dist_min=_optional_float(row, 'dist_min', 0.0),
+        dist_max=_optional_float(row, 'dist_max_in'),
+    )
+
+
+def _feature_fields(row, geom_type, background_lc):
+    """Every MeshField sizing one feature: explicit, implicit, then border grading."""
+    explicit = _explicit_fields(row.get('fields', None))
+    fields = list(explicit)
+    implicit = _implicit_size_field(row, background_lc, has_explicit_fields=bool(explicit))
+    if implicit is not None:
+        fields.append(implicit)
+    if geom_type == 'surfaces':
+        border = _border_grading_field(row)
+        if border is not None:
+            fields.append(border)
+    return fields
+
+
+@dataclasses.dataclass
+class _FieldGroup:
+    """One MeshField (at one feature lc) and the feature ids it sizes, per geometry type."""
+    field: MeshField
+    feature_lc: float | None
+    feature_ids: dict = dataclasses.field(
+        default_factory=lambda: {geom_type: [] for geom_type in _FIELD_GEOM_TYPES}
+    )
+
+
+def _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
+    """Group features by (field, feature lc) so each group becomes one Gmsh field.
+
+    Groups are not split by geometry type: a single Distance/Threshold field
+    can target points, curves and surfaces at once. ``feature_lc`` is part of
+    the key because growth fields compute their transition from it.
+    """
+    groups = {}
+    for gdf, geom_type in zip((points_gdf, lines_gdf, polygons_gdf), _FIELD_GEOM_TYPES):
+        for idx, row in gdf.iterrows():
+            fields = _feature_fields(row, geom_type, background_lc)
+            if not fields:
+                continue
+            lc = _optional_float(row, 'lc')
+            for field in fields:
+                group = groups.setdefault((hash(field), lc), _FieldGroup(field, lc))
+                group.feature_ids[geom_type].append(int(idx))
+    return list(groups.values())
+
+
+def _field_target_tags(gmsh_map, feature_ids, field_only_polygon_ids):
+    """Gmsh tags a field group targets, as the tags_dict MeshField.create expects."""
+    tags = {'points': [], 'lines': [], 'surfaces': [],
+            'embedded_surfaces': [], 'field_only_surfaces': []}
+    buffer_surfs = gmsh_map.get('structured_buffer_surfs', {})
+
+    for fid in feature_ids['points']:
+        if fid in gmsh_map.get('points', {}):
+            tags['points'].extend(_dimtag_tags(gmsh_map['points'][fid]))
+
+    for fid in feature_ids['lines']:
+        if fid in gmsh_map.get('lines', {}):
+            tags['lines'].extend(_dimtag_tags(gmsh_map['lines'][fid]))
+        elif fid in gmsh_map.get('straddle_points', {}):
+            # Straddle/barrier lines are represented by point pairs.
+            tags['points'].extend(_dimtag_tags(gmsh_map['straddle_points'][fid]))
+        elif ('line', fid) in buffer_surfs:
+            # Buffer strips are embedded surfaces; list them as such so
+            # distance-growth fields target their boundary curves (an empty
+            # 'embedded_surfaces' would disable the field).
+            surface_tags = _dimtag_tags(buffer_surfs[('line', fid)])
+            tags['surfaces'].extend(surface_tags)
+            tags['embedded_surfaces'].extend(surface_tags)
+
+    for fid in feature_ids['surfaces']:
+        if fid in gmsh_map.get('surfaces', {}):
+            surface_tags = _dimtag_tags(gmsh_map['surfaces'][fid])
+            # A buffered polygon's outline lives in its band surfaces (the
+            # interior is inset), so include them for field targeting too.
+            if ('poly', fid) in buffer_surfs:
+                surface_tags = surface_tags + _dimtag_tags(buffer_surfs[('poly', fid)])
+            tags['surfaces'].extend(surface_tags)
+            kind = 'field_only_surfaces' if fid in field_only_polygon_ids else 'embedded_surfaces'
+            tags[kind].extend(surface_tags)
+        elif fid in gmsh_map.get('poly_curves', {}):
+            # Field-only polygons without a surface: size from their boundary curves.
+            tags['lines'].extend(_dimtag_tags(gmsh_map['poly_curves'][fid]))
+    return tags
+
+
+def _activate_size_fields(field_ids):
+    """Set Min(field_ids) as the background mesh and turn off Gmsh's own sizing."""
+    if field_ids:
+        # At any (x, y), Gmsh takes the smallest requested element size.
+        min_field = gmsh.model.mesh.field.add("Min")
+        gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", [float(f) for f in field_ids])
+        gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+    # Otherwise sizing from points/curvature/boundary competes with the fields.
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+
+
+# --- Explicit embedding helpers (used by MeshGenerator._embed_features) ---
+
+@dataclasses.dataclass
+class _EmbedStats:
+    """Outcome counts of explicit embedding, reported in diagnostics['embedding']."""
+    ok: int = 0
+    failed: int = 0
+    skip_bbox: int = 0
+    skip_no_cand: int = 0
+    skip_no_match: int = 0
+    boundary_skip: int = 0
+    multi_match: int = 0
+    inside_failed: int = 0
+    boundary_tags: list = dataclasses.field(default_factory=list)
+    multi_tags: list = dataclasses.field(default_factory=list)
+    fail_tags: list = dataclasses.field(default_factory=list)
+    inside_fail_tags: list = dataclasses.field(default_factory=list)
+    records: list = dataclasses.field(default_factory=list)
+
+    def as_diagnostics(self, include_records):
+        """The diagnostics['embedding'] dict."""
+        report = {name: getattr(self, name) for name in (
+            'ok', 'failed', 'skip_bbox', 'skip_no_cand', 'skip_no_match',
+            'boundary_skip', 'multi_match', 'inside_failed')}
+        report.update(boundary_tags=list(self.boundary_tags),
+                      multi_tags=list(self.multi_tags),
+                      fail_tags=list(self.fail_tags))
+        if include_records:
+            report['records'] = list(self.records)
+        return report
+
+
+def _domain_surface_tags(gmsh_map, polygons_gdf):
+    """Surface tags of the embedded polygons: the pool features are embedded into."""
+    tags = set()
+    for idx, row in polygons_gdf.iterrows():
+        if is_embedded(row) and idx in gmsh_map.get('surfaces', {}):
+            for dt in gmsh_map['surfaces'][idx]:
+                if isinstance(dt, (tuple, list)) and len(dt) >= 2 and dt[0] == 2:
+                    tags.add(dt[1])
+    return tags
+
+
+def _surface_bboxes(surface_tags):
+    """Bounding box (xmin, ymin, zmin, xmax, ymax, zmax) per surface; unmeasurable ones are left out."""
+    bboxes = {}
+    for tag in surface_tags:
+        try:
+            bboxes[tag] = gmsh.model.getBoundingBox(2, tag)
+        except Exception:
+            logger.debug("No bounding box for domain surface %d; it is "
+                         "excluded from the embedding candidate pool.", tag)
+    return bboxes
+
+
+def _bbox_contains_point(bbox, pt, eps=1e-4):
+    """True if ``pt`` lies inside ``bbox`` grown by ``eps``."""
+    return (bbox[0] - eps <= pt[0] <= bbox[3] + eps and
+            bbox[1] - eps <= pt[1] <= bbox[4] + eps and
+            bbox[2] - eps <= pt[2] <= bbox[5] + eps)
+
+
+def _entity_sample_points(dim, tag, bbox):
+    """Points identifying the surface that owns an entity: a point's location, or three interior samples of a curve."""
+    xmin, ymin, zmin, xmax, ymax, zmax = bbox
+    if dim == 0:
+        return [((xmin + xmax) / 2.0, (ymin + ymax) / 2.0, (zmin + zmax) / 2.0)]
+    if dim != 1:
+        return []
+
+    pmin, pmax = gmsh.model.getParametrizationBounds(1, tag)
+    lo = float(pmin[0])
+    hi = float(pmax[0])
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return []
+    if hi < lo:
+        lo, hi = hi, lo
+
+    # Avoid exact endpoints: line ends commonly lie on partition boundaries
+    # and are ambiguous. Interior samples identify the trimmed surface that
+    # actually owns the line fragment.
+    points = []
+    seen = set()
+    for f in (0.25, 0.5, 0.75):
+        val = gmsh.model.getValue(1, tag, [lo + (hi - lo) * f])
+        pt = (float(val[0]), float(val[1]), float(val[2]))
+        key = (round(pt[0], 8), round(pt[1], 8), round(pt[2], 8))
+        if key not in seen:
+            seen.add(key)
+            points.append(pt)
+    return points
+
+
+def _surface_area(surf_tag):
+    """Area of a surface (inf if it cannot be measured)."""
+    try:
+        return float(gmsh.model.occ.getMass(2, int(surf_tag)))
+    except Exception:
+        try:
+            return float(gmsh.model.getMass(2, int(surf_tag)))
+        except Exception:
+            return float("inf")
+
+
+def _curve_adjacent_surfaces(curve_tag):
+    """Surfaces a curve bounds (none if the adjacency lookup fails)."""
+    try:
+        up, _down = gmsh.model.getAdjacencies(1, curve_tag)
+    except Exception:
+        logger.debug("getAdjacencies failed for curve %d; treating it as "
+                     "interior for embedding.", curve_tag)
+        return []
+    return sorted({int(v) for v in up})
+
+
+def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
+    """(dim, tag) of every embedded point, line and barrier straddle point, in embedding order."""
+    entities = []
+    if points_gdf is not None:
+        for idx, row in points_gdf.iterrows():
+            if is_embedded(row):
+                entities.extend((0, dt[1]) for dt in gmsh_map.get('points', {}).get(idx, [])
+                                if dt[0] == 0)
+    if lines_gdf is not None:
+        for idx, row in lines_gdf.iterrows():
+            if is_embedded(row):
+                entities.extend((1, dt[1]) for dt in gmsh_map.get('lines', {}).get(idx, [])
+                                if dt[0] == 1)
+                entities.extend((0, dt[1]) for dt in gmsh_map.get('straddle_points', {}).get(idx, [])
+                                if dt[0] == 0)
+    return entities
+
+
 class MeshGenerator:
     def __init__(self, background_lc=None, verbosity=None, mesh_algorithm=6,
                  smoothing_steps=10, optimization_cycles=2,
@@ -1837,324 +2157,56 @@ class MeshGenerator:
             )
     
     def _setup_fields(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf, crossings=()):
-        """
-        Configures Gmsh mesh size fields based on the input features.
+        """Build the mesh-size fields and set their Min as the background mesh.
 
-        This method creates and combines various fields (`Distance`, `Threshold`,
-        `MathEval`) to control the mesh element size across the domain. It uses
-        the parameters (e.g., `lc`, `dist_min`, `dist_max`) from the
-        original conceptual model features to define how the mesh should be
-        refined near points, along lines, and within polygons. ``crossings``
-        are the quad-buffer crossing disks from ``_build_occ_model``; each
-        becomes a Ball refinement field.
+        Each feature contributes its explicit ``fields`` plus the implicit
+        field backing its resolution (see ``_implicit_size_field``); features
+        sharing a field and lc become one Gmsh field targeting all of their
+        tags. ``crossings`` are the quad-buffer crossing disks from
+        ``_build_occ_model``; each becomes a Ball refinement field. A Constant
+        field at ``background_lc`` bounds everything from above.
         """
-        if self._verbosity > 0:
-            logger.info("--- Setup Fields Debug ---")
-            logger.info(f"Polygons GDF: {len(polygons_gdf)} rows")
-            logger.info(f"Gmsh Surface Map: {len(gmsh_map.get('surfaces', {}))} entries")
-            if not polygons_gdf.empty:
-                first_idx = polygons_gdf.index[0]
-                logger.info(f"First Poly Index: {first_idx} (Type: {type(first_idx)})")
-                if gmsh_map['surfaces']:
-                    first_key = list(gmsh_map['surfaces'].keys())[0]
-                    logger.info(f"First Map Key: {first_key} (Type: {type(first_key)})")
-                    logger.info(f"Match? {first_idx in gmsh_map['surfaces']}")
-                else:
-                    logger.info("Gmsh Surface Map is EMPTY.")
-
-        # Collect all created Gmsh field ids so we can combine them at the end.
-        field_list = []
-        
-        # The global background mesh size is always required.
-        # We create a Constant field for it and always set a background mesh.
+        self._log_field_setup_diagnostics(gmsh_map, polygons_gdf)
         self._validate_background_lc()
-        global_max_lc = float(self.background_lc)
+        background_lc = float(self.background_lc)
+        field_only_polygon_ids = {
+            int(idx) for idx, row in polygons_gdf.iterrows() if not is_embedded(row)
+        }
 
-        def extract_tags(entry_list):
-            """Return a clean list of integer tags from Gmsh's dimtag-ish output.
-
-            Gmsh commonly returns lists of (dim, tag) tuples; some maps in this
-            code also store raw tag ints. We normalize both to an int tag list.
-            """
-            clean_tags = []
-            for item in entry_list:
-                if isinstance(item, (tuple, list)) and len(item) >= 2:
-                    clean_tags.append(item[1])
-                else:
-                    clean_tags.append(item)
-            return clean_tags
-
-        def get_row_param(row, key, default):
-            if key in row and not pd.isna(row[key]):
-                return float(row[key])
-            return float(default)
-
-        def _normalize_fields(value):
-            """Normalize feature field specifications to a list[MeshField].
-
-            Supported inputs:
-            - None / NaN -> []
-            - MeshField  -> [field]
-            - list/tuple/set of mixed values -> only MeshField entries are kept
-            """
-            if value is None:
-                return []
-            if isinstance(value, float) and pd.isna(value):
-                return []
-            if isinstance(value, MeshField):
-                return [value]
-            if isinstance(value, (list, tuple, set)):
-                return [v for v in value if isinstance(v, MeshField)]
-            return []
-
-        def _auto_field_from_row(row, background_lc, has_explicit_fields):
-            """Build the implicit size field that backs a feature's resolution.
-
-            Default: a GeometricGrowthField that grows the mesh from the
-            feature size up to the background size at the feature's growth_factor
-            (DEFAULT_GROWTH_FACTOR when unset). Created only when the feature is
-            finer than the background and has no explicit ``fields``.
-
-            Legacy (deprecated): if dist_min/dist_max are supplied, honor them as
-            the old linear ThresholdField and emit a DeprecationWarning. This path
-            is kept (even alongside explicit fields) so existing models still mesh.
-            """
-            if background_lc is None or (isinstance(background_lc, float) and pd.isna(background_lc)):
-                return None
-
-            feature_lc = row.get('lc', None)
-            if feature_lc is None or (isinstance(feature_lc, float) and pd.isna(feature_lc)):
-                return None
-            feature_lc = float(feature_lc)
-
-            dist_min = row.get('dist_min', None)
-            dist_max = row.get('dist_max', None)
-            dist_min = None if (dist_min is None or (isinstance(dist_min, float) and pd.isna(dist_min))) else float(dist_min)
-            dist_max = None if (dist_max is None or (isinstance(dist_max, float) and pd.isna(dist_max))) else float(dist_max)
-
-            if dist_min is not None or dist_max is not None:
-                # --- Legacy linear ThresholdField (deprecated) ---
-                warnings.warn(
-                    "dist_min/dist_max are deprecated for feature size transitions; they "
-                    "select the legacy linear ThresholdField. Omit them to use the default "
-                    "GeometricGrowthField (tune it with growth_factor), or pass an explicit "
-                    "ThresholdField in `fields` to keep a linear ramp.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                # DistMin: at least one local element size; DistMax: broad scale.
-                if dist_min is None:
-                    dist_min = feature_lc
-                if dist_max is None:
-                    dist_max = float(background_lc) * 5.0
-                dist_min = max(dist_min, feature_lc * 0.5)
-                # Enforce a gentle gradient relative to SizeMax.
-                min_span = 3.0 * float(background_lc)
-                if (dist_max - dist_min) < min_span:
-                    dist_max = dist_min + min_span
-                if dist_max <= dist_min:
-                    dist_max = dist_min + max(float(background_lc), feature_lc, 1e-3)
-                return ThresholdField(size_min=feature_lc, dist_min=dist_min, dist_max=dist_max, size_max=background_lc)
-
-            # --- Default GeometricGrowthField ---
-            # Only when the user has not supplied an explicit field and the
-            # feature is actually finer than the background (else nothing to do).
-            if has_explicit_fields or feature_lc >= float(background_lc):
-                return None
-            growth = row.get('growth_factor', None)
-            if growth is None or (isinstance(growth, float) and pd.isna(growth)):
-                growth = DEFAULT_GROWTH_FACTOR
-            growth = float(growth)
-            return GeometricGrowthField(growth_factor=growth)
-
-        def _border_field_from_row(row):
-            """Border grading backing the deprecated add_polygon(border_density=...)."""
-            border_lc = row.get('border_lc', None)
-            if border_lc is None or pd.isna(border_lc):
-                return None
-            return _BorderGradingField(
-                border_size=float(border_lc),
-                dist_min=get_row_param(row, 'dist_min', 0.0),
-                dist_max=None if pd.isna(row.get('dist_max_in', None)) else float(row['dist_max_in']),
-            )
-
-        # Configure mesh size fields using MeshField objects attached to features.
-        #
-        # Data model expectations:
-        # - ConceptualMesh stores the user's desired behavior in GeoDataFrame rows.
-        # - Fields are created here (engine side) because the engine has the Gmsh
-        #   tags and is responsible for mapping features -> CAD entities.
-        #
-        # How fields can be specified per feature:
-        # - `fields`: list[MeshField] (the only supported explicit mechanism)
-        # - resolution (+ growth_factor): default implicit GeometricGrowthField
-        # - `dist_min/dist_max` (+ lc): DEPRECATED shorthand for a linear ThresholdField
-        #
-        # Grouping:
-        # - We build ONE gmsh field per unique (field parameters + lc).
-        # - We intentionally do NOT split by geometry type because a single Gmsh
-        #   Distance/Threshold field can target points/curves/surfaces at once.
-        # - `feature_lc` is part of grouping because growth fields compute their
-        #   transition based on the local target size.
-        #
-        # Each group accumulates feature ids per geometry type so we can later
-        # gather all relevant gmsh tags into a single tags_dict.
-        field_objects = {}
-        for gdf, geom_type in [(points_gdf, 'points'), (lines_gdf, 'lines'), (polygons_gdf, 'surfaces')]:
-            for idx, row in gdf.iterrows():
-                # 1) Collect explicitly specified fields.
-                explicit_fields = _normalize_fields(row.get('fields', None))
-                row_fields = list(explicit_fields)
-
-                # 2) Add the implicit size field backing the feature's
-                #    resolution: GeometricGrowthField by default, or the legacy
-                #    ThresholdField when dist_min/dist_max are given (deprecated).
-                auto_field = _auto_field_from_row(
-                    row, global_max_lc, has_explicit_fields=bool(explicit_fields)
-                )
-                if auto_field is not None:
-                    row_fields.append(auto_field)
-                if geom_type == 'surfaces':
-                    border_field = _border_field_from_row(row)
-                    if border_field is not None:
-                        row_fields.append(border_field)
-
-                if not row_fields:
-                    continue
-
-                # Cache the feature lc for growth fields.
-                feature_lc = row.get('lc', None)
-                if feature_lc is None or (isinstance(feature_lc, float) and pd.isna(feature_lc)):
-                    feature_lc = None
-                else:
-                    feature_lc = float(feature_lc)
-
-                for field in row_fields:
-                    if field is None or not isinstance(field, MeshField):
-                        continue
-                    key = (hash(field), feature_lc)
-                    if key not in field_objects:
-                        field_objects[key] = {
-                            'field': field,
-                            'feature_lc': feature_lc,
-                            'feature_ids_by_geom': {'points': [], 'lines': [], 'surfaces': []},
-                        }
-                    field_objects[key]['feature_ids_by_geom'][geom_type].append(int(idx))
-        
-        # Now create and apply each unique field to the corresponding features.
-        # We gather all Gmsh entity tags for the features and let the MeshField
-        # implementation create the appropriate Distance/Threshold/etc field.
-        for key, info in field_objects.items():
-            field = info['field']
-            feature_lc = info.get('feature_lc', None)
-            feature_ids_by_geom = info.get('feature_ids_by_geom', {'points': [], 'lines': [], 'surfaces': []})
-            
-            # Gather all Gmsh tags for the features using this field.
-            # Note: embedded geometry is mapped under gmsh_map[geom_type].
-            # For embed=False polygons, we keep their boundary curves under
-            # gmsh_map['poly_curves'] so fields can still be applied without
-            # cutting/fragmenting the domain.
-            tags_dict = {
-                'points': [],
-                'lines': [],
-                'surfaces': [],
-                'embedded_surfaces': [],
-                'field_only_surfaces': [],
-            }
-
-            # Points
-            for fid in feature_ids_by_geom.get('points', []):
-                if fid in gmsh_map.get('points', {}):
-                    tags_dict['points'].extend(extract_tags(gmsh_map['points'][fid]))
-
-            # Lines
-            for fid in feature_ids_by_geom.get('lines', []):
-                if fid in gmsh_map.get('lines', {}):
-                    tags_dict['lines'].extend(extract_tags(gmsh_map['lines'][fid]))
-                # Straddle/barrier lines are represented by point pairs.
-                elif fid in gmsh_map.get('straddle_points', {}):
-                    tags_dict['points'].extend(extract_tags(gmsh_map['straddle_points'][fid]))
-                elif ('line', fid) in gmsh_map.get('structured_buffer_surfs', {}):
-                    # Buffer strips are embedded surfaces; list them as such so
-                    # distance-growth fields target their boundary curves
-                    # (an empty 'embedded_surfaces' would disable the field).
-                    surface_tags = extract_tags(gmsh_map['structured_buffer_surfs'][('line', fid)])
-                    tags_dict['surfaces'].extend(surface_tags)
-                    tags_dict['embedded_surfaces'].extend(surface_tags)
-
-            # Surfaces
-            for fid in feature_ids_by_geom.get('surfaces', []):
-                if fid in gmsh_map.get('surfaces', {}):
-                    surface_tags = extract_tags(gmsh_map['surfaces'][fid])
-                    # A buffered polygon's outline lives in its band surfaces
-                    # (the interior is inset), so include them for field
-                    # targeting too.
-                    if ('poly', fid) in gmsh_map.get('structured_buffer_surfs', {}):
-                        surface_tags = surface_tags + extract_tags(
-                            gmsh_map['structured_buffer_surfs'][('poly', fid)]
-                        )
-                    tags_dict['surfaces'].extend(surface_tags)
-
-                    try:
-                        embed_val = polygons_gdf.loc[fid].get('embed', True)
-                        embedded = True if pd.isna(embed_val) else bool(embed_val)
-                    except Exception:
-                        embedded = True
-
-                    if embedded:
-                        tags_dict['embedded_surfaces'].extend(surface_tags)
-                    else:
-                        tags_dict['field_only_surfaces'].extend(surface_tags)
-                # Field-only polygons (embed=False): apply distance-based fields to boundary curves.
-                elif fid in gmsh_map.get('poly_curves', {}):
-                    curve_dimtags = gmsh_map['poly_curves'][fid]
-                    tags_dict['lines'].extend(extract_tags(curve_dimtags))
-
+        field_ids = []
+        for group in _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
+            tags_dict = _field_target_tags(gmsh_map, group.feature_ids, field_only_polygon_ids)
             if not any(tags_dict.values()):
                 continue
-
             # Private metadata for built-in field helpers; custom MeshField
             # implementations can ignore it because tag lists remain unchanged.
             tags_dict['_verbosity'] = self._verbosity
-            
-            # Create the Gmsh field using the provided MeshField object.
-            f_id = field.create(
-                gmsh_api=gmsh,
-                tags_dict=tags_dict,
-                background_lc=global_max_lc,
-                feature_lc=feature_lc
-            )
-            
-            if f_id is not None:
-                field_list.append(f_id)
-
-        field_list.extend(self._add_crossing_fields(crossings, global_max_lc))
-
-        #now lets add the background constant field if specified
-        if self.background_lc is not None:
-            const_field = ConstantField(size=self.background_lc)
-            f_id = const_field.create(
-                gmsh_api=gmsh,
-                tags_dict={},
-                background_lc=self.background_lc,
-                feature_lc=None
+            f_id = group.field.create(
+                gmsh_api=gmsh, tags_dict=tags_dict,
+                background_lc=background_lc, feature_lc=group.feature_lc,
             )
             if f_id is not None:
-                field_list.append(f_id)
+                field_ids.append(f_id)
 
-        # Combine all active fields using a Min field and set it as the background mesh.
-        # At any (x,y), Gmsh will take the smallest requested element size.
-        if field_list:
-            min_field = gmsh.model.mesh.field.add("Min")
-            gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", [float(f) for f in field_list])
-            gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+        field_ids.extend(self._add_crossing_fields(crossings, background_lc))
+        field_ids.append(ConstantField(size=self.background_lc).create(
+            gmsh_api=gmsh, tags_dict={}, background_lc=self.background_lc, feature_lc=None,
+        ))
+        _activate_size_fields(field_ids)
 
-        # Disable Gmsh's default sizing mechanisms so fields fully control mesh size.
-        # Otherwise, mesh sizing from points/curvature/boundary can compete with fields.
-        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-
+    def _log_field_setup_diagnostics(self, gmsh_map, polygons_gdf):
+        """[DIAG] Polygon rows versus surface-map keys (a mismatch detaches polygon fields)."""
+        if self._verbosity < 2:
+            return
+        surfaces = gmsh_map.get('surfaces', {})
+        logger.debug(f"[DIAG] Setup fields: {len(polygons_gdf)} polygon rows, "
+                     f"{len(surfaces)} surface map entries")
+        if not polygons_gdf.empty and surfaces:
+            first_idx = polygons_gdf.index[0]
+            first_key = next(iter(surfaces))
+            logger.debug(f"[DIAG]   first polygon index {first_idx!r} ({type(first_idx).__name__}), "
+                         f"first map key {first_key!r} ({type(first_key).__name__}), "
+                         f"match={first_idx in surfaces}")
 
     @staticmethod
     def _add_crossing_fields(crossings, background_lc):
@@ -2182,287 +2234,151 @@ class MeshGenerator:
         return field_ids
 
     def _embed_features(self, gmsh_map, polygons_gdf, lines_gdf, points_gdf):
-        """
-        Explicitly embeds features into domain surfaces to ensure mesh conformity.
-        
-        This handles cases where fragmentation splits surfaces, requiring
-        geometric discovery to find the correct surface for points/lines.
+        """Embed points, lines and straddle points into the domain surfaces that contain them.
+
+        Fragmentation splits surfaces, so each entity's owner is found
+        geometrically. Candidates are pre-filtered by bounding box, then
+        confirmed with gmsh.model.isInside() on the trimmed surfaces. Do not
+        use getClosestPoint() here: for coplanar OCC surfaces it can project
+        onto the support plane outside the trimmed face, causing false
+        multi-surface embeds and over-constraining Gmsh.
         """
         if self._verbosity > 0:
             logger.info("Explicitly embedding features into domain surfaces...")
-
-        def is_embedded(row):
-            val = row.get('embed', True)
-            if pd.isna(val):
-                return True
-            return bool(val)
-
-        # 1. Collect Domain Surfaces (Candidate Pool)
-        domain_surface_tags = set()
-        if not polygons_gdf.empty:
-            for idx, row in polygons_gdf.iterrows():
-                if is_embedded(row) and idx in gmsh_map.get('surfaces', {}):
-                    for dt in gmsh_map['surfaces'][idx]:
-                        # Ensure we are tracking actual surfaces (dim=2)
-                        if isinstance(dt, (tuple, list)) and len(dt) >= 2 and dt[0] == 2:
-                            domain_surface_tags.add(dt[1])
-
-        # >>> DIAG: domain surface collection summary
-        if self._verbosity >= 2:
-            _gdf_idxs = list(polygons_gdf.index) if not polygons_gdf.empty else []
-            _map_keys = list(gmsh_map.get('surfaces', {}).keys())
-            _matching = [i for i in _gdf_idxs if i in gmsh_map.get('surfaces', {})]
-            logger.debug(f"[DIAG] Embed pool: GDF indices={_gdf_idxs}, map keys={_map_keys}, "
-                         f"matched={len(_matching)}, domain_surface_tags={sorted(domain_surface_tags)}")
-            # Dump bbox of ALL surfaces - shows which surfaces cover which area
-            _all_surfs = gmsh.model.getEntities(2)
-            for _s in _all_surfs:
-                _in_pool = "POOL" if _s[1] in domain_surface_tags else "----"
-                try:
-                    _sbb = gmsh.model.getBoundingBox(2, _s[1])
-                    logger.debug(f"[DIAG]   surf {_s[1]:3d} [{_in_pool}] "
-                                 f"x=[{_sbb[0]:7.1f},{_sbb[3]:7.1f}] "
-                                 f"y=[{_sbb[1]:7.1f},{_sbb[4]:7.1f}]")
-                except Exception:
-                    logger.debug(f"[DIAG]   surf {_s[1]:3d} [{_in_pool}] bbox FAILED")
-            # Which feature id maps to which surface tags?
-            for _feat_id, _dts in gmsh_map.get('surfaces', {}).items():
-                _stags = [int(dt[1]) for dt in _dts if isinstance(dt, (tuple,list)) and dt[0]==2]
-                logger.debug(f"[DIAG]   map[surfaces][{_feat_id}] -> tags {_stags}")
-        # <<< DIAG
-
+        domain_surface_tags = _domain_surface_tags(gmsh_map, polygons_gdf)
+        self._log_embed_pool_diagnostics(gmsh_map, polygons_gdf, domain_surface_tags)
         if not domain_surface_tags:
-            return 
+            return
 
-        # >>> DIAG: Accumulator for embed summary
-        _elog = {'ok': 0, 'conflict': 0, 'skip_bbox': 0, 'skip_no_cand': 0,
-                 'skip_no_match': 0, 'failed': 0, 'boundary_skip': 0,
-                 'multi_match': 0, 'inside_failed': 0,
-                 'conflict_tags': [], 'fail_tags': [], 'boundary_tags': [],
-                 'multi_tags': [], 'inside_fail_tags': [], 'records': []}
-        # <<< DIAG
+        surface_bboxes = _surface_bboxes(domain_surface_tags)
+        stats = _EmbedStats()
+        for dim, tag in _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
+            self._embed_entity(dim, tag, surface_bboxes, stats)
 
-        # Helper for geometric embedding search and application.
-        # We pre-compute surface bboxes for a fast spatial filter, then confirm
-        # against trimmed surfaces with gmsh.model.isInside(). Do not use
-        # getClosestPoint() here: for coplanar OCC surfaces it can project onto
-        # the support plane outside the trimmed face, causing false multi-surface
-        # embeds and over-constraining Gmsh.
-        _surf_bboxes = {}
-        for _st in domain_surface_tags:
-            try:
-                _bb = gmsh.model.getBoundingBox(2, _st)
-                _surf_bboxes[_st] = _bb  # (xmin, ymin, zmin, xmax, ymax, zmax)
-            except Exception:
-                logger.debug("No bounding box for domain surface %d; it is "
-                             "excluded from the embedding candidate pool.", _st)
+        self._log_embed_summary_diagnostics(stats)
+        self.diagnostics['embedding'] = stats.as_diagnostics(include_records=self.diagnose)
 
-        def _bbox_contains_point(sbb, pt, eps=1e-4):
-            return (
-                sbb[0] - eps <= pt[0] <= sbb[3] + eps and
-                sbb[1] - eps <= pt[1] <= sbb[4] + eps and
-                sbb[2] - eps <= pt[2] <= sbb[5] + eps
-            )
+    def _embed_entity(self, dim, tag, surface_bboxes, stats):
+        """Embed one point or curve into the smallest domain surface containing it."""
+        try:
+            bbox = gmsh.model.getBoundingBox(dim, tag)
+        except Exception:
+            stats.skip_bbox += 1
+            return
 
-        def _entity_sample_points(dim, tag, bbox):
-            xmin, ymin, zmin, xmax, ymax, zmax = bbox
-            if dim == 0:
-                return [((xmin + xmax) / 2.0, (ymin + ymax) / 2.0, (zmin + zmax) / 2.0)]
-            if dim != 1:
-                return []
-
-            pmin, pmax = gmsh.model.getParametrizationBounds(1, tag)
-            lo = float(pmin[0])
-            hi = float(pmax[0])
-            if not (math.isfinite(lo) and math.isfinite(hi)):
-                return []
-            if hi < lo:
-                lo, hi = hi, lo
-
-            # Avoid exact endpoints: line ends commonly lie on partition
-            # boundaries and are ambiguous. Interior samples identify the
-            # trimmed surface that actually owns the line fragment.
-            params = [lo + (hi - lo) * f for f in (0.25, 0.5, 0.75)]
-            points = []
-            seen = set()
-            for param in params:
-                val = gmsh.model.getValue(1, tag, [param])
-                pt = (float(val[0]), float(val[1]), float(val[2]))
-                key = (round(pt[0], 8), round(pt[1], 8), round(pt[2], 8))
-                if key not in seen:
-                    seen.add(key)
-                    points.append(pt)
-            return points
-
-        def _surface_area(surf_tag):
-            try:
-                return float(gmsh.model.occ.getMass(2, int(surf_tag)))
-            except Exception:
-                try:
-                    return float(gmsh.model.getMass(2, int(surf_tag)))
-                except Exception:
-                    return float("inf")
-
-        def embed_entity(dim, tag):
-            # 1. Verify entity exists
-            try:
-                bbox = gmsh.model.getBoundingBox(dim, tag)
-            except Exception:
-                _elog['skip_bbox'] += 1
-                return
-            
-            xmin, ymin, zmin, xmax, ymax, zmax = bbox
-            
-            # Check if line is already a boundary of some surface. Boundary
-            # curves already constrain their adjacent surfaces; explicitly
-            # embedding them elsewhere duplicates constraints and can make Gmsh
-            # non-terminating on dense partitioned geometries.
-            is_boundary_of = set()
-            if dim == 1:
-                try:
-                    up, _down = gmsh.model.getAdjacencies(1, tag)
-                    is_boundary_of = {int(v) for v in up}
-                except Exception:
-                    logger.debug("getAdjacencies failed for curve %d; treating "
-                                 "it as interior for embedding.", tag)
-                if is_boundary_of:
-                    _elog['boundary_skip'] += 1
-                    _elog['boundary_tags'].append((int(tag), sorted(is_boundary_of)))
-                    return
-
-            # 2. Sample the entity inside its extent.
-            try:
-                sample_points = _entity_sample_points(dim, tag, bbox)
-            except Exception:
-                sample_points = []
-            if not sample_points:
-                _elog['skip_no_match'] += 1
+        # Boundary curves already constrain their adjacent surfaces; embedding
+        # them elsewhere duplicates constraints and can make Gmsh
+        # non-terminating on dense partitioned geometries.
+        if dim == 1:
+            adjacent = _curve_adjacent_surfaces(tag)
+            if adjacent:
+                stats.boundary_skip += 1
+                stats.boundary_tags.append((int(tag), adjacent))
                 return
 
-            # 3. Fast bbox pre-filter: only test surfaces whose bbox contains at
-            # least one sampled point.
-            candidates = set()
-            eps = 1e-4
-            for surf_tag, sbb in _surf_bboxes.items():
-                if any(_bbox_contains_point(sbb, pt, eps=eps) for pt in sample_points):
-                    candidates.add(int(surf_tag))
+        try:
+            sample_points = _entity_sample_points(dim, tag, bbox)
+        except Exception:
+            sample_points = []
+        if not sample_points:
+            stats.skip_no_match += 1
+            return
 
-            if not candidates:
-                _elog['skip_no_cand'] += 1
-                return
+        candidates = sorted({
+            int(surf_tag) for surf_tag, sbb in surface_bboxes.items()
+            if any(_bbox_contains_point(sbb, pt) for pt in sample_points)
+        })
+        if not candidates:
+            stats.skip_no_cand += 1
+            return
 
-            # 4. Confirm with isInside(). For lines, require all interior sample
-            # points to be inside a single trimmed surface.
-            target_matches = []
-            flat_points = []
-            for pt in sample_points:
-                flat_points.extend([pt[0], pt[1], pt[2]])
-            for surf_tag in sorted(candidates):
-                try:
-                    inside_count = int(gmsh.model.isInside(2, int(surf_tag), flat_points))
-                    if inside_count == len(sample_points):
-                        target_matches.append(surf_tag)
-                except Exception:
-                    _elog['inside_failed'] += 1
-                    _elog['inside_fail_tags'].append((int(tag), int(surf_tag)))
+        matches = self._surfaces_containing(tag, sample_points, candidates, stats)
+        if not matches:
+            stats.skip_no_match += 1
+            return
+        if len(matches) > 1:
+            stats.multi_match += 1
+            stats.multi_tags.append((int(tag), list(matches)))
+            # Nested or overlapping source polygons can still produce several
+            # containing faces. Choose the smallest trimmed surface as the most
+            # local owner instead of embedding into every containing face.
+            matches = [min(matches, key=_surface_area)]
 
-            # 5. Embed the entity into the verified surfaces
-            if target_matches:
-                target_matches = sorted(set(target_matches))
-                if len(target_matches) > 1:
-                    _elog['multi_match'] += 1
-                    _elog['multi_tags'].append((int(tag), list(target_matches)))
-                    # Nested or overlapping source polygons can still produce
-                    # multiple containing faces. Choose the smallest trimmed
-                    # surface as the most local owner instead of embedding the
-                    # same entity into every containing face.
-                    target_matches = [min(target_matches, key=_surface_area)]
-                for st in target_matches:
-                    try:
-                        gmsh.model.mesh.embed(dim, [tag], 2, st)
-                        _elog['ok'] += 1
-                        if self.diagnose:
-                            _elog['records'].append({
-                                'dim': int(dim),
-                                'tag': int(tag),
-                                'surface': int(st),
-                                'bbox': tuple(float(v) for v in bbox),
-                                'sample_points': sample_points,
-                            })
-                    except Exception as e:
-                        _elog['failed'] += 1
-                        _elog['fail_tags'].append((tag, str(e)[:60]))
-            else:
-                _elog['skip_no_match'] += 1
+        for surf_tag in matches:
+            try:
+                gmsh.model.mesh.embed(dim, [tag], 2, surf_tag)
+            except Exception as e:
+                stats.failed += 1
+                stats.fail_tags.append((tag, str(e)[:60]))
+                continue
+            stats.ok += 1
+            if self.diagnose:
+                stats.records.append({
+                    'dim': int(dim),
+                    'tag': int(tag),
+                    'surface': int(surf_tag),
+                    'bbox': tuple(float(v) for v in bbox),
+                    'sample_points': sample_points,
+                })
 
-        # Iterate and Embed Points
-        if points_gdf is not None and not points_gdf.empty:
-            for idx, row in points_gdf.iterrows():
-                if is_embedded(row) and idx in gmsh_map.get('points', {}):
-                    for dt in gmsh_map['points'][idx]:
-                        if dt[0] == 0:
-                            embed_entity(0, dt[1])
+    @staticmethod
+    def _surfaces_containing(tag, sample_points, candidates, stats):
+        """Candidate surfaces that contain every sample point (per gmsh isInside)."""
+        flat_points = [coord for pt in sample_points for coord in pt]
+        matches = []
+        for surf_tag in candidates:
+            try:
+                inside_count = int(gmsh.model.isInside(2, int(surf_tag), flat_points))
+            except Exception:
+                stats.inside_failed += 1
+                stats.inside_fail_tags.append((int(tag), int(surf_tag)))
+                continue
+            if inside_count == len(sample_points):
+                matches.append(surf_tag)
+        return matches
 
-        # Iterate and Embed Lines
-        if lines_gdf is not None and not lines_gdf.empty:
-            for idx, row in lines_gdf.iterrows():
-                if is_embedded(row):
-                    # Standard Lines
-                    if idx in gmsh_map.get('lines', {}):
-                        for dt in gmsh_map['lines'][idx]:
-                            if dt[0] == 1:
-                                embed_entity(1, dt[1])
-                    # Barrier/Straddle Points (these are points derived from lines)
-                    if idx in gmsh_map.get('straddle_points', {}):
-                        for dt in gmsh_map['straddle_points'][idx]:
-                            if dt[0] == 0:
-                                embed_entity(0, dt[1])
+    def _log_embed_pool_diagnostics(self, gmsh_map, polygons_gdf, domain_surface_tags):
+        """[DIAG] Which surfaces form the embedding pool and which feature owns each."""
+        if self._verbosity < 2:
+            return
+        surfaces = gmsh_map.get('surfaces', {})
+        gdf_idxs = list(polygons_gdf.index)
+        matching = [i for i in gdf_idxs if i in surfaces]
+        logger.debug(f"[DIAG] Embed pool: GDF indices={gdf_idxs}, map keys={list(surfaces)}, "
+                     f"matched={len(matching)}, domain_surface_tags={sorted(domain_surface_tags)}")
+        # Bounding box of every surface shows which surfaces cover which area.
+        for _dim, surf_tag in gmsh.model.getEntities(2):
+            in_pool = "POOL" if surf_tag in domain_surface_tags else "----"
+            try:
+                sbb = gmsh.model.getBoundingBox(2, surf_tag)
+                logger.debug(f"[DIAG]   surf {surf_tag:3d} [{in_pool}] "
+                             f"x=[{sbb[0]:7.1f},{sbb[3]:7.1f}] "
+                             f"y=[{sbb[1]:7.1f},{sbb[4]:7.1f}]")
+            except Exception:
+                logger.debug(f"[DIAG]   surf {surf_tag:3d} [{in_pool}] bbox FAILED")
+        for feat_id, dimtags in surfaces.items():
+            surf_tags = [int(dt[1]) for dt in dimtags if isinstance(dt, (tuple, list)) and dt[0] == 2]
+            logger.debug(f"[DIAG]   map[surfaces][{feat_id}] -> tags {surf_tags}")
 
-        # >>> DIAG: Embed summary
-        if self._verbosity >= 2:
-            _filt = _elog.get('skip_filtered', 0)
-            logger.debug(f"[DIAG] Embed results: {_elog['ok']} OK, "
-                         f"{_elog['conflict']} boundary-conflicts, "
-                         f"{_elog['failed']} failed, "
-                         f"{_elog['skip_bbox']} no-bbox, "
-                         f"{_elog['skip_no_cand']} empty-bbox, "
-                         f"{_filt} filtered-out, "
-                         f"{_elog['skip_no_match']} no-match, "
-                         f"{_elog['boundary_skip']} boundary-skip, "
-                         f"{_elog['multi_match']} multi-match, "
-                         f"{_elog['inside_failed']} inside-failed")
-            if _filt > 0:
-                logger.debug(f"[DIAG] *** {_filt} entities found nearby surfaces but NONE "
-                             f"were in domain_surface_tags — likely missing domain surface! ***")
-            if _elog['conflict_tags']:
-                uniq = sorted(set(_elog['conflict_tags']))
-                logger.debug(f"[DIAG] *** {len(uniq)} unique line tags had BOUNDARY CONFLICTS "
-                             f"(first 10): {uniq[:10]} ***")
-            if _elog['fail_tags']:
-                logger.debug(f"[DIAG] *** Failed embeds: {_elog['fail_tags'][:5]} ***")
-            if _elog['boundary_tags']:
-                uniq = _elog['boundary_tags'][:10]
-                logger.debug(f"[DIAG] Boundary line fragments skipped (first 10): {uniq}")
-            if _elog['multi_tags']:
-                logger.debug(f"[DIAG] Multi-surface embed candidates collapsed "
-                             f"(first 10): {_elog['multi_tags'][:10]}")
-        # <<< DIAG
-
-        self.diagnostics['embedding'] = {
-            'ok': _elog['ok'],
-            'failed': _elog['failed'],
-            'skip_bbox': _elog['skip_bbox'],
-            'skip_no_cand': _elog['skip_no_cand'],
-            'skip_no_match': _elog['skip_no_match'],
-            'boundary_skip': _elog['boundary_skip'],
-            'multi_match': _elog['multi_match'],
-            'inside_failed': _elog['inside_failed'],
-            'boundary_tags': list(_elog['boundary_tags']),
-            'multi_tags': list(_elog['multi_tags']),
-            'fail_tags': list(_elog['fail_tags']),
-        }
-        if self.diagnose:
-            self.diagnostics['embedding']['records'] = list(_elog['records'])
+    def _log_embed_summary_diagnostics(self, stats):
+        """[DIAG] Embedding outcome counts and the first few problem entities."""
+        if self._verbosity < 2:
+            return
+        logger.debug(f"[DIAG] Embed results: {stats.ok} OK, "
+                     f"{stats.failed} failed, "
+                     f"{stats.skip_bbox} no-bbox, "
+                     f"{stats.skip_no_cand} empty-bbox, "
+                     f"{stats.skip_no_match} no-match, "
+                     f"{stats.boundary_skip} boundary-skip, "
+                     f"{stats.multi_match} multi-match, "
+                     f"{stats.inside_failed} inside-failed")
+        if stats.fail_tags:
+            logger.debug(f"[DIAG] *** Failed embeds: {stats.fail_tags[:5]} ***")
+        if stats.boundary_tags:
+            logger.debug(f"[DIAG] Boundary line fragments skipped (first 10): {stats.boundary_tags[:10]}")
+        if stats.multi_tags:
+            logger.debug(f"[DIAG] Multi-surface embed candidates collapsed "
+                         f"(first 10): {stats.multi_tags[:10]}")
 
 
     def generate(self, clean_polys, clean_lines, clean_points, output_file=None, launch_gmsh_gui=False):

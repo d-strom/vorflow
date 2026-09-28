@@ -61,6 +61,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `GeometricGrowthField` (growth factor 1.2) by default. Models that relied on
   the old implicit sizing will generally get more, better-graded cells.
 - Progress output uses the `vorflow` logger (stderr) instead of `print()`.
+- The mesh-size field setup's index-matching lines are `[DIAG]` output
+  (verbosity 2) instead of printing at the default verbosity.
 - `ConceptualMesh(crs=...)` defaults to `None` instead of `"EPSG:4326"`;
   geographic CRSs trigger a warning.
 - `MeshGenerator.generate()` raises before starting Gmsh if `background_lc`
