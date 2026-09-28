@@ -151,6 +151,7 @@ def compile_tables(rows_d: Path, results_d: Path) -> tuple:
     tables = []
     for name, out in (("metrics", "metrics.csv"), ("mf6", "mf6_verification.csv")):
         rows = [r for f in sorted((rows_d / name).glob("*.json")) for r in json.loads(f.read_text())]
+        assert rows, f"no {name} rows in {rows_d / name}; did the build jobs run?"
         table = pd.DataFrame(rows)
         table.to_csv(results_d / out, index=False)
         tables.append(table)
