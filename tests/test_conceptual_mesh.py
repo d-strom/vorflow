@@ -479,3 +479,12 @@ class TestCrsHandling:
         clean_polys, _, _ = cm.generate()
         assert clean_polys.crs is not None
         assert clean_polys.crs.to_epsg() == 32618
+
+
+@pytest.mark.parametrize("method", ["add_line", "add_polygon"])
+def test_quad_buffer_requires_embedded_feature(method):
+    cm = ConceptualMesh()
+    geometry = Polygon([(0, 0), (4, 0), (4, 4)]) if method == "add_polygon" else LineString([(0, 0), (4, 0)])
+    identifier = {"zone_id": 1} if method == "add_polygon" else {"line_id": "l"}
+    with pytest.raises(ValueError, match="quad_buffer=True requires embed=True"):
+        getattr(cm, method)(geometry, resolution=1.0, quad_buffer=True, embed=False, **identifier)

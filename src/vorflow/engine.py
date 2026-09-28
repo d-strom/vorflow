@@ -2382,7 +2382,7 @@ class MeshGenerator:
         # - We build ONE gmsh field per unique (field parameters + lc).
         # - We intentionally do NOT split by geometry type because a single Gmsh
         #   Distance/Threshold field can target points/curves/surfaces at once.
-        # - `feature_lc` is part of grouping because Auto* fields compute their
+        # - `feature_lc` is part of grouping because growth fields compute their
         #   transition based on the local target size.
         #
         # Each group accumulates feature ids per geometry type so we can later
@@ -2410,7 +2410,7 @@ class MeshGenerator:
                 if not row_fields:
                     continue
 
-                # Cache the feature lc for Auto* fields.
+                # Cache the feature lc for growth fields.
                 feature_lc = row.get('lc', None)
                 if feature_lc is None or (isinstance(feature_lc, float) and pd.isna(feature_lc)):
                     feature_lc = None

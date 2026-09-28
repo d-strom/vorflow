@@ -341,6 +341,8 @@ class ConceptualMesh:
 
         if quad_buffer_thickness not in (1, 2):
             raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+        if quad_buffer and not embed:
+            raise ValueError("quad_buffer=True requires embed=True: a quad buffer is meshed geometry.")
 
         growth_factor = _validate_growth_factor(growth_factor)
 
@@ -441,6 +443,8 @@ class ConceptualMesh:
 
         if quad_buffer_thickness not in (1, 2):
             raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+        if quad_buffer and not embed:
+            raise ValueError("quad_buffer=True requires embed=True: a quad buffer is meshed geometry.")
 
         growth_factor = _validate_growth_factor(growth_factor)
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import math
 import operator
-import warnings
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +55,15 @@ def _growth_gradient(growth_factor, growth_model):
     return growth_factor, math.log(growth_factor)
 
 
+def _hashable(value):
+    """Return ``value`` if it can be hashed, else its repr."""
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
 class MeshField:
     """
     Base class for all mesh size fields.
@@ -77,9 +85,10 @@ class MeshField:
         return isinstance(other, self.__class__) and self.__dict__ == other.__dict__
 
     def __hash__(self):
-        """Hash for dictionary keys."""
-        # Create a tuple of sorted item pairs to ensure consistent hashing
-        return hash((self.__class__.__name__, tuple(sorted(self.__dict__.items()))))
+        """Hash for dictionary keys (unhashable attributes hash by repr)."""
+        return hash((self.__class__.__name__, tuple(
+            (name, _hashable(value)) for name, value in sorted(self.__dict__.items())
+        )))
 
 
 class DistanceField(MeshField):
@@ -308,7 +317,7 @@ class ExponentialField(MeshField):
             gmsh_api, f_math, tags_dict, self.size_min, background_lc
         )
 
-# --- Automatic growth fields ---
+# --- Growth fields ---
 
 
 class GeometricGrowthField(MeshField):
@@ -430,37 +439,3 @@ class _BorderGradingField(MeshField):
         f_min = field.add("Min")
         field.setNumbers(f_min, "FieldsList", [float(f_inside), float(f_outside)])
         return f_min
-
-
-class AutoExponentialField(GeometricGrowthField):
-    """Deprecated compatibility name for :class:`GeometricGrowthField`."""
-
-    def __init__(
-        self,
-        growth_factor=DEFAULT_GROWTH_FACTOR,
-        growth_model="edge_ratio",
-        sampling=20,
-    ):
-        warnings.warn(
-            "AutoExponentialField is deprecated; use GeometricGrowthField instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(growth_factor, growth_model, sampling)
-
-
-class AutoLinearField(GeometricGrowthField):
-    """Deprecated compatibility name for :class:`GeometricGrowthField`."""
-
-    def __init__(
-        self,
-        growth_factor=DEFAULT_GROWTH_FACTOR,
-        sampling=20,
-        growth_model="edge_ratio",
-    ):
-        warnings.warn(
-            "AutoLinearField is deprecated; use GeometricGrowthField instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(growth_factor, growth_model, sampling)
