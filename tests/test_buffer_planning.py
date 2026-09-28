@@ -6,7 +6,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
+from shapely.geometry import LineString, MultiLineString, Point, box
 
 from vorflow import buffer
 from vorflow._features import (
@@ -263,14 +263,3 @@ def test_trim_against_obstacles():
     assert was_trimmed and trimmed.area == pytest.approx(8.0)
     with pytest.warns(UserWarning):
         assert buffer.trim_against_obstacles(strip, box(-1, -1, 11, 2), 1.0, "x") == (None, True)
-
-
-def test_push_ring_vertices_off_strips_projects_inside_vertices():
-    strip = box(0, 4.5, 10, 5.5)
-    poly = Polygon([(2, 0), (8, 0), (8, 5), (5, 5.2), (2, 5)])
-    moved_poly, moved = buffer.push_ring_vertices_off_strips(poly, [strip])
-    assert moved == 3
-    assert not any(strip.contains(Point(xy)) for xy in moved_poly.exterior.coords)
-    untouched, n = buffer.push_ring_vertices_off_strips(box(0, 0, 1, 1), [strip])
-    assert n == 0 and untouched.equals(box(0, 0, 1, 1))
-    assert buffer.push_ring_vertices_off_strips(poly, []) == (poly, 0)

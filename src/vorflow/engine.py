@@ -1105,7 +1105,7 @@ class MeshGenerator:
         footprints = band_geoms + line_strips
         footprints_union = make_valid(unary_union(footprints)) if footprints else None
         for idx, row in polygons_gdf.iterrows():
-            self._add_polygon_feature(idx, row, footprints_union, line_strips, inventory)
+            self._add_polygon_feature(idx, row, footprints_union, inventory)
 
     def _add_polygon_quad_buffers(self, polygons_gdf, inventory, plans, corridors, domain):
         """Create the band surfaces of embedded quad-buffered polygons; returns the band footprints.
@@ -1148,7 +1148,7 @@ class MeshGenerator:
             return [], None
         return created, band
 
-    def _add_polygon_feature(self, idx, row, footprints_union, line_strips, inventory):
+    def _add_polygon_feature(self, idx, row, footprints_union, inventory):
         """Add an embedded polygon (minus buffer footprints) as surfaces, or defer a field-only one."""
         embedded = is_embedded(row)
         geom = row['geometry']
@@ -1180,9 +1180,6 @@ class MeshGenerator:
                 # domain surfaces, which violates embed=False semantics.
                 inventory.pending_nonembedded_polys.append((int(idx), poly))
                 continue
-            poly, moved = buffer.push_ring_vertices_off_strips(poly, line_strips)
-            if moved and self._verbosity > 0:
-                logger.info(f"Moved {moved} zone-ring vertex(es) off structured buffer strips.")
             s_tag, _ = self._create_polygon_surface(poly)
             if s_tag is None:
                 logger.warning(f"Warning: Skipping degenerate polygon {idx}")

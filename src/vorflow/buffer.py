@@ -43,7 +43,7 @@ import warnings
 from dataclasses import dataclass, field
 
 import pandas as pd
-from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
 from shapely.ops import linemerge, unary_union
 from shapely.validation import make_valid
 
@@ -443,46 +443,3 @@ def trim_against_obstacles(geom, obstacles, lc, feature_label):
     if not pieces:
         return None, True
     return make_valid(unary_union(pieces) if len(pieces) > 1 else pieces[0]), True
-
-
-def push_ring_vertices_off_strips(poly, strips):
-    """Project ring vertices lying inside a strip onto its boundary; returns (polygon, n_moved).
-
-    A ring vertex strictly inside a strip (e.g. a densified midpoint on the
-    buffered feature line) would subdivide the strip's end caps during
-    fragmentation and break its transfinite structure. The move is at most
-    half the strip width. Returns the input unchanged (n_moved 0) when nothing
-    moves or the adjusted ring is not a valid single Polygon.
-    """
-    if not strips:
-        return poly, 0
-    exterior, moved = _project_ring_off_strips(poly.exterior.coords, strips)
-    interiors = []
-    for ring in poly.interiors:
-        coords, n = _project_ring_off_strips(ring.coords, strips)
-        interiors.append(coords)
-        moved += n
-    if not moved:
-        return poly, 0
-    adjusted = Polygon(exterior, interiors)
-    if not adjusted.is_valid:
-        adjusted = make_valid(adjusted)
-    if adjusted.geom_type != 'Polygon' or adjusted.is_empty:
-        return poly, 0
-    return adjusted, moved
-
-
-def _project_ring_off_strips(coords, strips):
-    """Project each ring vertex inside a strip onto that strip's boundary; returns (coords, n_moved)."""
-    out = []
-    moved = 0
-    for x, y in list(coords):
-        point = Point(x, y)
-        for strip in strips:
-            if strip.contains(point):
-                boundary = strip.boundary
-                point = boundary.interpolate(boundary.project(point))
-                moved += 1
-                break
-        out.append((point.x, point.y))
-    return out, moved
