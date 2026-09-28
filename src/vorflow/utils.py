@@ -57,21 +57,29 @@ def _longest_line(geom):
     return None
 
 
-def _representative_point_on_geometry(geom):
-    """Return a point suitable for projection onto a connector line."""
-    if geom.is_empty:
-        return None
-    if isinstance(geom, Point):
-        return geom
-    if isinstance(geom, LineString):
-        return geom.interpolate(0.5, normalized=True)
-    if hasattr(geom, "geoms"):
-        for part in geom.geoms:
-            point = _representative_point_on_geometry(part)
-            if point is not None:
-                return point
-    centroid = geom.centroid
-    return centroid if isinstance(centroid, Point) and not centroid.is_empty else None
+def _cross_2d(a, b):
+    """Return the z-component of the cross product of (n, 2) vector arrays."""
+    return a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+
+
+def _face_skewness(center_1, center_2, face_start, face_end, parallel_tol=1e-12):
+    """Return per-face CVFD skewness |X - M| / |face|, NaN where connector and face are parallel."""
+    center_1, center_2, face_start, face_end = (
+        np.asarray(a, dtype=float).reshape(-1, 2)
+        for a in (center_1, center_2, face_start, face_end)
+    )
+    assert center_1.shape == center_2.shape == face_start.shape == face_end.shape
+    connector = center_2 - center_1
+    face = face_end - face_start
+    midpoint = 0.5 * (face_start + face_end)
+    # X = M + u * face lies on the connector line, so |X - M| / |face| = |u|.
+    denom = _cross_2d(face, connector)
+    numer = _cross_2d(center_1 - midpoint, connector)
+    scale = np.hypot(*connector.T) * np.hypot(*face.T)
+    valid = np.abs(denom) > parallel_tol * scale
+    skewness = np.full(len(face), np.nan)
+    skewness[valid] = np.abs(numer[valid] / denom[valid])
+    return skewness
 
 
 def _center_point(row, center):
@@ -91,10 +99,13 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
     centroids and reports MODFLOW-facing cell-center connectivity for exported
     cells. ``angle`` is the connector-vs-shared-face angle in degrees, with an
     ideal value of 90. ``ortho_error`` is the corresponding orthogonality error,
-    with an ideal value of 0. ``skewness`` is the fractional position along the
-    connector where the shared face crosses, with an ideal value of 0.5.
-    ``cell_id_1`` and ``cell_id_2`` are zero-based row positions in ``gdf`` and
-    are therefore unique even when the GeoDataFrame index is not. ``orig_index_1``
+    with an ideal value of 0. ``skewness`` is the CVFD face skewness: the
+    distance between the face midpoint and the point where the (infinite)
+    connector line meets the (infinite) line through the shared face's end
+    points, divided by the face length. Its ideal value is 0; values above 0.5
+    mean the connector misses the face; it is NaN when connector and face are
+    parallel. ``cell_id_1`` and ``cell_id_2`` are zero-based row positions in
+    ``gdf`` and are therefore unique even when the GeoDataFrame index is not. ``orig_index_1``
     and ``orig_index_2`` preserve the input index for traceability. The active
     geometry is ``shared_edge``; ``connector`` stores the center-to-center line.
     """
@@ -161,11 +172,9 @@ def build_connectivity(gdf: gpd.GeoDataFrame, center: str = "generator") -> gpd.
         ortho_error = abs(90.0 - angle)
 
         connector = LineString([(x1, y1), (x2, y2)])
-        crossing = connector.intersection(shared_edge)
-        point = _representative_point_on_geometry(crossing)
-        if point is None:
-            point = shared_edge.interpolate(0.5, normalized=True)
-        skewness = float(connector.project(point) / connector.length)
+        skewness = float(
+            _face_skewness((x1, y1), (x2, y2), coords[0][:2], coords[-1][:2])[0]
+        )
 
         record = {
             "cell_id_1": int(left["__cell_id"]),
@@ -426,8 +435,11 @@ def calculate_mesh_quality(
             It is expected to have 'x' and 'y' columns for the generator points.
         calc_ortho (bool): If True, the orthogonality error will be calculated.
             This is a more expensive calculation and is disabled by default.
-        calc_skewness (bool): If True, the maximum per-cell skewness error
-            ``abs(pair_skewness - 0.5)`` will be calculated. Disabled by default.
+        calc_skewness (bool): If True, the per-cell skewness (the maximum
+            CVFD face skewness over the cell's faces, see
+            :func:`build_connectivity`; ideal 0) will be calculated. Faces
+            with undefined (NaN) skewness are ignored; a cell with no defined
+            face skewness gets NaN. Disabled by default.
         connectivity (GeoDataFrame, optional): A precomputed report from
             ``build_connectivity(gdf, center=...)``. It must include
             ``cell_id_1`` and ``cell_id_2`` as zero-based row positions in
@@ -488,10 +500,9 @@ def calculate_mesh_quality(
         if connectivity_report is None or connectivity_report.empty:
             df['skewness'] = 0.0
         else:
-            skew_error = (connectivity_report['skewness'] - 0.5).abs()
             df['skewness'] = _max_pair_metric_by_cell(
                 connectivity_report,
-                skew_error,
+                connectivity_report['skewness'].astype(float),
                 len(df),
             )
         
