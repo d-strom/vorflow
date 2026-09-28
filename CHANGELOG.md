@@ -24,6 +24,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Field-only (`embed=False`) polygons no longer assign zones or change the
   clip domain, in both the Voronoi grid and the element grid.
 - Kept `node_id` unique when clipping splits a cell into several parts.
+- Cells whose generator sits on a slanted domain edge get the nearest zone
+  instead of no `zone_id` (about 3% of cells on a simple pentagon domain).
 - Polygon simplification no longer opens gaps along edges shared with
   neighbouring polygons.
 - Point deduplication no longer depends on which point of a close pair has

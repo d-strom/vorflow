@@ -598,3 +598,39 @@ def test_multipart_clip_keeps_node_ids_unique():
     assert detached["x"] == pytest.approx(detached.geometry.centroid.x)
     assert detached["y"] == pytest.approx(detached.geometry.centroid.y)
     assert detached["zone_id"] == 7
+
+
+def test_generators_just_outside_a_slanted_edge_still_get_a_zone():
+    # Mesh nodes on a slanted domain edge can sit a floating-point hair
+    # outside the zone polygon, so an intersects join alone misses them.
+    domain = Polygon([(0, 0), (1, 0), (1.2, 1), (0, 1)])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=7)
+    cm.generate()
+
+    edge = LineString([(1, 0), (1.2, 1)])
+    outward = np.array([1.0, -0.2]) / np.hypot(1.0, 0.2)
+    on_edge = [np.array(edge.interpolate(f, normalized=True).coords[0]) + 1e-12 * outward
+               for f in (0.25, 0.5, 0.75)]
+    interior = [(0.2, 0.2), (0.5, 0.5), (0.2, 0.8), (0.6, 0.2), (0.6, 0.8)]
+    nodes = np.vstack([np.array(interior), np.array(on_edge)])
+    assert not any(domain.intersects(Point(p)) for p in on_edge)
+
+    mesher = DummyMeshGenerator(nodes, np.arange(1, len(nodes) + 1), cm.clean_polygons)
+    grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
+
+    assert grid["zone_id"].notna().all()
+    assert set(grid["zone_id"]) == {7}
+
+
+@pytest.mark.slow
+def test_real_mesh_on_slanted_domain_assigns_every_cell_a_zone():
+    from vorflow.engine import MeshGenerator
+
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (120, 0), (130, 60), (60, 90), (0, 70)]), zone_id="dom", resolution=6)
+    clean = cm.generate()
+    mesher = MeshGenerator(background_lc=6, verbosity=0)
+    assert mesher.generate(*clean)
+    grid = VoronoiTessellator(mesher, cm).generate()
+    assert grid["zone_id"].eq("dom").all()

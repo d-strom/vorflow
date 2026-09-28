@@ -141,6 +141,22 @@ def _primary_piece_position(pieces, generator):
     return max(candidates, key=lambda i: pieces[i].area)
 
 
+def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
+    """Give generators that matched no zone the nearest zone instead.
+
+    Mesh nodes on a slanted domain edge can sit a floating-point hair outside
+    every zone polygon, so the ``intersects`` join leaves them without a zone
+    even though their cell lies inside the domain.
+    """
+    matched = joined['index_right'].notna()
+    missing = pts_gdf[~pts_gdf['node_id'].isin(joined.loc[matched, 'node_id'])]
+    if missing.empty or zones.empty:
+        return joined
+    logger.debug(f"  -> {len(missing)} generator(s) outside every zone; using the nearest zone.")
+    nearest = gpd.sjoin_nearest(missing, zones, how='left')
+    return pd.concat([joined[matched], nearest])
+
+
 def _explode_with_unique_ids(grid_gdf):
     """Explode multipart cells into polygons, giving every non-primary part a fresh node_id."""
     exploded = grid_gdf.explode(index_parts=False)
@@ -605,7 +621,8 @@ class VoronoiTessellator:
         
         # 2. Spatially join the points to the zones.
         joined = gpd.sjoin(pts_gdf, zones, how='left', predicate='intersects')
-        
+        joined = _join_unmatched_to_nearest_zone(joined, pts_gdf, zones)
+
         # 3. If a point falls on a boundary between zones, it may have multiple
         # matches. We use the `z_order` from the conceptual model to pick the
         # highest-priority zone.
