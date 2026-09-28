@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import dataclasses
+
 import gmsh
 import math
 import warnings
@@ -107,6 +109,63 @@ def _assign_zones_to_elements(grid, zones_gdf):
     if "z_order" in joined.columns:
         merge_cols.append("z_order")
     return grid.merge(joined[merge_cols], on="element_tag", how="left")
+
+
+# gmsh_map key for each fragment-input kind recorded in _GeometryInventory.
+_MAP_KEY_BY_KIND = {
+    'point': 'points',
+    'straddle_point': 'straddle_points',
+    'line': 'lines',
+    'surface': 'surfaces',
+    'structured_buffer_surf': 'structured_buffer_surfs',
+}
+
+
+@dataclasses.dataclass
+class _GeometryInventory:
+    """Per-call bookkeeping of the OCC entities created by ``_add_geometry``."""
+
+    # Embedded entities take part in fragmentation; input_tag_info maps each
+    # pre-fragment (dim, tag) to {'type', 'id'} so the fragment map can be
+    # traced back to features.
+    input_tag_info: dict = dataclasses.field(default_factory=dict)
+    embedded_point_tags: list = dataclasses.field(default_factory=list)
+    embedded_line_tags: list = dataclasses.field(default_factory=list)
+    embedded_surface_tags: list = dataclasses.field(default_factory=list)
+    # Non-embedded (field-only) entities per feature id; they do not fragment
+    # but still receive size fields. Straddle pairs are keyed by their *line*
+    # id, apart from point features (whose ids share the same 0..n range).
+    # Field-only polygons also keep their boundary curves (poly_curves).
+    nonembedded_point_tags: dict = dataclasses.field(default_factory=dict)
+    nonembedded_straddle_tags: dict = dataclasses.field(default_factory=dict)
+    nonembedded_line_tags: dict = dataclasses.field(default_factory=dict)
+    nonembedded_surface_tags: dict = dataclasses.field(default_factory=dict)
+    nonembedded_poly_curve_tags: dict = dataclasses.field(default_factory=dict)
+    # (feature id, polygon) created only after fragmentation.
+    pending_nonembedded_polys: list = dataclasses.field(default_factory=list)
+    # Per quad-buffered feature: lc, thickness, strip corners/side lines.
+    structured_buffer_specs: dict = dataclasses.field(default_factory=dict)
+
+    def record_embedded(self, key, kind, feature_id):
+        """Register an entity that takes part in fragmentation."""
+        self.input_tag_info[key] = {'type': kind, 'id': feature_id}
+        by_dim = (self.embedded_point_tags, self.embedded_line_tags, self.embedded_surface_tags)
+        by_dim[key[0]].append(key)
+
+    def object_tags(self):
+        """Fragment inputs: surfaces, then lines, then points, each in creation order."""
+        return self.embedded_surface_tags + self.embedded_line_tags + self.embedded_point_tags
+
+    def feature_map(self):
+        """A gmsh_map seeded with the non-embedded tags (shallow copies)."""
+        return {
+            'points': dict(self.nonembedded_point_tags),
+            'straddle_points': dict(self.nonembedded_straddle_tags),
+            'lines': dict(self.nonembedded_line_tags),
+            'surfaces': dict(self.nonembedded_surface_tags),
+            'structured_buffer_surfs': {},
+            'poly_curves': dict(self.nonembedded_poly_curve_tags),
+        }
 
 
 class MeshGenerator:
@@ -772,402 +831,25 @@ class MeshGenerator:
 
 
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=False):
-        """
-        Transfers Shapely geometries from GeoDataFrames into the Gmsh model.
+        """Transfer the clean features into the OCC model and fragment them; returns gmsh_map."""
+        inventory = _GeometryInventory()
+        domain = buffer.domain_union_geometry(polygons_gdf)
 
-        This method adds points, lines, and polygons to Gmsh's internal CAD
-        kernel (OCC). It also handles special cases like "straddle" lines and
-        pre-processes barrier features before fragmenting all geometries to
-        create a consistent topological model.
-        """
-        input_tag_info = {}
+        self._add_point_features(points_gdf, inventory)
 
-        # Refinement disks recorded where quad buffers cross (see
-        # buffer.find_crossings); consumed in _setup_fields.
-        self._quad_buffer_crossings = []
+        corridors = buffer.protected_corridors(polygons_gdf, lines_gdf, self.background_lc)
+        barrier_zone = self._build_barrier_zone(corridors)
+        plans = buffer.plan_quad_buffers(polygons_gdf, lines_gdf, self.background_lc, domain)
+        self._quad_buffer_crossings = buffer.find_all_crossings(plans)
 
-        # Non-embedded geometry does not participate in fragmentation.
-        # We still track it so mesh-size fields can be applied later.
-        nonembedded_point_tags = {}
-        nonembedded_line_tags = {}
-        # Straddle point pairs are keyed by their *line* feature id, so they
-        # live apart from point features (whose ids share the same 0..n range).
-        nonembedded_straddle_tags = {}
-        nonembedded_surface_tags = {}
-        # For non-embedded polygons, we track their boundary curves so size
-        # fields can be applied without forcing the polygon to cut/fragment the domain.
-        nonembedded_poly_curve_tags = {}
-        pending_nonembedded_polys = []
-
-        # Embedded geometry DOES participate in fragmentation.
-        embedded_point_tags = []
-        embedded_line_tags = []
-        embedded_surface_tags = []
-
-        to_key = _to_key
-
-        def create_polygon_surface(poly):
-            """Create a Gmsh plane surface and return its tag plus boundary curves."""
-            if poly.is_empty:
-                return None, []
-
-            poly = self._force_close_polygon(poly)
-
-            def create_loop(coords):
-                clean_coords = sanitize_coords(
-                    coords,
-                    min_spacing=1e-5,
-                    require_closed=True,
-                    min_points=3,
-                )
-
-                if len(clean_coords) < 3:
-                    return None, []
-
-                p_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in clean_coords]
-                l_tags = []
-                for i in range(len(p_tags)):
-                    p1 = p_tags[i]
-                    p2 = p_tags[(i + 1) % len(p_tags)]
-                    try:
-                        l_tags.append(gmsh.model.occ.addLine(p1, p2))
-                    except Exception as e:
-                        logger.error(f"Error adding line {p1}-{p2}: {e}")
-                        return None, []
-
-                try:
-                    loop_tag = gmsh.model.occ.addCurveLoop(l_tags)
-                    return loop_tag, l_tags
-                except Exception as e:
-                    logger.error(f"Error adding curve loop: {e}")
-                    return None, []
-
-            exterior_loop_tag, exterior_lines = create_loop(list(poly.exterior.coords))
-            if exterior_loop_tag is None:
-                return None, []
-
-            loops = [exterior_loop_tag]
-            boundary_curve_tags = list(exterior_lines)
-            for interior in poly.interiors:
-                interior_loop_tag, interior_lines = create_loop(list(interior.coords))
-                if interior_loop_tag is not None:
-                    loops.append(interior_loop_tag)
-                    boundary_curve_tags.extend(interior_lines)
-
-            try:
-                s_tag = gmsh.model.occ.addPlaneSurface(loops)
-            except Exception as e:
-                logger.error(f"Error creating surface: {e}")
-                return None, []
-
-            return s_tag, boundary_curve_tags
-
-        background_lc = self.background_lc
-        domain_geom_for_buffers = buffer.domain_union_geometry(polygons_gdf)
-
-        def add_structured_buffer_surface(buffer_geom, feature_id, input_type,
-                                          corners=None, side_lines=None):
-            """Create OCC surfaces for a buffer geometry; returns [(key, strip_info), ...]."""
-            created = []
-            if domain_geom_for_buffers is not None and not domain_geom_for_buffers.is_empty:
-                buffer_geom = buffer_geom.intersection(domain_geom_for_buffers)
-            buffer_geom = make_valid(buffer_geom)
-            parts = [
-                poly for poly in polygon_parts(buffer_geom)
-                if not poly.is_empty and poly.area > 0
-            ]
-            if corners is not None and len(parts) != 1:
-                # The recorded whole-strip corners no longer apply; pieces are
-                # re-cornered individually from the side lines post-fragment.
-                corners = None
-            for poly in parts:
-                s_tag, boundary_curve_tags = create_polygon_surface(poly)
-                if s_tag is None:
-                    continue
-                key = to_key(2, s_tag)
-                input_tag_info[key] = {'type': input_type, 'id': feature_id}
-                embedded_surface_tags.append(key)
-                created.append((key, {'corners': corners, 'side_lines': side_lines}))
-            return created
-
-        # Strip footprints collected for ring-vertex protection (see
-        # buffer.push_ring_vertices_off_strips).
-        line_strip_polygons = []
-
-        def create_line_structured_buffer(row):
-            key = ('line', int(row.name))
-            plan = strip_plans.get(key)
-            if plan is None:
-                return []
-            obstacles = buffer.higher_priority_obstacles(key, strip_plans, corridors_by_feature)
-            self._quad_buffer_crossings.extend(buffer.find_crossings(key, strip_plans))
-            created = []
-            feature_label = f"line feature {row.name}"
-            for part_plan in plan.parts:
-                strip, trimmed = buffer.trim_against_obstacles(
-                    part_plan.strip, obstacles, plan.lc, feature_label
-                )
-                corners = None if trimmed else part_plan.corners
-                if strip is None:
-                    continue
-                line_strip_polygons.append(strip)
-                created.extend(
-                    add_structured_buffer_surface(
-                        strip, key, 'structured_buffer_surf',
-                        corners=corners, side_lines=part_plan.side_lines,
-                    )
-                )
-            return created
-
-        def create_polygon_structured_buffer(row):
-            key = ('poly', int(row.name))
-            plan = strip_plans.get(key)
-            if plan is None:
-                return [], None
-            obstacles = buffer.higher_priority_obstacles(key, strip_plans, corridors_by_feature)
-            self._quad_buffer_crossings.extend(buffer.find_crossings(key, strip_plans))
-            feature_label = f"polygon feature {row.name}"
-            band, _ = buffer.trim_against_obstacles(plan.band, obstacles, plan.lc, feature_label)
-            if band is None:
-                return [], None
-            created = add_structured_buffer_surface(
-                band, key, 'structured_buffer_surf'
-            )
-            if not created:
-                return [], None
-            return created, band
-
-        structured_buffer_specs = {}
-
-        # Add all point features to the Gmsh model first.
-        for idx, row in points_gdf.iterrows():
-            tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
-            key = to_key(0, tag)
-            if is_embedded(row):
-                input_tag_info[key] = {'type': 'point', 'id': idx}
-                embedded_point_tags.append(key)
-            else:
-                nonembedded_point_tags.setdefault(int(idx), []).append(key)
-
-        # Protection corridors and the barrier zone trimming standard lines.
-        corridors_by_feature = buffer.protected_corridors(polygons_gdf, lines_gdf, background_lc)
-        barrier_zone = buffer.barrier_zone(corridors_by_feature)
-        if barrier_zone is not None and self._verbosity > 0:
-            logger.info(f"Constructed Barrier Zone from {len(corridors_by_feature)} protected features.")
-
-        # Plan every quad-buffer footprint up front so crossings resolve by priority.
-        strip_plans = buffer.plan_quad_buffers(
-            polygons_gdf, lines_gdf, background_lc, domain_geom_for_buffers
+        line_strips = self._add_line_features(
+            lines_gdf, inventory, plans, corridors, barrier_zone, domain
+        )
+        self._add_polygon_features(
+            polygons_gdf, inventory, plans, corridors, domain, line_strips
         )
 
-        # Add line features to the model, handling barriers and standard lines differently.
-        for idx, row in lines_gdf.iterrows():
-            is_barrier = row_bool(row, 'is_barrier', False)
-            quad_buffer = row_bool(row, 'quad_buffer', False)
-            straddle = positive_number(row.get('straddle_width'))
-            lc = feature_lc(row, background_lc)
-
-            use_structured_buffer = quad_buffer
-            use_virtual_straddle = not use_structured_buffer and (is_barrier or straddle is not None)
-
-            embedded = is_embedded(row)
-
-            if use_structured_buffer:
-                created = create_line_structured_buffer(row)
-                if created:
-                    structured_buffer_specs[('line', int(idx))] = {
-                        'lc': lc,
-                        'thickness': buffer.quad_buffer_thickness(row),
-                        'kind': 'line',
-                        'strips': [info for _, info in created],
-                        'n_surfaces_created': len(created),
-                    }
-                elif self._verbosity > 0:
-                    logger.warning(f"Warning: Structured buffer requested for line {idx}, but no buffer surface was created.")
-
-            elif use_virtual_straddle:
-                # For barriers or "straddle" lines, we don't add the line itself.
-                # Instead, we place pairs of points along the line's path. These
-                # points will become nodes in the triangular mesh, forcing the
-                # subsequent Voronoi cell edges to align with the original line.
-                line = row.geometry
-                length = line.length
-                num_segments = int(max(1, np.ceil(length / lc)))
-                distances = np.linspace(0, length, num_segments + 1)
-
-                if straddle:
-                    epsilon = straddle / 2.0
-                else:
-                    epsilon = lc * 0.20
-
-                # Tangent probe proportional to line length so the offsets
-                # work for any CRS units and for lines shorter than the old
-                # fixed 0.01 step.
-                probe = max(length * 1e-4, 1e-12)
-                for d in distances:
-                    p = line.interpolate(d)
-                    dx, dy = _unit_tangent(line, d, probe)
-                    nx, ny = -dy, dx
-
-                    # Create two points, offset from the original line by the normal.
-                    lx, ly = p.x + nx*epsilon, p.y + ny*epsilon
-                    lt = gmsh.model.occ.addPoint(lx, ly, 0)
-                    k_l = to_key(0, lt)
-                    if embedded:
-                        input_tag_info[k_l] = {'type': 'straddle_point', 'id': idx}
-                        embedded_point_tags.append(k_l)
-                    else:
-                        nonembedded_straddle_tags.setdefault(int(idx), []).append(k_l)
-
-                    rx, ry = p.x - nx*epsilon, p.y - ny*epsilon
-                    rt = gmsh.model.occ.addPoint(rx, ry, 0)
-                    k_r = to_key(0, rt)
-                    if embedded:
-                        input_tag_info[k_r] = {'type': 'straddle_point', 'id': idx}
-                        embedded_point_tags.append(k_r)
-                    else:
-                        nonembedded_straddle_tags.setdefault(int(idx), []).append(k_r)
-
-            else:
-                # This is a standard line feature that will act as a constraint
-                # in the mesh, but not a hard barrier.
-                geom = row.geometry
-
-                # Trim the line against the barrier zone to avoid intersections.
-                if barrier_zone:
-                    if geom.intersects(barrier_zone):
-                        try:
-                            original_len = geom.length
-                            geom = geom.difference(barrier_zone)
-
-                            if self._verbosity > 1:
-                                logger.info(f"  Line {idx} trimmed by barrier (Len: {original_len:.2f} -> {geom.length:.2f})")
-
-                        except Exception as e:
-                            logger.warning(f"Warning: Failed to trim line {idx}: {e}")
-
-                if geom.is_empty:
-                    continue
-
-                # A line might be split into multiple parts after being trimmed.
-                if geom.geom_type == 'LineString':
-                    parts = [geom]
-                elif geom.geom_type == 'MultiLineString':
-                    parts = geom.geoms
-                else:
-                    parts = []
-
-                for part in parts:
-                    # Filter out tiny fragments that might remain after trimming.
-                    if part.length < 1e-6:
-                        continue
-
-                    coords = sanitize_coords(list(part.coords), min_points=2)
-                    if len(coords) < 2:
-                        if self._verbosity > 0:
-                            logger.warning(f"Warning: Skipping degenerate line part for feature {idx} after coordinate cleanup.")
-                        continue
-
-                    # Add each segment of the line to Gmsh.
-                    pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
-                    created_segments = 0
-                    for i in range(len(pt_tags) - 1):
-                        try:
-                            line_tag = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
-                        except Exception as e:
-                            logger.warning(
-                                f"Warning: Skipping invalid line segment {i} for feature {idx} "
-                                f"between {coords[i]} and {coords[i+1]}: {e}"
-                            )
-                            continue
-
-                        key = to_key(1, line_tag)
-                        created_segments += 1
-                        if embedded:
-                            embedded_line_tags.append(key)
-                            input_tag_info[key] = {'type': 'line', 'id': idx}
-                        else:
-                            nonembedded_line_tags.setdefault(int(idx), []).append(key)
-
-                    if created_segments == 0 and self._verbosity > 0:
-                        logger.warning(f"Warning: No valid line segments were created for feature {idx}.")
-
-        # Add polygon features to the model.
-        if not polygons_gdf.empty:
-            logger.info(f"Adding {len(polygons_gdf)} polygons to Gmsh...")
-            # First pass: create the quad-buffer band surfaces and collect their
-            # footprints. The band hugs the full feature boundary, so it is
-            # created once per feature rather than once per MultiPolygon part.
-            polygon_band_geoms = []
-            for idx, row in polygons_gdf.iterrows():
-                if not (is_embedded(row) and row_bool(row, 'quad_buffer', False)):
-                    continue
-                created, band_geom = create_polygon_structured_buffer(row)
-                if created:
-                    structured_buffer_specs[('poly', int(idx))] = {
-                        'lc': feature_lc(row, background_lc),
-                        'thickness': buffer.quad_buffer_thickness(row),
-                        'kind': 'polygon',
-                        'strips': [],
-                        'n_surfaces_created': len(created),
-                    }
-                    polygon_band_geoms.append(band_geom)
-                elif self._verbosity > 0:
-                    logger.warning(f"Warning: Structured buffer requested for polygon {idx}, but no buffer surface was created.")
-            buffer_footprints = polygon_band_geoms + line_strip_polygons
-            buffer_footprints_union = (
-                make_valid(unary_union(buffer_footprints)) if buffer_footprints else None
-            )
-
-            for idx, row in polygons_gdf.iterrows():
-                embedded = is_embedded(row)
-                geom = row['geometry']
-                if geom.geom_type not in ('Polygon', 'MultiPolygon'):
-                    continue
-                # Mesh every embedded polygon minus the band/strip footprints,
-                # so the buffer surfaces tile the plane with their neighbours
-                # exactly (shared curves merged by removeAllDuplicates) instead
-                # of relying on OCC fragment to cut overlapping faces — which
-                # silently refuses in some trimmed-crossing configurations and
-                # leaves double-meshed regions. It also keeps a buffered zone's
-                # outline out of the mesh entirely: overlap resolution makes
-                # neighbours share that outline (e.g. the domain piece has a
-                # hole there), so subtracting only from the buffered zone itself
-                # would still pin mesh nodes onto it. Zone assignment uses the
-                # original polygons, so zone extents are unchanged.
-                if (
-                    embedded
-                    and buffer_footprints_union is not None
-                    and geom.intersects(buffer_footprints_union)
-                ):
-                    geom = make_valid(geom.difference(buffer_footprints_union))
-                polys = polygon_parts(geom)
-
-                for poly in polys:
-                    if poly.is_empty:
-                        continue
-
-                    if not embedded:
-                        # Defer field-only polygon creation until after
-                        # fragmentation/dedup/healing. If these overlapping
-                        # surfaces exist during global OCC cleanup they can cut
-                        # or renumber embedded domain surfaces, which violates
-                        # embed=False semantics.
-                        pending_nonembedded_polys.append((int(idx), poly))
-                        continue
-
-                    poly, moved = buffer.push_ring_vertices_off_strips(poly, line_strip_polygons)
-                    if moved and self._verbosity > 0:
-                        logger.info(f"Moved {moved} zone-ring vertex(es) off structured buffer strips.")
-                    s_tag, boundary_curve_tags = create_polygon_surface(poly)
-                    if s_tag is None:
-                        logger.warning(f"Warning: Skipping degenerate polygon {idx}")
-                        continue
-
-                    key = to_key(2, s_tag)
-                    input_tag_info[key] = {'type': 'surface', 'id': idx}
-                    embedded_surface_tags.append(key)
-        #call the gui before fragmentation for debugging
+        # Call the GUI before fragmentation for debugging.
         if self._verbosity > 1 and launch_gmsh_gui:
             gmsh.model.occ.synchronize()
             gmsh.fltk.run()
@@ -1175,40 +857,29 @@ class MeshGenerator:
         # >>> DIAG: Pre-fragment inventory (summary)
         if self._verbosity >= 2:
             _line_feats = sorted(set(
-                input_tag_info.get(to_key(dt[0], dt[1]), {}).get('id', '?')
-                for dt in embedded_line_tags
-            )) if embedded_line_tags else []
-            logger.debug(f"\n[DIAG] Pre-fragment: {len(embedded_surface_tags)} surfs, "
-                         f"{len(embedded_line_tags)} lines, {len(embedded_point_tags)} pts "
+                inventory.input_tag_info.get(_to_key(dt[0], dt[1]), {}).get('id', '?')
+                for dt in inventory.embedded_line_tags
+            )) if inventory.embedded_line_tags else []
+            logger.debug(f"\n[DIAG] Pre-fragment: {len(inventory.embedded_surface_tags)} surfs, "
+                         f"{len(inventory.embedded_line_tags)} lines, {len(inventory.embedded_point_tags)} pts "
                          f"| line features: {_line_feats}")
         # <<< DIAG
 
-        # "Fragment" combines all the individual geometries into a single,
-        # topologically consistent model. This is where intersections are
-        # calculated and new, smaller entities are created at overlaps.
-        # Only embedded geometry participates in fragmentation.
-        object_tags = embedded_surface_tags + embedded_line_tags + embedded_point_tags
-        
+        object_tags = inventory.object_tags()
         if not object_tags:
             logger.warning("Warning: No geometry to mesh.")
-            return {
-                'points': nonembedded_point_tags,
-                'straddle_points': nonembedded_straddle_tags,
-                'lines': nonembedded_line_tags,
-                'surfaces': nonembedded_surface_tags,
-                'structured_buffer_surfs': {},
-                'poly_curves': nonembedded_poly_curve_tags,
-            }
+            return inventory.feature_map()
 
+        # "Fragment" combines all the individual geometries into a single,
+        # topologically consistent model. Only embedded geometry takes part.
         logger.info(f"Fragmenting {len(object_tags)} objects...")
         out_dt, out_map = gmsh.model.occ.fragment(object_tags, [])
-
-        self._dedup_and_remap_fragment_map(out_map, object_tags, input_tag_info)
-
-        self._heal_and_remap_fragment_map(out_map, object_tags, input_tag_info)
+        self._dedup_and_remap_fragment_map(out_map, object_tags, inventory.input_tag_info)
+        self._heal_and_remap_fragment_map(out_map, object_tags, inventory.input_tag_info)
 
         # >>> DIAG: Post-fragment summary
         if self._verbosity >= 2:
+            input_tag_info = inventory.input_tag_info
             all_surfs_post = gmsh.model.getEntities(2)
             all_lines_post = gmsh.model.getEntities(1)
             all_pts_post   = gmsh.model.getEntities(0)
@@ -1217,7 +888,7 @@ class MeshGenerator:
             _n_boundary, _n_interior, _n_orphan, _n_dim0 = 0, 0, 0, 0
             _boundary_feats = set()  # feature names whose lines became boundaries
             for i, input_dimtag in enumerate(object_tags):
-                key = to_key(input_dimtag[0], input_dimtag[1])
+                key = _to_key(input_dimtag[0], input_dimtag[1])
                 info = input_tag_info.get(key, {})
                 if info.get('type') != 'line':
                     continue
@@ -1258,76 +929,8 @@ class MeshGenerator:
                              f"{sorted(_boundary_feats)} ***")
         # <<< DIAG
 
-        if pending_nonembedded_polys:
-            if self._verbosity > 0:
-                logger.info(f"Adding {len(pending_nonembedded_polys)} field-only polygon surface(s)...")
-            for idx, poly in pending_nonembedded_polys:
-                s_tag, boundary_curve_tags = create_polygon_surface(poly)
-                if s_tag is None:
-                    if self._verbosity > 0:
-                        logger.warning(f"Warning: Skipping degenerate field-only polygon {idx}")
-                    continue
-                nonembedded_surface_tags.setdefault(int(idx), []).append(to_key(2, s_tag))
-                nonembedded_poly_curve_tags.setdefault(int(idx), []).extend(
-                    [(1, int(t)) for t in boundary_curve_tags]
-                )
-            gmsh.model.occ.synchronize()
-        
-        # After fragmentation, we need to rebuild our map of which original
-        # feature corresponds to which new Gmsh tags.
-        final_map = {
-            'points': dict(nonembedded_point_tags),
-            'straddle_points': dict(nonembedded_straddle_tags),
-            'lines': dict(nonembedded_line_tags),
-            'surfaces': dict(nonembedded_surface_tags),
-            'structured_buffer_surfs': {},
-            'poly_curves': dict(nonembedded_poly_curve_tags),
-        }
-        
-        logger.info(f"Reconstructing Map (Input Tags: {len(object_tags)}, Out Map Len: {len(out_map)})...")
-        
-        for i, input_dimtag in enumerate(object_tags):
-            if i < len(out_map):
-                res_tags = out_map[i]
-            else:
-                res_tags = [input_dimtag]
-
-            # Look up the original feature ID using the pre-fragmentation tag.
-            key = to_key(input_dimtag[0], input_dimtag[1])
-            
-            if key in input_tag_info:
-                info = input_tag_info[key]
-                kind = info['type']
-                # Structured-buffer ids are ('line'|'poly', idx) tuples so line
-                # and polygon features with the same index cannot collide.
-                feat_id = info['id'] if isinstance(info['id'], tuple) else int(info['id'])
-                
-                if kind == 'point':
-                    if feat_id not in final_map['points']:
-                        final_map['points'][feat_id] = []
-                    final_map['points'][feat_id].extend(res_tags)
-                    
-                elif kind == 'line':
-                    if feat_id not in final_map['lines']:
-                        final_map['lines'][feat_id] = []
-                    final_map['lines'][feat_id].extend(res_tags)
-                    
-                elif kind == 'surface':
-                    if feat_id not in final_map['surfaces']:
-                        final_map['surfaces'][feat_id] = []
-                    final_map['surfaces'][feat_id].extend(res_tags)
-                    
-                elif kind == 'straddle_point':
-                    if feat_id not in final_map['straddle_points']:
-                        final_map['straddle_points'][feat_id] = []
-                    final_map['straddle_points'][feat_id].extend(res_tags)
-
-                elif kind == 'structured_buffer_surf':
-                    if feat_id not in final_map['structured_buffer_surfs']:
-                        final_map['structured_buffer_surfs'][feat_id] = []
-                    final_map['structured_buffer_surfs'][feat_id].extend(res_tags)
-            else:
-                logger.warning(f"Warning: Tag {key} lost during fragmentation mapping.")
+        self._add_field_only_polygons(inventory)
+        final_map = self._rebuild_feature_map(object_tags, out_map, inventory)
 
         # DIAG: Final map point summary
         if self._verbosity >= 2:
@@ -1353,11 +956,363 @@ class MeshGenerator:
             if _stale_feats:
                 logger.debug(f"  [DIAG] Stale point (feat_id, tag): {_stale_feats}")
 
-        # Safety net: OCC's fragment map can omit pieces of an input surface
-        # (observed when a buffer strip with boundaries coincident to the
-        # densified domain edge splits the domain). An unclaimed 2D entity
-        # would silently lose its mesh nodes and field sizing downstream, so
-        # re-attach each orphan to the embedded polygon feature containing it.
+        self._recover_orphan_surfaces(final_map, polygons_gdf)
+        self._apply_structured_buffer_meshing(final_map, inventory.structured_buffer_specs)
+        return final_map
+
+    def _add_point_features(self, points_gdf, inventory):
+        """Add one OCC point per point feature."""
+        for idx, row in points_gdf.iterrows():
+            tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
+            key = _to_key(0, tag)
+            if is_embedded(row):
+                inventory.record_embedded(key, 'point', idx)
+            else:
+                inventory.nonembedded_point_tags.setdefault(int(idx), []).append(key)
+
+    def _build_barrier_zone(self, corridors):
+        """Union of the protection corridors (None if there are none), logged at verbosity 1."""
+        zone = buffer.barrier_zone(corridors)
+        if zone is not None and self._verbosity > 0:
+            logger.info(f"Constructed Barrier Zone from {len(corridors)} protected features.")
+        return zone
+
+    def _add_line_features(self, lines_gdf, inventory, plans, corridors, barrier_zone, domain):
+        """Add each line as a quad buffer, straddle point pairs or plain curves; returns the strip footprints."""
+        line_strips = []
+        for idx, row in lines_gdf.iterrows():
+            is_barrier = row_bool(row, 'is_barrier', False)
+            quad_buffer = row_bool(row, 'quad_buffer', False)
+            straddle = positive_number(row.get('straddle_width'))
+            lc = feature_lc(row, self.background_lc)
+            embedded = is_embedded(row)
+            if quad_buffer:
+                line_strips.extend(self._add_line_quad_buffer(
+                    idx, row, lc, inventory, plans, corridors, domain
+                ))
+            elif is_barrier or straddle is not None:
+                self._add_straddle_points(idx, row.geometry, lc, straddle, embedded, inventory)
+            else:
+                self._add_standard_line(idx, row.geometry, embedded, barrier_zone, inventory)
+        return line_strips
+
+    def _add_line_quad_buffer(self, idx, row, lc, inventory, plans, corridors, domain):
+        """Create a quad-buffered line's strip surfaces, trimmed by priority; returns the strip footprints."""
+        key = ('line', int(idx))
+        plan = plans.get(key)
+        strips, created = [], []
+        if plan is not None:
+            obstacles = buffer.higher_priority_obstacles(key, plans, corridors)
+            feature_label = f"line feature {row.name}"
+            for part in plan.parts:
+                strip, trimmed = buffer.trim_against_obstacles(
+                    part.strip, obstacles, plan.lc, feature_label
+                )
+                if strip is None:
+                    continue
+                strips.append(strip)
+                created.extend(self._add_buffer_surfaces(
+                    strip, key, domain, inventory,
+                    corners=None if trimmed else part.corners,
+                    side_lines=part.side_lines,
+                ))
+        if created:
+            inventory.structured_buffer_specs[key] = {
+                'lc': lc,
+                'thickness': buffer.quad_buffer_thickness(row),
+                'kind': 'line',
+                'strips': [info for _, info in created],
+                'n_surfaces_created': len(created),
+            }
+        elif self._verbosity > 0:
+            logger.warning(f"Warning: Structured buffer requested for line {idx}, but no buffer surface was created.")
+        return strips
+
+    def _add_straddle_points(self, idx, line, lc, straddle, embedded, inventory):
+        """Place point pairs at +/-eps along a barrier/straddle line so Voronoi edges follow it.
+
+        The line itself is not added; the pairs become mesh nodes whose
+        Voronoi edges trace the original line.
+        """
+        length = line.length
+        num_segments = int(max(1, np.ceil(length / lc)))
+        distances = np.linspace(0, length, num_segments + 1)
+        epsilon = straddle / 2.0 if straddle else lc * 0.20
+        # Tangent probe proportional to line length so the offsets work for
+        # any CRS units and for lines shorter than a fixed step.
+        probe = max(length * 1e-4, 1e-12)
+        for d in distances:
+            p = line.interpolate(d)
+            dx, dy = _unit_tangent(line, d, probe)
+            nx, ny = -dy, dx
+            for sign in (1.0, -1.0):
+                tag = gmsh.model.occ.addPoint(p.x + sign * nx * epsilon, p.y + sign * ny * epsilon, 0)
+                key = _to_key(0, tag)
+                if embedded:
+                    inventory.record_embedded(key, 'straddle_point', idx)
+                else:
+                    inventory.nonembedded_straddle_tags.setdefault(int(idx), []).append(key)
+
+    def _add_standard_line(self, idx, geom, embedded, barrier_zone, inventory):
+        """Add a plain constraint line, trimmed off the barrier zone, as OCC segments."""
+        if barrier_zone and geom.intersects(barrier_zone):
+            try:
+                original_len = geom.length
+                geom = geom.difference(barrier_zone)
+                if self._verbosity > 1:
+                    logger.info(f"  Line {idx} trimmed by barrier (Len: {original_len:.2f} -> {geom.length:.2f})")
+            except Exception as e:
+                # Broad on purpose: a failed trim keeps the untrimmed line
+                # rather than aborting the whole mesh.
+                logger.warning(f"Warning: Failed to trim line {idx}: {e}")
+        if geom.is_empty:
+            return
+        # A line might be split into multiple parts after being trimmed.
+        if geom.geom_type == 'LineString':
+            parts = [geom]
+        elif geom.geom_type == 'MultiLineString':
+            parts = geom.geoms
+        else:
+            parts = []
+        for part in parts:
+            # Filter out tiny fragments that might remain after trimming.
+            if part.length < 1e-6:
+                continue
+            self._add_polyline(idx, part, embedded, inventory)
+
+    def _add_polyline(self, idx, part, embedded, inventory):
+        """Add one LineString as a chain of OCC segments."""
+        coords = sanitize_coords(list(part.coords), min_points=2)
+        if len(coords) < 2:
+            if self._verbosity > 0:
+                logger.warning(f"Warning: Skipping degenerate line part for feature {idx} after coordinate cleanup.")
+            return
+        pt_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in coords]
+        created_segments = 0
+        for i in range(len(pt_tags) - 1):
+            try:
+                line_tag = gmsh.model.occ.addLine(pt_tags[i], pt_tags[i+1])
+            except Exception as e:
+                # gmsh's Python API raises plain Exception on OCC errors.
+                logger.warning(
+                    f"Warning: Skipping invalid line segment {i} for feature {idx} "
+                    f"between {coords[i]} and {coords[i+1]}: {e}"
+                )
+                continue
+            key = _to_key(1, line_tag)
+            created_segments += 1
+            if embedded:
+                inventory.record_embedded(key, 'line', idx)
+            else:
+                inventory.nonembedded_line_tags.setdefault(int(idx), []).append(key)
+        if created_segments == 0 and self._verbosity > 0:
+            logger.warning(f"Warning: No valid line segments were created for feature {idx}.")
+
+    def _add_polygon_features(self, polygons_gdf, inventory, plans, corridors, domain, line_strips):
+        """Add quad-buffer bands, then every polygon minus the buffer footprints."""
+        if polygons_gdf.empty:
+            return
+        logger.info(f"Adding {len(polygons_gdf)} polygons to Gmsh...")
+        band_geoms = self._add_polygon_quad_buffers(polygons_gdf, inventory, plans, corridors, domain)
+        footprints = band_geoms + line_strips
+        footprints_union = make_valid(unary_union(footprints)) if footprints else None
+        for idx, row in polygons_gdf.iterrows():
+            self._add_polygon_feature(idx, row, footprints_union, line_strips, inventory)
+
+    def _add_polygon_quad_buffers(self, polygons_gdf, inventory, plans, corridors, domain):
+        """Create the band surfaces of embedded quad-buffered polygons; returns the band footprints.
+
+        A band hugs the full feature outline, so it is created once per
+        feature rather than once per MultiPolygon part.
+        """
+        band_geoms = []
+        for idx, row in polygons_gdf.iterrows():
+            if not (is_embedded(row) and row_bool(row, 'quad_buffer', False)):
+                continue
+            key = ('poly', int(idx))
+            created, band = self._add_polygon_band(key, inventory, plans, corridors, domain)
+            if created:
+                inventory.structured_buffer_specs[key] = {
+                    'lc': feature_lc(row, self.background_lc),
+                    'thickness': buffer.quad_buffer_thickness(row),
+                    'kind': 'polygon',
+                    'strips': [],
+                    'n_surfaces_created': len(created),
+                }
+                band_geoms.append(band)
+            elif self._verbosity > 0:
+                logger.warning(f"Warning: Structured buffer requested for polygon {idx}, but no buffer surface was created.")
+        return band_geoms
+
+    def _add_polygon_band(self, key, inventory, plans, corridors, domain):
+        """Create one polygon's band surfaces, trimmed by priority; returns (created, band) or ([], None)."""
+        plan = plans.get(key)
+        if plan is None:
+            return [], None
+        obstacles = buffer.higher_priority_obstacles(key, plans, corridors)
+        band, _ = buffer.trim_against_obstacles(
+            plan.band, obstacles, plan.lc, f"polygon feature {key[1]}"
+        )
+        if band is None:
+            return [], None
+        created = self._add_buffer_surfaces(band, key, domain, inventory)
+        if not created:
+            return [], None
+        return created, band
+
+    def _add_polygon_feature(self, idx, row, footprints_union, line_strips, inventory):
+        """Add an embedded polygon (minus buffer footprints) as surfaces, or defer a field-only one."""
+        embedded = is_embedded(row)
+        geom = row['geometry']
+        if geom.geom_type not in ('Polygon', 'MultiPolygon'):
+            return
+        # Mesh every embedded polygon minus the band/strip footprints, so the
+        # buffer surfaces tile the plane with their neighbours exactly (shared
+        # curves merged by removeAllDuplicates) instead of relying on OCC
+        # fragment to cut overlapping faces -- which silently refuses in some
+        # trimmed-crossing configurations and leaves double-meshed regions. It
+        # also keeps a buffered zone's outline out of the mesh entirely:
+        # overlap resolution makes neighbours share that outline, so
+        # subtracting only from the buffered zone itself would still pin mesh
+        # nodes onto it. Zone assignment uses the original polygons, so zone
+        # extents are unchanged.
+        if (
+            embedded
+            and footprints_union is not None
+            and geom.intersects(footprints_union)
+        ):
+            geom = make_valid(geom.difference(footprints_union))
+        for poly in polygon_parts(geom):
+            if poly.is_empty:
+                continue
+            if not embedded:
+                # Defer field-only polygon creation until after
+                # fragmentation/dedup/healing: overlapping surfaces present
+                # during global OCC cleanup can cut or renumber embedded
+                # domain surfaces, which violates embed=False semantics.
+                inventory.pending_nonembedded_polys.append((int(idx), poly))
+                continue
+            poly, moved = buffer.push_ring_vertices_off_strips(poly, line_strips)
+            if moved and self._verbosity > 0:
+                logger.info(f"Moved {moved} zone-ring vertex(es) off structured buffer strips.")
+            s_tag, _ = self._create_polygon_surface(poly)
+            if s_tag is None:
+                logger.warning(f"Warning: Skipping degenerate polygon {idx}")
+                continue
+            inventory.record_embedded(_to_key(2, s_tag), 'surface', idx)
+
+    def _add_buffer_surfaces(self, buffer_geom, feature_key, domain, inventory,
+                             corners=None, side_lines=None):
+        """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)]."""
+        if domain is not None and not domain.is_empty:
+            buffer_geom = buffer_geom.intersection(domain)
+        buffer_geom = make_valid(buffer_geom)
+        parts = [
+            poly for poly in polygon_parts(buffer_geom)
+            if not poly.is_empty and poly.area > 0
+        ]
+        if corners is not None and len(parts) != 1:
+            # The recorded whole-strip corners no longer apply; pieces are
+            # re-cornered individually from the side lines post-fragment.
+            corners = None
+        created = []
+        for poly in parts:
+            s_tag, _ = self._create_polygon_surface(poly)
+            if s_tag is None:
+                continue
+            key = _to_key(2, s_tag)
+            inventory.record_embedded(key, 'structured_buffer_surf', feature_key)
+            created.append((key, {'corners': corners, 'side_lines': side_lines}))
+        return created
+
+    def _add_field_only_polygons(self, inventory):
+        """Create the deferred field-only (embed=False) polygon surfaces after fragmentation."""
+        pending = inventory.pending_nonembedded_polys
+        if not pending:
+            return
+        if self._verbosity > 0:
+            logger.info(f"Adding {len(pending)} field-only polygon surface(s)...")
+        for idx, poly in pending:
+            s_tag, boundary_curve_tags = self._create_polygon_surface(poly)
+            if s_tag is None:
+                if self._verbosity > 0:
+                    logger.warning(f"Warning: Skipping degenerate field-only polygon {idx}")
+                continue
+            inventory.nonembedded_surface_tags.setdefault(int(idx), []).append(_to_key(2, s_tag))
+            inventory.nonembedded_poly_curve_tags.setdefault(int(idx), []).extend(
+                [(1, int(t)) for t in boundary_curve_tags]
+            )
+        gmsh.model.occ.synchronize()
+
+    def _create_polygon_surface(self, poly):
+        """Create an OCC plane surface; returns (surface tag, boundary curve tags) or (None, [])."""
+        if poly.is_empty:
+            return None, []
+        poly = self._force_close_polygon(poly)
+        exterior_loop_tag, exterior_lines = self._create_curve_loop(list(poly.exterior.coords))
+        if exterior_loop_tag is None:
+            return None, []
+        loops = [exterior_loop_tag]
+        boundary_curve_tags = list(exterior_lines)
+        for interior in poly.interiors:
+            interior_loop_tag, interior_lines = self._create_curve_loop(list(interior.coords))
+            if interior_loop_tag is not None:
+                loops.append(interior_loop_tag)
+                boundary_curve_tags.extend(interior_lines)
+        try:
+            s_tag = gmsh.model.occ.addPlaneSurface(loops)
+        except Exception as e:
+            # gmsh's Python API raises plain Exception on OCC errors.
+            logger.error(f"Error creating surface: {e}")
+            return None, []
+        return s_tag, boundary_curve_tags
+
+    @staticmethod
+    def _create_curve_loop(coords):
+        """Create an OCC curve loop through a ring's coordinates; returns (loop tag, curve tags) or (None, [])."""
+        clean_coords = sanitize_coords(coords, min_spacing=1e-5, require_closed=True, min_points=3)
+        if len(clean_coords) < 3:
+            return None, []
+        p_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in clean_coords]
+        l_tags = []
+        for i in range(len(p_tags)):
+            p1 = p_tags[i]
+            p2 = p_tags[(i + 1) % len(p_tags)]
+            try:
+                l_tags.append(gmsh.model.occ.addLine(p1, p2))
+            except Exception as e:
+                # gmsh's Python API raises plain Exception on OCC errors.
+                logger.error(f"Error adding line {p1}-{p2}: {e}")
+                return None, []
+        try:
+            return gmsh.model.occ.addCurveLoop(l_tags), l_tags
+        except Exception as e:
+            # gmsh's Python API raises plain Exception on OCC errors.
+            logger.error(f"Error adding curve loop: {e}")
+            return None, []
+
+    def _rebuild_feature_map(self, object_tags, out_map, inventory):
+        """Map each feature id to its post-fragment dimtags, starting from the non-embedded tags."""
+        final_map = inventory.feature_map()
+        logger.info(f"Reconstructing Map (Input Tags: {len(object_tags)}, Out Map Len: {len(out_map)})...")
+        for i, input_dimtag in enumerate(object_tags):
+            res_tags = out_map[i] if i < len(out_map) else [input_dimtag]
+            info = inventory.input_tag_info.get(_to_key(input_dimtag[0], input_dimtag[1]))
+            assert info is not None, f"fragment input {input_dimtag} was never recorded"
+            # Structured-buffer ids are ('line'|'poly', idx) tuples so line
+            # and polygon features with the same index cannot collide.
+            feat_id = info['id'] if isinstance(info['id'], tuple) else int(info['id'])
+            final_map[_MAP_KEY_BY_KIND[info['type']]].setdefault(feat_id, []).extend(res_tags)
+        return final_map
+
+    def _recover_orphan_surfaces(self, final_map, polygons_gdf):
+        """Attach surfaces the fragment map dropped to the embedded polygon covering (or nearest) them.
+
+        OCC's fragment map can omit pieces of an input surface (observed when
+        a buffer strip with boundaries coincident to the densified domain edge
+        splits the domain). An unclaimed surface would silently lose its mesh
+        nodes and field sizing downstream.
+        """
         claimed_surfaces = set()
         for map_key in ('surfaces', 'structured_buffer_surfs'):
             for dimtags in final_map.get(map_key, {}).values():
@@ -1368,38 +1323,37 @@ class MeshGenerator:
             int(tag) for dim, tag in gmsh.model.getEntities(2)
             if int(tag) not in claimed_surfaces
         ]
-        if orphan_surfaces and polygons_gdf is not None and not polygons_gdf.empty:
-            embedded_polys = [
-                (int(idx), row.geometry)
-                for idx, row in polygons_gdf.iterrows()
-                if is_embedded(row)
-            ]
-            recovered = 0
-            for surf_tag in orphan_surfaces:
-                try:
-                    cx, cy, _ = gmsh.model.occ.getCenterOfMass(2, surf_tag)
-                except Exception:
-                    continue
-                center = Point(cx, cy)
-                owner = None
-                for fid, geom in embedded_polys:
-                    if geom.covers(center):
-                        owner = fid
-                        break
-                if owner is None and embedded_polys:
-                    owner = min(embedded_polys, key=lambda item: item[1].distance(center))[0]
-                if owner is not None:
-                    final_map['surfaces'].setdefault(owner, []).append((2, surf_tag))
-                    recovered += 1
-            if recovered:
-                logger.info(
-                          f"Recovered {recovered} orphan surface(s) the fragment map had "
-                          "dropped; re-attached to their containing polygon features."
-                )
-
-        self._apply_structured_buffer_meshing(final_map, structured_buffer_specs)
-
-        return final_map
+        if not orphan_surfaces or polygons_gdf is None or polygons_gdf.empty:
+            return
+        embedded_polys = [
+            (int(idx), row.geometry)
+            for idx, row in polygons_gdf.iterrows()
+            if is_embedded(row)
+        ]
+        recovered = 0
+        for surf_tag in orphan_surfaces:
+            try:
+                cx, cy, _ = gmsh.model.occ.getCenterOfMass(2, surf_tag)
+            except Exception:
+                # gmsh raises plain Exception for entities without mass
+                # properties; such a surface cannot be located, so skip it.
+                continue
+            center = Point(cx, cy)
+            owner = None
+            for fid, geom in embedded_polys:
+                if geom.covers(center):
+                    owner = fid
+                    break
+            if owner is None and embedded_polys:
+                owner = min(embedded_polys, key=lambda item: item[1].distance(center))[0]
+            if owner is not None:
+                final_map['surfaces'].setdefault(owner, []).append((2, surf_tag))
+                recovered += 1
+        if recovered:
+            logger.info(
+                f"Recovered {recovered} orphan surface(s) the fragment map had "
+                "dropped; re-attached to their containing polygon features."
+            )
 
     @staticmethod
     def _entity_length(dim, tag):

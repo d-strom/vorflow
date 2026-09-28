@@ -239,6 +239,7 @@ def test_find_crossings_records_a_disk_from_the_losers_side_only():
     assert c.size == 1.0
     assert c.radius == pytest.approx(0.5 * math.hypot(1.0, 1.0) + 0.5 * (1.0 + 1.0) + 1.0)
     assert buffer.find_crossings(('poly', 0), plans) == []
+    assert buffer.find_all_crossings(plans) == crossings
 
 
 # --- trimming ----------------------------------------------------------------

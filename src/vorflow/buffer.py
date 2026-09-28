@@ -385,6 +385,14 @@ def find_crossings(self_key, plans) -> list[Crossing]:
     return crossings
 
 
+def find_all_crossings(plans) -> list[Crossing]:
+    """Crossing disks for every planned buffer, in plan order."""
+    crossings = []
+    for key in plans:
+        crossings.extend(find_crossings(key, plans))
+    return crossings
+
+
 def clean_trimmed_pieces(geom, lc, feature_label) -> list:
     """Drop sliver pieces (thinner than ~0.8 cells) left by one-sided trimming.
 
