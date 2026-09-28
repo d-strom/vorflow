@@ -17,6 +17,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Preserved integer cell IDs when splitting cells along barrier lines.
 - Kept quality reports usable with Gmsh 4.11 by retaining unsupported metrics as `NaN`.
 - Restored Shapely 2.0 resampling plus stable lint and minimum-dependency CI.
+- Kept barrier straddle points separate from point features with the same
+  index; a point's size field no longer leaks onto an unrelated barrier.
+- Enforced barriers wherever cells actually straddle them, including quad
+  buffers with `quad_buffer_thickness=2` and cells at barrier ends.
+- Field-only (`embed=False`) polygons no longer assign zones or change the
+  clip domain, in both the Voronoi grid and the element grid.
+- Kept `node_id` unique when clipping splits a cell into several parts.
+- Polygon simplification no longer opens gaps along edges shared with
+  neighbouring polygons.
+- Point deduplication no longer depends on which point of a close pair has
+  `simplify_tolerance`, and clean points keep their insertion order.
+- Face skewness now reports the standard CVFD measure; the generator-mode
+  value was always zero.
+- `MeshGenerator(verbosity=...)` no longer changes the package-wide log
+  level; the setting applies only while `generate()` runs.
+- Custom `MeshField` subclasses with unhashable attributes can be grouped.
+- Inset-mirror boundary centering skips nodes whose mirror ghost would land
+  inside the domain, and is about 20x faster on large meshes.
 
 ### Added
 
@@ -25,11 +43,34 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Optional boundary inset/mirror points and structured quad buffers.
 - Explicit mesh-size growth fields and runnable examples.
 - Cross-platform tests and TestPyPI release automation.
+- `vorflow.set_verbosity(level, console=False)` routes messages to the
+  application's logging configuration instead of vorflow's console handler.
 
 ### Changed
 
 - Prepared project metadata, installation documentation, and dependency floors
   for the first public release candidate.
+- Features finer than `background_lc` now grade outward with a
+  `GeometricGrowthField` (growth factor 1.2) by default. Models that relied on
+  the old implicit sizing will generally get more, better-graded cells.
+- Progress output uses the `vorflow` logger (stderr) instead of `print()`.
+- `ConceptualMesh(crs=...)` defaults to `None` instead of `"EPSG:4326"`;
+  geographic CRSs trigger a warning.
+- `MeshGenerator.generate()` raises before starting Gmsh if `background_lc`
+  is missing or not positive.
+- `get_element_grid()` builds element polygons on first use instead of in
+  every `generate()` call.
+- `quad_buffer=True` requires `embed=True`.
+- Barrier straddle offsets use a tangent probe proportional to line length,
+  which can move barrier nodes by floating-point amounts.
+- Python 3.10 is now the minimum; matplotlib is optional (`examples` extra).
+
+### Deprecated
+
+- `add_polygon(mesh_refinement=...)` (no effect), `dist_max_out` (use
+  `dist_max`), `border_density` (use `densify`; the border grading is kept),
+  and `dist_max_in`.
+- `dist_min`/`dist_max` on features; use `growth_factor` or explicit `fields`.
 
 [Unreleased]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...HEAD
 [0.1.0rc1]: https://github.com/rhugman/vorflow/tree/v0.1.0rc1
