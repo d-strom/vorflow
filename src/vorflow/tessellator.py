@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import geopandas as gpd
 import pandas as pd
+import shapely
 from scipy.spatial import Voronoi, cKDTree
 from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union, split
@@ -15,6 +16,104 @@ logger = logging.getLogger(__name__)
 # Split pieces smaller than this fraction of the cell area are treated as
 # floating-point slivers from a barrier that runs along a cell face.
 BARRIER_SLIVER_FRACTION = 1e-6
+
+
+def _boundary_node_spacing(nodes, boundary_indices):
+    """Return each boundary node's distance to its nearest distinct boundary node (NaN elsewhere)."""
+    spacing = np.full(len(nodes), np.nan)
+    if len(boundary_indices) < 2:
+        return spacing
+    boundary_xy = nodes[boundary_indices]
+    # Querying k=2 against de-duplicated coordinates returns the node's own
+    # coordinate (distance 0) and the nearest *different* coordinate.
+    unique_xy = np.unique(boundary_xy, axis=0)
+    if len(unique_xy) > 1:
+        dists, _ = cKDTree(unique_xy).query(boundary_xy, k=2)
+        spacing[boundary_indices] = dists[:, 1]
+    return spacing
+
+
+def _ring_vertex_angles(domain_geom):
+    """Return every open ring vertex of the domain and the angle between its two edges in degrees (NaN if degenerate)."""
+    if isinstance(domain_geom, Polygon):
+        polygons = [domain_geom]
+    elif isinstance(domain_geom, MultiPolygon):
+        polygons = list(domain_geom.geoms)
+    else:
+        polygons = []
+
+    vertices, angles = [], []
+    for poly in polygons:
+        for ring in (poly.exterior, *poly.interiors):
+            coords = np.asarray(ring.coords, dtype=float)[:, :2]
+            if len(coords) < 4:
+                continue
+            open_coords = coords[:-1]
+            v1 = np.roll(open_coords, 1, axis=0) - open_coords
+            v2 = np.roll(open_coords, -1, axis=0) - open_coords
+            magnitude = np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                cos_theta = np.einsum('ij,ij->i', v1, v2) / magnitude
+            angle = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+            angle[magnitude == 0] = np.nan
+            vertices.append(open_coords)
+            angles.append(angle)
+    if not vertices:
+        return np.empty((0, 2)), np.empty(0)
+    return np.concatenate(vertices), np.concatenate(angles)
+
+
+def _ring_angles_at_points(points_xy, vertices, angles, tolerance):
+    """Return the ring angle at each point from the first ring vertex within tolerance (NaN if none)."""
+    result = np.full(len(points_xy), np.nan)
+    if len(points_xy) == 0 or len(vertices) == 0:
+        return result
+    matches = cKDTree(vertices).query_ball_point(points_xy, r=tolerance)
+    for i, vertex_indices in enumerate(matches):
+        if vertex_indices:
+            result[i] = angles[min(vertex_indices)]
+    return result
+
+
+def _boundary_tangents(boundary, points, spacing):
+    """Return unit boundary tangents at points from samples +/- spacing/4 along the boundary (NaN if degenerate)."""
+    length = boundary.length
+    distance = shapely.line_locate_point(boundary, points)
+    eps = np.maximum(np.maximum(spacing * 0.25, length * 1e-9), 1e-9)
+    before = np.maximum(0.0, distance - eps)
+    after = np.minimum(length, distance + eps)
+    same = before == after
+    before[same] = np.maximum(0.0, distance[same] - 1e-9)
+    after[same] = np.minimum(length, distance[same] + 1e-9)
+    p1 = shapely.get_coordinates(shapely.line_interpolate_point(boundary, before))
+    p2 = shapely.get_coordinates(shapely.line_interpolate_point(boundary, after))
+    tangents = p2 - p1
+    norm = np.linalg.norm(tangents, axis=1)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        tangents = tangents / norm[:, None]
+    tangents[norm == 0] = np.nan
+    return tangents
+
+
+def _inward_normals(domain_geom, points_xy, tangents, inset):
+    """Return the unit normal pointing into the domain at each point (NaN if neither side probes inside)."""
+    left = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    right = np.column_stack([tangents[:, 1], -tangents[:, 0]])
+    probe = np.maximum(inset * 0.5, 1e-9)[:, None]
+    left_inside = _probe_inside(domain_geom, points_xy + left * probe)
+    right_inside = _probe_inside(domain_geom, points_xy + right * probe)
+    # The left normal takes precedence when both probes land inside.
+    normals = np.where(right_inside[:, None], right, np.nan)
+    return np.where(left_inside[:, None], left, normals)
+
+
+def _probe_inside(domain_geom, probe_xy):
+    """Return whether each probe point is covered by the domain (False for NaN probes)."""
+    inside = np.zeros(len(probe_xy), dtype=bool)
+    finite = np.isfinite(probe_xy).all(axis=1)
+    # A point is covered by a polygon exactly when it intersects it.
+    inside[finite] = shapely.intersects_xy(domain_geom, probe_xy[finite, 0], probe_xy[finite, 1])
+    return inside
 
 
 def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
@@ -156,70 +255,6 @@ class VoronoiTessellator:
             node_scale = max(np.ptp(nodes[:, 0]), np.ptp(nodes[:, 1]), 1.0)
         return max(domain_scale, node_scale) * 1e-8
 
-    def _ring_angle_at_point(self, point, domain_geom, tolerance):
-        """Return the local ring angle for a boundary vertex, if matched."""
-        polygons = []
-        if isinstance(domain_geom, Polygon):
-            polygons = [domain_geom]
-        elif isinstance(domain_geom, MultiPolygon):
-            polygons = list(domain_geom.geoms)
-
-        for poly in polygons:
-            rings = [poly.exterior, *poly.interiors]
-            for ring in rings:
-                coords = list(ring.coords)
-                if len(coords) < 4:
-                    continue
-                open_coords = coords[:-1]
-                for i, coord in enumerate(open_coords):
-                    if Point(coord).distance(point) > tolerance:
-                        continue
-                    prev_coord = np.asarray(open_coords[i - 1], dtype=float)
-                    current = np.asarray(coord, dtype=float)
-                    next_coord = np.asarray(open_coords[(i + 1) % len(open_coords)], dtype=float)
-                    v1 = prev_coord - current
-                    v2 = next_coord - current
-                    mag1 = np.linalg.norm(v1)
-                    mag2 = np.linalg.norm(v2)
-                    if mag1 == 0 or mag2 == 0:
-                        return None
-                    cos_theta = np.dot(v1, v2) / (mag1 * mag2)
-                    cos_theta = min(1.0, max(-1.0, cos_theta))
-                    return float(np.degrees(np.arccos(cos_theta)))
-        return None
-
-    def _is_sharp_boundary_corner(self, point, domain_geom, tolerance):
-        angle = self._ring_angle_at_point(point, domain_geom, tolerance)
-        return angle is not None and angle < self.boundary_corner_angle
-
-    def _local_boundary_tangent(self, boundary, point, spacing):
-        distance = boundary.project(point)
-        eps = max(spacing * 0.25, boundary.length * 1e-9, 1e-9)
-        before = max(0.0, distance - eps)
-        after = min(boundary.length, distance + eps)
-        if before == after:
-            before = max(0.0, distance - 1e-9)
-            after = min(boundary.length, distance + 1e-9)
-        p1 = boundary.interpolate(before)
-        p2 = boundary.interpolate(after)
-        tangent = np.array([p2.x - p1.x, p2.y - p1.y], dtype=float)
-        norm = np.linalg.norm(tangent)
-        if norm == 0:
-            return None
-        return tangent / norm
-
-    def _inward_normal(self, domain_geom, point, tangent, offset):
-        normals = [
-            np.array([-tangent[1], tangent[0]], dtype=float),
-            np.array([tangent[1], -tangent[0]], dtype=float),
-        ]
-        probe_distance = max(offset * 0.5, 1e-9)
-        for normal in normals:
-            probe = Point(point.x + normal[0] * probe_distance, point.y + normal[1] * probe_distance)
-            if domain_geom.covers(probe):
-                return normal
-        return None
-
     def _prepare_boundary_centered_nodes(self, nodes, node_tags):
         """
         Shift non-corner boundary nodes inward and add mirrored outside ghosts.
@@ -249,61 +284,45 @@ class VoronoiTessellator:
 
         boundary = domain_geom.boundary
         tolerance = self._boundary_tolerance(nodes, domain_geom)
-        points = [Point(float(x), float(y)) for x, y in nodes]
-        boundary_mask = np.array([boundary.distance(point) <= tolerance for point in points])
-        boundary_indices = np.flatnonzero(boundary_mask)
+        shapely.prepare(boundary)
+        shapely.prepare(domain_geom)
+        points = shapely.points(nodes)
 
+        boundary_indices = np.flatnonzero(shapely.dwithin(boundary, points, tolerance))
+        spacing = _boundary_node_spacing(nodes, boundary_indices)
+        candidates = np.flatnonzero(spacing > 0)
+
+        vertices, vertex_angles = _ring_vertex_angles(domain_geom)
+        corner_angles = _ring_angles_at_points(nodes[candidates], vertices, vertex_angles, tolerance)
+        # NaN (no matching ring vertex) compares False, so the node is not a corner.
+        candidates = candidates[~(corner_angles < self.boundary_corner_angle)]
+
+        inset = spacing[candidates] * self.boundary_inset_fraction
+        tangents = _boundary_tangents(boundary, points[candidates], spacing[candidates])
+        normals = _inward_normals(domain_geom, nodes[candidates], tangents, inset)
+        ghosts = nodes[candidates] - normals * inset[:, None]
+        keep = ~np.isnan(normals).any(axis=1)
+
+        centered_indices = candidates[keep]
         prepared = nodes.astype(float, copy=True)
-        ghost_nodes = []
-        records = []
+        prepared[centered_indices] = nodes[centered_indices] + normals[keep] * inset[keep, None]
 
-        if len(boundary_indices) > 1:
-            boundary_xy = nodes[boundary_indices]
-            # Nearest distinct-neighbor spacing via a KD-tree instead of the
-            # previous dense N x N distance matrix (quadratic memory).
-            # Querying k=2 against the de-duplicated coordinates returns the
-            # node's own coordinate (distance 0) and the nearest *different*
-            # coordinate, matching the old nearest-nonzero semantics exactly.
-            unique_xy = np.unique(boundary_xy, axis=0)
-            if len(unique_xy) > 1:
-                dists, _ = cKDTree(unique_xy).query(boundary_xy, k=2)
-                nearest_spacing = dists[:, 1]
-            else:
-                nearest_spacing = np.full(len(boundary_xy), np.nan)
-            spacing_by_index = {
-                int(idx): float(spacing)
-                for idx, spacing in zip(boundary_indices, nearest_spacing)
-                if not np.isnan(spacing) and spacing > 0
+        centered = np.zeros(len(nodes), dtype=bool)
+        centered[centered_indices] = True
+        node_inset = np.zeros(len(nodes), dtype=float)
+        node_inset[centered_indices] = inset[keep]
+        metadata = pd.DataFrame(
+            {
+                "node_id": node_tags,
+                "source_x": nodes[:, 0].astype(float),
+                "source_y": nodes[:, 1].astype(float),
+                "boundary_centering": np.where(centered, "inset_mirror", "clip").astype(object),
+                "boundary_inset": node_inset,
+                "boundary_centered": centered,
             }
-        else:
-            spacing_by_index = {}
-
-        for i, (node, tag, point) in enumerate(zip(nodes, node_tags, points)):
-            centered = False
-            inset = 0.0
-            if i in spacing_by_index and not self._is_sharp_boundary_corner(point, domain_geom, tolerance):
-                spacing = spacing_by_index[i]
-                inset = spacing * self.boundary_inset_fraction
-                tangent = self._local_boundary_tangent(boundary, point, spacing)
-                normal = None if tangent is None else self._inward_normal(domain_geom, point, tangent, inset)
-                if normal is not None:
-                    prepared[i] = node + normal * inset
-                    ghost_nodes.append(node - normal * inset)
-                    centered = True
-
-            records.append(
-                {
-                    "node_id": tag,
-                    "source_x": float(node[0]),
-                    "source_y": float(node[1]),
-                    "boundary_centering": "inset_mirror" if centered else "clip",
-                    "boundary_inset": float(inset if centered else 0.0),
-                    "boundary_centered": bool(centered),
-                }
-            )
-
-        ghosts = np.asarray(ghost_nodes, dtype=float) if ghost_nodes else np.empty((0, 2))
-        return prepared, node_tags, ghosts, pd.DataFrame(records)
+        )
+        ghosts = ghosts[keep] if keep.any() else np.empty((0, 2))
+        return prepared, node_tags, ghosts, metadata
 
     def _build_raw_voronoi(self, nodes, node_tags):
         """
