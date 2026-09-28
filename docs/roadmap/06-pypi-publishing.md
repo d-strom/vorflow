@@ -15,8 +15,8 @@ verifying `0.1.0rc1`; real PyPI publication remains a separate approval gate.
 ## Current state (release candidate prepared locally)
 
 - Explicit PEP 621/639 metadata for `0.1.0rc1`, with Oscar Sanchez as first
-  author and Oscar and rhugman as maintainers. Rhugman's public commit author
-  email is provisionally used in maintainer metadata pending his confirmation.
+  author and Oscar and rhugman as maintainers. rhugman is listed by name only
+  (no contact email in package metadata).
 - MIT SPDX metadata, dependency floors, keywords, repository links, changelog,
   and absolute README links suitable for package-index rendering.
 - One canonical Basic Usage script that runs against an installed wheel.
@@ -40,7 +40,7 @@ requires fresh CI and release-workflow verification.
 - [x] Smoke-test the wheel in a fresh environment outside the repository.
 - [x] Add PyPI-facing installation documentation and absolute links.
 - [x] Add and test runtime dependency floors without upper caps.
-- [x] Record Oscar's primary authorship and provisional co-maintainer metadata
+- [x] Record Oscar's primary authorship and name-only co-maintainer metadata
   for rhugman.
 - [x] Add the changelog, modern licence metadata, and package keywords.
 - [x] Add an RC-only, TestPyPI-only Trusted Publishing workflow.
@@ -49,9 +49,9 @@ requires fresh CI and release-workflow verification.
 
 - [ ] Address release code-review findings and integrate the focused release
   branch into `main`.
-- [ ] Confirm with rhugman that `rthugman@gmail.com` is the contact address he
-  wants exposed in package maintainer metadata, and verify the upstream
-  `testpypi` GitHub environment and TestPyPI Trusted Publisher identity.
+- [ ] Verify the upstream `testpypi` GitHub environment (with a required
+  reviewer) and the TestPyPI Trusted Publisher identity (see the header of
+  `.github/workflows/testpypi.yml`).
 - [ ] Create and push the annotated `v0.1.0rc1` tag.
 - [ ] Review the GitHub build and manually approve the protected `testpypi`
   deployment.
