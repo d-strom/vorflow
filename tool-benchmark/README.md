@@ -38,6 +38,13 @@ Edit the flags in `workflow.py`'s `__main__` block, then:
 python workflow.py
 ```
 
+## Notebook
+
+`compare_generators.ipynb` walks through two cases (the vorflow demo geometry
+and the 30° barrier) with the same adapters, matched-count search, metrics
+and MF6 checks, and plots the grids side by side. Start Jupyter in this folder,
+in the benchmark environment. It writes only under `work/notebook/`.
+
 ## CI
 
 `.github/workflows/benchmark.yml` runs on pushes that touch `tool-benchmark/`

@@ -175,6 +175,9 @@ def load_grids(case, work_d: Path, target: int) -> dict:
 
 def make_figures(cases, mf6_table: pd.DataFrame, work_d: Path, figures_d: Path) -> None:
     """Mesh and size figures per case, convergence per sweep case, and the verification summary."""
+    import matplotlib
+
+    matplotlib.use("Agg")       # files only; CI runners have no display
     from bench import plots
 
     for case in cases:

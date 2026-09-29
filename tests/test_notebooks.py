@@ -5,7 +5,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOKS = sorted((ROOT / "examples").rglob("*.ipynb"))
+NOTEBOOKS = sorted((ROOT / "examples").rglob("*.ipynb")) + sorted((ROOT / "tool-benchmark").glob("*.ipynb"))
 
 
 @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda p: p.name)

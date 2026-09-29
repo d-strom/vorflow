@@ -4,22 +4,22 @@ Each tool keeps one colour and marker in every figure (``TOOL_STYLE``): the
 first four categorical slots of the dataviz reference palette, in fixed order,
 with a distinct marker as secondary encoding. Slot 4 (yellow) is below 3:1
 contrast on white, so every figure carries a legend.
+
+The module leaves the Matplotlib backend alone, so notebooks can import
+``TOOL_STYLE``; ``workflow.make_figures`` selects Agg before importing it.
 """
 
 from pathlib import Path
 
-import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shapely
+from matplotlib.collections import PolyCollection
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-import shapely  # noqa: E402
-from matplotlib.collections import PolyCollection  # noqa: E402
-
-from .case import Case  # noqa: E402
-from .grid import open_rings  # noqa: E402
-from .metrics import face_metrics, face_table  # noqa: E402
+from .case import Case
+from .grid import open_rings
+from .metrics import face_metrics, face_table
 
 TOOL_STYLE = {
     "vorflow": {"color": "#2a78d6", "marker": "o"},
