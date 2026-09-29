@@ -30,6 +30,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the line itself still fall back to the post-hoc split.
 - Barrier splits no longer leave zero-length edges where the line passes
   through (or within roundoff of) a cell vertex.
+- `heal_shapes=True` no longer hangs Gmsh on lines that meet near a thin
+  sliver polygon (`cleaning_limitations_demo`, Problem 4). After healing,
+  curves and surfaces are matched to the nearest survivor within half their
+  own extent, one-to-one, instead of keeping a surviving tag number that
+  healing had reused for a different piece. Pieces shorter than the 1e-4
+  tolerance no longer take a neighbour's or another line's entity, and pieces
+  that healing deleted are pruned. A line fragment whose endpoint lies on a
+  surface boundary without being a vertex of that surface (healing can
+  duplicate a hole's edges instead of sharing them) is no longer embedded; a
+  warning names it and `diagnostics['embedding']['nonconforming_skip']`
+  counts it.
 
 ## [0.1.0rc1]
 

@@ -1,6 +1,11 @@
 """Regression tests for MeshGenerator bookkeeping, logging and lazy exports."""
+import json
 import logging
+import os
+import subprocess
+import sys
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,21 +13,59 @@ from shapely.geometry import LineString, Point, Polygon, box
 
 import vorflow
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator, _SurvivorIndex
+from vorflow.engine import MeshGenerator, _SurvivorIndex, _match_heal_survivors
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
 
-def test_survivor_index_picks_same_tag_then_nearest_within_tolerance():
+def test_survivor_index_picks_nearest_then_same_tag_within_tolerance():
     survivors = _SurvivorIndex({(0, 1): (0.0, 0.0, 0.0), (0, 2): (4e-7, 0.0, 0.0),
-                                (0, 3): (0.5, 0.0, 0.0)}, tolerance=1e-6)
-    # Two survivors round to the same 6-decimal key; the nearer one wins.
+                                (0, 3): (0.5, 0.0, 0.0), (0, 4): (0.5, 0.0, 0.0)},
+                               tolerance=1e-6)
+    # Two survivors round to the same 6-decimal key; the nearer one wins,
+    # even over the same tag (healShapes reuses tags for other entities).
     assert survivors.match(0, 9, (3e-7, 0.0, 0.0)) == 2
-    assert survivors.match(0, 1, (3e-7, 0.0, 0.0)) == 1
+    assert survivors.match(0, 1, (3e-7, 0.0, 0.0)) == 2
+    # The same tag breaks a tie.
+    assert survivors.match(0, 4, (0.5, 0.0, 0.0)) == 4
     # Offsets straddling a rounding boundary still match.
     assert survivors.match(0, 9, (0.5000004, 0.0, 0.0)) == 3
     assert survivors.match(0, 9, (0.25, 0.0, 0.0)) is None
     assert survivors.match(1, 9, (0.0, 0.0, 0.0)) is None
+
+
+def _curve_signature(x0, y0, x1, y1):
+    """Signature (bbox plus centre of mass) of a straight segment in the z=0 plane."""
+    return (min(x0, x1), min(y0, y1), 0.0, max(x0, x1), max(y0, y1), 0.0,
+            (x0 + x1) / 2, (y0 + y1) / 2, 0.0)
+
+
+def test_heal_match_keeps_short_collinear_pieces_apart_and_prunes_deleted_ones():
+    # Pieces near a three-line junction, all shorter than _HEAL_MATCH_TOL.
+    # Healing renumbered 125 -> 124 and 126 -> 125, and deleted the 9e-6-long
+    # piece 132. The old matcher kept 125 (now a different piece) because the
+    # tag survived, and mapped 132 onto a neighbour instead of pruning it.
+    left = _curve_signature(1.0, 1.0, 1.0001, 1.0)
+    right = _curve_signature(1.0001, 1.0, 1.00018, 1.0)
+    below = _curve_signature(1.0001, 0.98, 1.0001, 1.0)
+    pre_heal = {(1, 125): left, (1, 126): right, (1, 131): below,
+                (1, 132): _curve_signature(1.0001, 1.0, 1.0001, 1.000009)}
+    drift = 1e-6
+    survivors = _SurvivorIndex({(1, 124): left, (1, 125): right,
+                                (1, 130): tuple(v + drift for v in below)}, tolerance=1e-4)
+    assert _match_heal_survivors(pre_heal, survivors) == {
+        (1, 125): 124, (1, 126): 125, (1, 131): 130, (1, 132): None}
+
+
+def test_heal_match_is_one_to_one_for_curves_but_not_points():
+    segment = _curve_signature(0.0, 0.0, 1.0, 0.0)
+    pre_heal = {(1, 1): segment, (1, 2): tuple(v + 3e-6 for v in segment),
+                (0, 1): (0.0, 0.0, 0.0), (0, 2): (2e-5, 0.0, 0.0)}
+    survivors = _SurvivorIndex({(1, 7): tuple(v + 1e-6 for v in segment),
+                                (0, 5): (1e-5, 0.0, 0.0)}, tolerance=1e-4)
+    # The nearer curve claims the survivor; points merged by healing share it.
+    assert _match_heal_survivors(pre_heal, survivors) == {
+        (1, 1): 7, (1, 2): None, (0, 1): 5, (0, 2): 5}
 
 
 def _barrier_model(with_point):
@@ -164,3 +207,53 @@ def test_heal_remap_keeps_surfaces_with_identical_bounding_boxes_apart():
             mg._finalize_gmsh()
     assert maps[True] == maps[False]
     assert len(maps[True][0]) == len(maps[True][1]) == 1
+
+
+# Three lines meeting near a thin sliver polygon (cleaning_limitations_demo,
+# Problem 4). healShapes duplicates the sliver's hole edges instead of sharing
+# them, so line pieces end on the domain surface's boundary without being in
+# its topology; embedding them made Gmsh hang forever.
+_HEALED_SLIVER_JUNCTION = """
+import json, sys
+import numpy as np
+from shapely.geometry import LineString, Polygon, box
+from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
+
+line_kwargs = json.loads(sys.argv[1])
+theta = np.deg2rad(5.0)
+dx, dy = np.cos(theta) * 0.75, np.sin(theta) * 0.75
+lines = [LineString([(0.25, 1), (1.75, 1)]),
+         LineString([(1 - dx, 1 - dy), (1 + dx, 1 + dy)]),
+         LineString([(1 + 1e-4, 0.35), (1 + 1e-4, 1.65)])]
+sx, sy, w, length = 1.00018, 1.00002, 1e-3, 0.05
+sliver = Polygon([(sx, sy - w / 2), (sx + length, sy - w / 2),
+                  (sx + length, sy + w / 2), (sx, sy + w / 2)])
+cm = ConceptualMesh(connectivity_tolerance=1e-12)
+cm.add_polygon(box(0, 0, 2, 2), zone_id=1, resolution=0.45)
+cm.add_polygon(sliver, zone_id=2, resolution=0.04, z_order=2, densify=False)
+for i, line in enumerate(lines):
+    cm.add_line(line, line_id=f"l{i}", resolution=0.04, **line_kwargs)
+mg = MeshGenerator(background_lc=0.45, heal_shapes=True, heal_tolerance=5e-5,
+                   optimization_cycles=0, smoothing_steps=0, verbosity=0)
+assert mg.generate(*cm.generate())
+grid = VoronoiTessellator(mg, cm).generate()
+print(json.dumps({"cells": len(grid),
+                  "skipped": mg.diagnostics["embedding"]["nonconforming_skip"]}))
+"""
+
+
+@pytest.mark.parametrize("line_kwargs", [{"growth_factor": 1.5}, {"dist_max": 0.12}],
+                         ids=["growth_factor", "dist_max"])
+def test_healed_sliver_at_line_junction_meshes_without_hanging(line_kwargs):
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _HEALED_SLIVER_JUNCTION, json.dumps(line_kwargs)],
+            env=env, capture_output=True, text=True, timeout=120, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("Gmsh did not finish meshing the healed sliver junction within 120 s")
+    assert result.returncode == 0, result.stderr[-2000:]
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    assert report["cells"] > 0
+    assert report["skipped"] > 0

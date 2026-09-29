@@ -89,9 +89,12 @@ def _to_key(dim, tag):
 
 
 # Tolerances for matching OCC entities across removeAllDuplicates (~um) and
-# healShapes (0.1 mm, absorbing its ~1e-6 drift).
+# healShapes (0.1 mm, absorbing its ~1e-6 drift). After healing, a curve or
+# surface matches only within _HEAL_MATCH_REL_TOL of its own extent, so a piece
+# shorter than _HEAL_MATCH_TOL cannot match its neighbour.
 _DEDUP_MATCH_TOL = 1e-6
 _HEAL_MATCH_TOL = 1e-4
+_HEAL_MATCH_REL_TOL = 0.5
 
 
 def _entity_signature(dim, tag):
@@ -135,19 +138,64 @@ class _SurvivorIndex:
             for d, items in by_dim.items()
         }
 
-    def match(self, dim, tag, signature):
-        """Surviving tag with this signature (the same tag if it qualifies, else the nearest), or None."""
+    def candidates(self, dim, tag, signature, tolerance=None):
+        """(offset, surviving tag) within the tolerance of this signature, nearest first.
+
+        The same tag only breaks ties: healShapes reuses tag numbers for
+        different entities, so a surviving tag is not evidence of identity.
+        """
         if dim not in self._trees:
-            return None
+            return []
         tags, tree = self._trees[dim]
-        hits = tree.query_ball_point(signature, r=self.tolerance, p=np.inf)
+        radius = self.tolerance if tolerance is None else tolerance
+        hits = tree.query_ball_point(signature, r=radius, p=np.inf)
         if not hits:
-            return None
-        hit_tags = tags[hits]
-        if tag in hit_tags:
-            return int(tag)
+            return []
         offsets = np.abs(tree.data[hits] - np.asarray(signature)).max(axis=1)
-        return int(hit_tags[np.argmin(offsets)])
+        return sorted(((float(offset), int(t)) for offset, t in zip(offsets, tags[hits])),
+                      key=lambda pair: (pair[0], pair[1] != tag, pair[1]))
+
+    def match(self, dim, tag, signature, tolerance=None):
+        """Nearest surviving tag within the tolerance (the same tag on a tie), or None."""
+        found = self.candidates(dim, tag, signature, tolerance)
+        return found[0][1] if found else None
+
+
+def _heal_match_tolerance(dim, signature):
+    """_HEAL_MATCH_TOL, capped for a curve or surface at _HEAL_MATCH_REL_TOL of its extent."""
+    if dim == 0:
+        return _HEAL_MATCH_TOL
+    extent = max(signature[3] - signature[0], signature[4] - signature[1], signature[5] - signature[2])
+    return min(_HEAL_MATCH_TOL, _HEAL_MATCH_REL_TOL * extent)
+
+
+def _match_heal_survivors(pre_heal, survivors):
+    """Surviving tag (or None) for each pre-heal entity, keyed by (dim, tag).
+
+    Points take the nearest survivor: healing merges close points, and the
+    merged point still marks each of them. Curves and surfaces are matched
+    one-to-one, nearest pair first, within _heal_match_tolerance. Two
+    collinear neighbours differ by at least the longer one's length, so a
+    piece that healing deleted or absorbed into its neighbour is pruned
+    rather than aliased onto that neighbour (or onto another feature's piece).
+    """
+    matches = {}
+    pairs = []
+    for (d, t), signature in pre_heal.items():
+        if d == 0:
+            matches[(d, t)] = survivors.match(d, t, signature)
+            continue
+        matches[(d, t)] = None
+        pairs.extend(
+            (offset, new_tag != t, d, t, new_tag)
+            for offset, new_tag in survivors.candidates(d, t, signature, _heal_match_tolerance(d, signature))
+        )
+    claimed = set()
+    for _offset, _retagged, d, t, new_tag in sorted(pairs):
+        if matches[(d, t)] is None and (d, new_tag) not in claimed:
+            matches[(d, t)] = new_tag
+            claimed.add((d, new_tag))
+    return matches
 
 
 def _embedded_zones(zones_gdf):
@@ -487,9 +535,11 @@ class _EmbedStats:
     skip_no_cand: int = 0
     skip_no_match: int = 0
     boundary_skip: int = 0
+    nonconforming_skip: int = 0
     multi_match: int = 0
     inside_failed: int = 0
     boundary_tags: list = dataclasses.field(default_factory=list)
+    nonconforming_tags: list = dataclasses.field(default_factory=list)
     multi_tags: list = dataclasses.field(default_factory=list)
     fail_tags: list = dataclasses.field(default_factory=list)
     inside_fail_tags: list = dataclasses.field(default_factory=list)
@@ -499,8 +549,9 @@ class _EmbedStats:
         """The diagnostics['embedding'] dict."""
         report = {name: getattr(self, name) for name in (
             'ok', 'failed', 'skip_bbox', 'skip_no_cand', 'skip_no_match',
-            'boundary_skip', 'multi_match', 'inside_failed')}
+            'boundary_skip', 'nonconforming_skip', 'multi_match', 'inside_failed')}
         report.update(boundary_tags=list(self.boundary_tags),
+                      nonconforming_tags=list(self.nonconforming_tags),
                       multi_tags=list(self.multi_tags),
                       fail_tags=list(self.fail_tags))
         if include_records:
@@ -589,6 +640,21 @@ def _curve_adjacent_surfaces(curve_tag):
                      "interior for embedding.", curve_tag)
         return []
     return sorted({int(v) for v in up})
+
+
+def _endpoint_surfaces(curve_tag):
+    """Surfaces bounded by a curve at each of its endpoints (empty sets if the lookup fails)."""
+    try:
+        _up, endpoints = gmsh.model.getAdjacencies(1, curve_tag)
+        surfaces = []
+        for point_tag in endpoints:
+            curves, _down = gmsh.model.getAdjacencies(0, int(point_tag))
+            surfaces.append({int(s) for c in curves for s in gmsh.model.getAdjacencies(1, int(c))[0]})
+    except Exception:
+        logger.debug("getAdjacencies failed for the endpoints of curve %d; "
+                     "treating them as interior for embedding.", curve_tag)
+        return []
+    return surfaces
 
 
 def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
@@ -1120,12 +1186,13 @@ class MeshGenerator:
         """Remap out_map entries to the healed entity with the same signature; returns (surviving, remapped, pruned).
 
         healShapes introduces ~1e-6 coordinate drift, so signatures match
-        within _HEAL_MATCH_TOL -- enough to distinguish any two intentionally
-        distinct entities while absorbing the drift.
+        within a tolerance (see _match_heal_survivors) that absorbs the drift
+        but stays below the size of the entity being matched.
         """
         surviving = {(int(d), int(t)) for dim in range(3) for d, t in gmsh.model.getEntities(dim)}
         survivors = _SurvivorIndex(_snapshot_signatures(sorted(surviving), "Post-heal survey"),
                                    _HEAL_MATCH_TOL)
+        matches = _match_heal_survivors(pre_heal, survivors)
 
         remapped = 0
         pruned = 0
@@ -1140,7 +1207,7 @@ class MeshGenerator:
                     else:
                         pruned += 1
                     continue
-                new_tag = survivors.match(d, t, pre_heal[(d, t)])
+                new_tag = matches[(d, t)]
                 if new_tag is None:
                     pruned += 1
                 elif new_tag == t:
@@ -2255,6 +2322,13 @@ class MeshGenerator:
         for dim, tag in _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
             self._embed_entity(dim, tag, surface_bboxes, stats)
 
+        if stats.nonconforming_skip:
+            logger.warning(
+                f"Skipped embedding {stats.nonconforming_skip} line fragment(s) whose "
+                f"endpoints lie on another surface's boundary but not in the target "
+                f"surface's topology (curve, target surface, endpoint surfaces): "
+                f"{stats.nonconforming_tags[:5]}. This usually follows heal_shapes=True; "
+                f"a smaller heal_tolerance may keep them.")
         self._log_embed_summary_diagnostics(stats)
         self.diagnostics['embedding'] = stats.as_diagnostics(include_records=self.diagnose)
 
@@ -2303,6 +2377,19 @@ class MeshGenerator:
             # containing faces. Choose the smallest trimmed surface as the most
             # local owner instead of embedding into every containing face.
             matches = [min(matches, key=_surface_area)]
+
+        # In a conforming model a curve ending on a surface boundary ends at a
+        # vertex of that surface. healShapes can break this (a hole edge
+        # duplicated rather than shared), leaving the endpoint on the target's
+        # boundary but not in its topology; Gmsh then never terminates while
+        # recovering the edge.
+        if dim == 1:
+            foreign = [sorted(owners) for owners in _endpoint_surfaces(tag)
+                       if owners and not owners & set(matches)]
+            if foreign:
+                stats.nonconforming_skip += 1
+                stats.nonconforming_tags.append((int(tag), int(matches[0]), foreign))
+                return
 
         for surf_tag in matches:
             try:
@@ -2370,6 +2457,7 @@ class MeshGenerator:
                      f"{stats.skip_no_cand} empty-bbox, "
                      f"{stats.skip_no_match} no-match, "
                      f"{stats.boundary_skip} boundary-skip, "
+                     f"{stats.nonconforming_skip} nonconforming-skip, "
                      f"{stats.multi_match} multi-match, "
                      f"{stats.inside_failed} inside-failed")
         if stats.fail_tags:
