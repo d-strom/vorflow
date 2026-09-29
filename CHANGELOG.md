@@ -7,6 +7,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `VoronoiTessellator(boundary_inset_fraction=...)` now defaults to 0.25
+  instead of 0.5. At 0.5, `boundary_centering="inset_mirror"` moved boundary
+  nodes past the point where their cells are centred on Gmsh meshes and made
+  centroid-to-centroid boundary orthogonality worse than `"clip"` (median
+  ortho_error 12.0 vs 6.4 degrees on a 200 x 200 box at `background_lc=20`).
+  At 0.25 the median is 1.4 degrees there, and 1.3 vs 6.9 degrees on the
+  comprehensive demo model. Pass `boundary_inset_fraction=0.5` for the old
+  behaviour.
+
 ### Fixed
 
 - Cells that straddle a barrier now get a mirror generator across the line

@@ -325,7 +325,7 @@ class VoronoiTessellator:
         conceptual_mesh,
         clip_to_boundary=True,
         boundary_centering="clip",
-        boundary_inset_fraction=0.5,
+        boundary_inset_fraction=0.25,
         boundary_corner_angle=135.0,
         boundary_tolerance=None,
     ):
@@ -346,9 +346,19 @@ class VoronoiTessellator:
             boundary_centering (str): ``"clip"`` keeps the historical behavior.
                 ``"inset_mirror"`` shifts boundary generators inward and adds
                 mirrored outside ghosts so boundary-cell centers move off the
-                clipped face.
+                clipped face. On Gmsh meshes this lowers the median
+                centroid-to-centroid orthogonality error of boundary
+                connections from about 6 to under 2 degrees. Nodes at sharp
+                corners stay in place, so the worst connections next to
+                corners do not improve.
             boundary_inset_fraction (float): Fraction of local boundary-node
                 spacing used for the inward shift in ``"inset_mirror"`` mode.
+                A boundary cell reaches about halfway to the first interior
+                row, so its generator sits near its centroid when the inset is
+                about a third of that row's depth. On Gmsh meshes the row lies
+                about 0.87 x spacing inside, so 0.2-0.3 works best. At 0.5
+                boundary nodes get closer to the interior row than to each
+                other and orthogonality ends up worse than ``"clip"``.
             boundary_corner_angle (float): Boundary vertices with a local angle
                 below this value are treated as sharp corners and left unchanged.
             boundary_tolerance (float, optional): Distance tolerance used to

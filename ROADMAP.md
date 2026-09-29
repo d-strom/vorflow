@@ -83,6 +83,9 @@ opt-in structured quad buffers (`add_polygon`/`add_line` with
    against direct clipping.
 3. **Boundary inset/mirror points**: add an opt-in Voronoi construction mode that
    improves boundary-cell center placement and boundary connectivity quality.
+   On Gmsh meshes the default inset (0.25 x boundary spacing) lowers the median
+   boundary ortho_error from about 6 to under 2 degrees; cells next to sharp
+   corners do not improve. See the milestone doc for measurements.
 4. **Structured-quad transfinite buffer**: add opt-in robust feature alignment for
    line and polygon features in the OCC pipeline, keeping straddle as the default.
 5. **Triangular/mixed element-grid output**: add a separate `MeshGenerator`

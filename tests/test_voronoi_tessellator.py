@@ -339,8 +339,9 @@ def test_boundary_inset_mirror_offsets_scale_with_local_spacing():
     fine_inset = metadata.loc[metadata["source_x"] == 1.0, "boundary_inset"].iloc[0]
 
     assert coarse_inset > fine_inset
-    assert np.isclose(coarse_inset, 0.25)
-    assert np.isclose(fine_inset, 0.10)
+    # Default fraction 0.25 of the nearest boundary-node spacing (0.5 and 0.2).
+    assert np.isclose(coarse_inset, 0.125)
+    assert np.isclose(fine_inset, 0.05)
     assert len(ghosts) == int(metadata["boundary_centered"].sum())
     assert not np.allclose(prepared, nodes)
 
@@ -377,7 +378,7 @@ def test_boundary_inset_mirror_keeps_node_when_ghost_lands_inside_domain():
     cm.add_polygon(domain, zone_id=1, densify=False)
     clean_polys, _, _ = cm.generate()
 
-    # Two nodes on the slit's lower face are 1.0 apart, so their inset (0.5)
+    # Two nodes on the slit's lower face are 1.0 apart, so their inset (0.25)
     # and mirror ghost reach across the 0.1-wide slit into the domain.
     slit_nodes = [[1.5, 1.95], [2.5, 1.95]]
     outer_nodes = [[2.0, 0.0], [0.0, 2.0], [4.0, 2.0], [2.0, 4.0]]
