@@ -6,6 +6,8 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 import shapely
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import Voronoi, cKDTree
 from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union, split
@@ -24,6 +26,60 @@ BARRIER_MIRROR_PASSES = 3
 # this fraction of its distance to the original node; the pair is then
 # already symmetric about the barrier up to a sliver.
 BARRIER_MIRROR_MERGE_FRACTION = 1e-3
+
+# Cell vertices closer than this fraction of the grid's coordinate scale are
+# one vertex. Clipping puts a cut point within roundoff of a domain vertex
+# wherever a Voronoi face meets the boundary there, which leaves a
+# zero-length edge; MODFLOW 6 can crash on those.
+VERTEX_MERGE_FRACTION = 1e-12
+
+
+def _merged_vertex_index(vertices: np.ndarray, tolerance: float) -> np.ndarray:
+    """Map each vertex index to the lowest index in its cluster of vertices chained within tolerance."""
+    pairs = cKDTree(vertices).query_pairs(tolerance, output_type='ndarray')
+    n = len(vertices)
+    if len(pairs) == 0:
+        return np.arange(n)
+    graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    _, labels = connected_components(graph, directed=False)
+    representative = np.full(labels.max() + 1, n)
+    np.minimum.at(representative, labels, np.arange(n))
+    return representative[labels]
+
+
+def _merge_close_vertices(grid_gdf: gpd.GeoDataFrame, rel_tol: float = VERTEX_MERGE_FRACTION) -> gpd.GeoDataFrame:
+    """
+    Merge cell vertices within rel_tol x coordinate scale of each other across the whole grid.
+
+    Every vertex moves to its cluster representative, so neighbouring cells
+    keep identical shared vertices; consecutive repeats are then dropped.
+    The scale includes the coordinate magnitude because roundoff grows with
+    it (e.g. UTM northings). A cell the merge would make invalid keeps its
+    geometry.
+    """
+    if grid_gdf.empty:
+        return grid_gdf
+    geoms = grid_gdf.geometry.to_numpy()
+    coords, owner = shapely.get_coordinates(geoms, return_index=True)
+    scale = max(float(np.ptp(coords, axis=0).max()), float(np.abs(coords).max()), 1.0)
+    index = _merged_vertex_index(coords, rel_tol * scale)
+    # Vertices shared exactly between neighbours map to one index but do not move.
+    moved = (coords[index] != coords).any(axis=1)
+    if not moved.any():
+        return grid_gdf
+
+    merged = shapely.set_coordinates(geoms.copy(), coords[index])
+    changed = np.unique(owner[moved])
+    merged[changed] = shapely.remove_repeated_points(merged[changed])
+    invalid = changed[~shapely.is_valid(merged[changed])]
+    merged[invalid] = geoms[invalid]
+    if len(invalid):
+        logger.warning(f"  -> Kept {len(invalid)} cells unmerged: merging close vertices made them invalid")
+    logger.info(f"  -> Merged {int(moved.sum())} cell vertices within roundoff of another")
+
+    result = grid_gdf.copy()
+    result[grid_gdf.geometry.name] = gpd.GeoSeries(merged, index=grid_gdf.index, crs=grid_gdf.crs)
+    return result
 
 
 def _boundary_node_spacing(nodes, boundary_indices):
@@ -702,7 +758,9 @@ class VoronoiTessellator:
         3. Clipping the grid to the model domain.
         4. Assigning zone IDs to cells based on their generator point location.
         5. Enforcing barrier lines by splitting cells that still straddle them.
-        6. Calculating final cell properties.
+        6. Merging cell vertices a roundoff distance apart, so no cell has
+           a zero-length edge.
+        7. Calculating final cell properties.
 
         Returns:
             gpd.GeoDataFrame: The final, clean Voronoi grid.
@@ -838,6 +896,7 @@ class VoronoiTessellator:
 
         # Final cleanup after potential splits.
         self.final_grid = _explode_with_unique_ids(self.final_grid)
+        self.final_grid = _merge_close_vertices(self.final_grid)
 
         # The 'x' and 'y' columns should always refer to the generator point
         # coordinates, which are essential for quality analysis. We add separate

@@ -53,6 +53,16 @@ class EmptyMeshGenerator:
         self.zones_gdf = gpd.GeoDataFrame()
 
 
+def _shortest_edge(grid):
+    """Return the shortest ring edge over all cells of a grid."""
+    lengths = []
+    for cell in grid.geometry:
+        for ring in [cell.exterior, *cell.interiors]:
+            coords = np.asarray(ring.coords)
+            lengths.append(np.hypot(*np.diff(coords, axis=0).T))
+    return np.concatenate(lengths).min()
+
+
 def _build_simple_conceptual_mesh():
     cm = ConceptualMesh(crs="EPSG:3857")
     square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
@@ -77,6 +87,29 @@ def test_full_pipeline_assigns_zones_and_covers_domain():
     domain_area = unary_union(clean_polys.geometry).area
     grid_area = unary_union(final_grid.geometry).area
     assert pytest.approx(domain_area, rel=1e-2) == grid_area
+
+
+@pytest.mark.parametrize("boundary_centering", ["clip", "inset_mirror"])
+def test_lattice_grid_has_no_zero_length_edges(boundary_centering):
+    """Catches roundoff-length cell edges, which MODFLOW 6 can crash on.
+
+    Where a lattice Voronoi face meets the boundary at a densified domain
+    vertex, clipping adds a cut point about 5e-17 from that vertex (6 such
+    edges on this grid with clip centering).
+    """
+    cm = _build_simple_conceptual_mesh()
+    clean_polys, _, _ = cm.generate()
+    mesh_gen = FakeMeshGenerator(clean_polys)
+    tessellator = VoronoiTessellator(mesh_gen, cm, boundary_centering=boundary_centering)
+
+    grid = tessellator.generate()
+
+    assert _shortest_edge(grid) > 1e-9
+    assert grid.is_valid.all()
+    assert set(grid["node_id"]) == set(mesh_gen.node_tags)
+    assert grid.geometry.area.sum() == pytest.approx(4.0, rel=1e-12)
+    # Neighbours still share exact vertices: no gaps or overlaps.
+    assert unary_union(grid.geometry).area == pytest.approx(4.0, rel=1e-12)
 
 
 def test_pipeline_reports_empty_when_no_domain():
@@ -115,9 +148,5 @@ def test_barrier_cells_keep_orthogonal_generator_centres():
     assert barrier.difference(faces).length == pytest.approx(0.0, abs=1e-9)
     connectivity = build_connectivity(grid, center="generator")
     assert connectivity["ortho_error"].max() < 1e-6
-    # Lattice nodes are cocircular, so Qhull leaves roundoff-length edges
-    # elsewhere; only the cells along the barrier are checked.
-    for cell in grid.geometry[grid.intersects(barrier)]:
-        coords = np.asarray(cell.exterior.coords)
-        assert np.hypot(*np.diff(coords, axis=0).T).min() > 1e-9
+    assert _shortest_edge(grid) > 1e-9
     assert pytest.approx(unary_union(clean_polys.geometry).area, rel=1e-9) == grid.geometry.area.sum()
