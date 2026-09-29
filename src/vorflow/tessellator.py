@@ -19,13 +19,23 @@ logger = logging.getLogger(__name__)
 # floating-point slivers from a barrier that runs along a cell face.
 BARRIER_SLIVER_FRACTION = 1e-6
 
+# Split pieces without the generator smaller than this fraction of the cell
+# area join the neighbouring cell on their side of the barrier instead of
+# becoming cells of their own. A curved barrier leaves such pieces all along
+# it: the straddle pairs' Voronoi faces are chords of the curve, which bulges
+# across them by the sagitta (pieces of 0.03-13% of the cell on curves with
+# radius 1-4 lc).
+BARRIER_FRAGMENT_MERGE_FRACTION = 0.2
+
 # Rounds of barrier mirroring before leftover crossings go to the post-hoc split.
 BARRIER_MIRROR_PASSES = 3
 
 # A mirror generator is dropped when an existing node lies closer to it than
-# this fraction of its distance to the original node; the pair is then
-# already symmetric about the barrier up to a sliver.
-BARRIER_MIRROR_MERGE_FRACTION = 1e-3
+# this fraction of its distance to the original node: that node already
+# acts as the partner, and a mirror beside it would squeeze both cells. On a
+# curved barrier a straddle point's partner reflected across the nearest
+# segment lands 4-19% of the reflection distance from it (lc 2, radius 1.7-8).
+BARRIER_MIRROR_MERGE_FRACTION = 0.1
 
 # Cell vertices closer than this fraction of the grid's coordinate scale are
 # one vertex. Clipping puts a cut point within roundoff of a domain vertex
@@ -188,9 +198,28 @@ def _strictly_inside(domain_geom, points_xy):
     return inside
 
 
+def _split_polygon_pieces(cell_poly, line):
+    """Return the polygon pieces of split(cell_poly, line), covering the whole cell.
+
+    Where the line runs along a cell face to within roundoff (a straddle
+    pair's face lies on the barrier segment through the pair), split() can
+    drop a piece. Snapping the cell to the line's vertices first makes the
+    overlap exact, so split is retried that way when area goes missing.
+    """
+    tolerance = 1e-9 * cell_poly.area
+    pieces = [piece for piece in split(cell_poly, line).geoms if isinstance(piece, (Polygon, MultiPolygon))]
+    if abs(cell_poly.area - sum(piece.area for piece in pieces)) <= tolerance:
+        return pieces
+    snapped = shapely.snap(cell_poly, line, 1e-9 * cell_poly.length)
+    retried = [piece for piece in split(snapped, line).geoms if isinstance(piece, (Polygon, MultiPolygon))]
+    if abs(cell_poly.area - sum(piece.area for piece in retried)) <= tolerance:
+        return retried
+    return pieces
+
+
 def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
     """Return the polygon pieces of a cell split by a line, or [] when the line does not straddle it."""
-    pieces = [piece for piece in split(cell_poly, line).geoms if isinstance(piece, (Polygon, MultiPolygon))]
+    pieces = _split_polygon_pieces(cell_poly, line)
     min_area = sliver_fraction * cell_poly.area
     significant = [piece for piece in pieces if piece.area > min_area]
     if len(significant) < 2:
@@ -256,6 +285,66 @@ def _primary_piece_position(pieces, generator):
     covering = [i for i, piece in enumerate(pieces) if piece.covers(generator)]
     candidates = covering if covering else range(len(pieces))
     return max(candidates, key=lambda i: pieces[i].area)
+
+
+def _fragment_merge(piece, geometries, tree, barriers):
+    """Return (position, merged geometry) of the cell ``piece`` joins, or None if no cell qualifies.
+
+    The cell must share a boundary with the piece, the union must be one
+    valid polygon without holes, and no barrier may straddle the union; so
+    the piece never joins a cell across a barrier (e.g. the cell it was cut
+    from, unless it is a roundoff crumb). Of the cells left, the one sharing
+    the longest boundary wins.
+
+    The piece's cut points can sit a roundoff distance off the cell's face
+    (a barrier vertex on a straddle pair's face), which would leave the two
+    touching at a point only; snapping the cell to the piece's vertices
+    first inserts them into its faces.
+    """
+    best = None
+    best_shared = 1e-9 * piece.length
+    for position in tree.query(piece, predicate='intersects'):
+        cell = shapely.snap(geometries[position], piece, 1e-9 * piece.length)
+        merged = cell.union(piece)
+        if merged.geom_type != 'Polygon' or merged.interiors or not merged.is_valid:
+            continue
+        if abs(merged.area - cell.area - piece.area) > 1e-9 * merged.area:
+            continue
+        # Union drops the shared boundary from both perimeters.
+        shared = 0.5 * (cell.length + piece.length - merged.length)
+        if shared <= best_shared:
+            continue
+        if any(_straddled_pieces(merged, line) for line in barriers if merged.intersects(line)):
+            continue
+        best, best_shared = (position, merged), shared
+    return best
+
+
+def _merge_barrier_fragments(geometries, fragments, barriers):
+    """Merge small barrier-split fragments into neighbouring cells; return the fragments left over.
+
+    ``geometries`` (the grid's cell geometries, an object array) is updated
+    in place. ``fragments`` are (piece, cell area, cell row) tuples. A
+    fragment joins a neighbour (see _fragment_merge) when its area is below
+    BARRIER_FRAGMENT_MERGE_FRACTION of the cell it was cut from. Fragments
+    that only touch other fragments are retried once those have merged.
+    """
+    pending = [f for f in fragments if f[0].area < BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
+    leftover = [f for f in fragments if f[0].area >= BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
+    while pending:
+        tree = shapely.STRtree(geometries)
+        unmerged = []
+        for fragment in pending:
+            merge = _fragment_merge(fragment[0], geometries, tree, barriers)
+            if merge is None:
+                unmerged.append(fragment)
+            else:
+                geometries[merge[0]] = merge[1]
+        if len(unmerged) == len(pending):
+            break
+        pending = unmerged
+    kept = {id(f) for f in leftover + pending}
+    return [f for f in fragments if id(f) in kept]
 
 
 def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
@@ -586,13 +675,17 @@ class VoronoiTessellator:
         bisector of the two is the barrier line, so after re-tessellation
         both cells stop at the line and every face stays a Voronoi bisector.
 
-        A node on the line and a mirror that would duplicate an existing
-        generator are skipped; the post-hoc split in _enforce_barriers
-        handles what is left. A mirror outside the domain (a boundary node
-        near a barrier end) is kept: every point of the piece beyond the line
-        is nearer to the mirror than to any other node, so the mirror's
-        clipped cell covers it. That cell's x/y then lies outside the cell,
-        as with the engine's straddle pair at a barrier end.
+        A node on the line and a mirror within BARRIER_MIRROR_MERGE_FRACTION
+        of an existing generator are skipped; the post-hoc split in
+        _enforce_barriers handles what is left. A mirror outside the domain
+        (a boundary node near a barrier end) is kept when the piece beyond
+        the line is large enough to stay a cell of its own after that split
+        (see BARRIER_FRAGMENT_MERGE_FRACTION): every point of the piece is
+        nearer to the mirror than to any other node, so the mirror's clipped
+        cell covers it. That cell's x/y then lies outside the cell, as with
+        the engine's straddle pair at a barrier end. A smaller piece would
+        leave the mirror a corner cell of a few thousandths of lc^2; the
+        split merges it into a neighbour instead.
         """
         barriers = self._barrier_lines()
         cells = raw_gdf[raw_gdf['node_id'] != -1]
@@ -611,12 +704,20 @@ class VoronoiTessellator:
                 cell_geom = cell.geometry
                 if domain_geom is not None:
                     cell_geom = _polygonal_part(cell_geom.intersection(domain_geom))
-                if cell_geom.is_empty or not _straddled_pieces(cell_geom, line):
+                if cell_geom.is_empty:
+                    continue
+                pieces = _straddled_pieces(cell_geom, line)
+                if not pieces:
                     continue
                 node_xy = np.array([cell['x'], cell['y']], dtype=float)
                 mirror = _reflect_across_nearest_segment(node_xy, line, tolerance)
                 if mirror is None:
                     continue
+                if domain_geom is not None and not domain_geom.covers(Point(mirror)):
+                    primary = _primary_piece_position(pieces, Point(node_xy))
+                    beyond = cell_geom.area - pieces[primary].area
+                    if beyond < BARRIER_FRAGMENT_MERGE_FRACTION * cell_geom.area:
+                        continue
                 merge_distance = BARRIER_MIRROR_MERGE_FRACTION * np.hypot(*(mirror - node_xy))
                 if tree.query(mirror)[0] < merge_distance:
                     continue
@@ -670,18 +771,23 @@ class VoronoiTessellator:
         method. Barrier mirror generators (_barrier_mirror_points) already
         stop most cells at the line; what is left here is mainly nodes that
         lie on the line itself (quad_buffer_thickness=2 puts a node row on
-        it) and cells the mirror passes did not finish. A cell is split only
-        when the line leaves at least two pieces larger than
-        BARRIER_SLIVER_FRACTION of its area; cells the line merely runs along
-        are left untouched. Cut points within roundoff of a cell vertex are
-        merged into it, so the split adds no zero-length edges.
+        it), cells the mirror passes did not finish, and the bulges of a
+        curved barrier across its straddle pairs' faces (chords of the
+        curve). A cell is split only when the line leaves at least two
+        pieces larger than BARRIER_SLIVER_FRACTION of its area; cells the
+        line merely runs along are left untouched. Cut points within
+        roundoff of a cell vertex are merged into it, so the split adds no
+        zero-length edges.
 
         The piece covering the generator point (else the largest piece)
-        keeps the original node_id and x/y. The other pieces get new,
-        unique IDs above the current maximum. These fragments have no
-        generator of their own, so their x/y are set to the fragment
-        centroid and do not denote a mesh node; their connections are not
-        orthogonal.
+        keeps the original node_id and x/y. A piece smaller than
+        BARRIER_FRAGMENT_MERGE_FRACTION of the cell joins the neighbouring
+        cell on its side of the barrier (_merge_barrier_fragments), so the
+        barrier face follows the line instead of leaving a sliver cell. The
+        other pieces get new, unique IDs above the current maximum. These
+        fragments have no generator of their own, so their x/y are set to
+        the fragment centroid and do not denote a mesh node; their
+        connections are not orthogonal.
 
         Args:
             grid_gdf (gpd.GeoDataFrame): The current Voronoi grid.
@@ -703,28 +809,31 @@ class VoronoiTessellator:
         logger.info(f"Enforcing Barrier Cuts on {len(barriers_to_cut)} lines...")
 
         current_grid = grid_gdf
+        barrier_lines = list(barriers_to_cut.geometry)
 
         # Keep the caller's integer dtype while assigning fragment IDs with
         # Python integers, avoiding NumPy scalar arithmetic during increments.
         node_id_dtype = grid_gdf['node_id'].dtype
         max_id = int(grid_gdf['node_id'].max())
+        n_merged = 0
 
         for idx, row in barriers_to_cut.iterrows():
             line = row.geometry
-            
+
             # Use a spatial index to quickly find cells that might intersect the line.
             possible_matches_index = list(current_grid.sindex.query(line, predicate='intersects'))
             candidate_cells = current_grid.iloc[possible_matches_index]
-            
-            cells_to_keep = []
+
+            primary_rows = []
+            fragments = []
             cells_to_remove_indices = []
-            
+
             for cell_idx, cell_row in candidate_cells.iterrows():
                 cell_poly = cell_row.geometry
-                
+
                 if not cell_poly.intersects(line):
                     continue
-                    
+
                 try:
                     pieces = _straddled_pieces(cell_poly, line)
                     if not pieces:
@@ -741,26 +850,45 @@ class VoronoiTessellator:
 
                     primary_row = cell_row.copy()
                     primary_row.geometry = pieces[primary]
-                    cells_to_keep.append(primary_row)
-                    for piece in others:
-                        max_id += 1
-                        new_row = cell_row.copy()
-                        new_row.geometry = piece
-                        new_row['node_id'] = max_id
-                        new_row['x'] = piece.centroid.x
-                        new_row['y'] = piece.centroid.y
-                        cells_to_keep.append(new_row)
+                    primary_rows.append(primary_row)
+                    fragments.extend((piece, cell_poly.area, cell_row) for piece in others)
                     cells_to_remove_indices.append(cell_idx)
 
                 except Exception as e:
                     logger.warning(f"Warning: Failed to split cell {cell_row['node_id']}: {e}")
-            
-            # Rebuild the grid with the split cells.
-            if cells_to_remove_indices:
-                current_grid = current_grid.drop(cells_to_remove_indices)
-                new_df = gpd.GeoDataFrame(cells_to_keep, crs=current_grid.crs)
-                current_grid = pd.concat([current_grid, new_df], ignore_index=True)
-        
+
+            if not cells_to_remove_indices:
+                continue
+
+            # Rebuild the grid with the primary pieces, then let small
+            # fragments join a neighbour on their side of the barrier.
+            current_grid = pd.concat(
+                [current_grid.drop(cells_to_remove_indices), gpd.GeoDataFrame(primary_rows, crs=current_grid.crs)],
+                ignore_index=True,
+            )
+            geometries = current_grid.geometry.to_numpy().copy()
+            leftover = _merge_barrier_fragments(geometries, fragments, barrier_lines)
+            n_merged += len(fragments) - len(leftover)
+            current_grid[current_grid.geometry.name] = gpd.GeoSeries(
+                geometries, index=current_grid.index, crs=current_grid.crs
+            )
+
+            new_rows = []
+            for piece, _, cell_row in leftover:
+                max_id += 1
+                new_row = cell_row.copy()
+                new_row.geometry = piece
+                new_row['node_id'] = max_id
+                new_row['x'] = piece.centroid.x
+                new_row['y'] = piece.centroid.y
+                new_rows.append(new_row)
+            if new_rows:
+                current_grid = pd.concat(
+                    [current_grid, gpd.GeoDataFrame(new_rows, crs=current_grid.crs)], ignore_index=True
+                )
+
+        if n_merged:
+            logger.info(f"  -> Merged {n_merged} barrier fragments into the neighbouring cell on their side")
         current_grid['node_id'] = current_grid['node_id'].astype(node_id_dtype)
         return current_grid
 

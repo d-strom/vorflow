@@ -124,6 +124,42 @@ def test_enforce_barriers_keeps_id_on_piece_holding_the_generator():
     assert result[result["node_id"] == 3].iloc[0].geometry.area == pytest.approx(0.75)
 
 
+def test_enforce_barriers_merges_small_fragment_into_cell_on_its_side():
+    """Catches a curved barrier's bulge across a face becoming a sliver cell of its own."""
+    line = LineString([(1, 0), (0.9, 0.5), (1, 1)])
+    tessellator = _barrier_tessellator(line, densify=False)
+
+    result = tessellator._enforce_barriers(_two_cell_grid())
+
+    assert sorted(result["node_id"]) == [1, 2]
+    areas = result.set_index("node_id").geometry.area
+    assert areas[1] == pytest.approx(0.95)
+    assert areas[2] == pytest.approx(1.05)
+    assert result.geometry.is_valid.all()
+    assert not any(tessellator_module._straddled_pieces(cell, line) for cell in result.geometry)
+
+
+def test_split_pieces_keep_area_where_barrier_runs_along_a_face():
+    """Catches split() dropping a piece where the barrier follows a cell face to roundoff."""
+    # A straddle pair's face on a curved barrier: the barrier bends at the
+    # cell vertex and runs along the faces either side of it.
+    cell = Polygon([
+        (57.96922267793483, 11.86440677966101), (57.48847447458607, 9.36193501881629),
+        (55.011979711113504, 10.297986205530755), (55.174633511821476, 13.730206996037758),
+        (57.92501721293334, 14.299737684624162),
+    ])
+    line = LineString([
+        (57.16349866562289, 8.950243290450704), (57.643613623698016, 10.169491525423728),
+        (57.96922267793483, 11.864406779661017), (57.938457036682884, 13.559322033898304),
+        (57.66593350278956, 14.756695707921759),
+    ])
+
+    pieces = tessellator_module._straddled_pieces(cell, line)
+
+    assert sum(piece.area for piece in pieces) == pytest.approx(cell.area, rel=1e-12)
+    assert len(pieces) == 3
+
+
 def test_straddled_pieces_merge_cut_point_into_nearby_cell_vertex():
     """Catches split() leaving a zero-length edge where a barrier passes through a cell vertex."""
     vertex = (1.0, 1.0)

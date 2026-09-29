@@ -41,6 +41,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their count is `VoronoiTessellator.n_barrier_mirrors`. A mirror of a
   boundary node near a barrier end can lie just outside the domain. Nodes on
   the line itself still fall back to the post-hoc split.
+- A curved barrier no longer leaves sliver cells along it. Straddle pairs'
+  Voronoi faces are chords of the curve, and the post-hoc barrier split
+  turned every bulge of the curve across a chord into a cell of its own
+  (about 80 cells with compactness < 0.3 and areas of 1e-2 to 1e-15 on a
+  sine barrier at `resolution=2`). A split piece smaller than 20% of its
+  cell (`BARRIER_FRAGMENT_MERGE_FRACTION`) now joins the neighbouring cell on
+  its side of the barrier, so the barrier face follows the line. Barrier
+  mirrors within 10% of their reflection distance of an existing generator
+  (`BARRIER_MIRROR_MERGE_FRACTION`, was 1e-3) are dropped, as are mirrors
+  outside the domain whose piece would merge anyway; on curves tighter than
+  `lc` both left cells of 1e-3 lc^2. A barrier split also no longer loses a
+  piece (a hole in the grid) where the barrier runs along a cell face to
+  roundoff.
 - Barrier splits no longer leave zero-length edges where the line passes
   through (or within roundoff of) a cell vertex.
 - `heal_shapes=True` no longer hangs Gmsh on lines that meet near a thin
