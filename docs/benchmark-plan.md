@@ -420,6 +420,27 @@ gives NCPL 6440. Findings from VOROGRIDGEN's first results:
   0.98× and 1.05× its planned scale. If no build lands within tolerance, it
   keeps the successful build closest to the target (`matched = False`).
   `n_failed_builds` is recorded for every tool.
+- **Third run (36485251402):** VOROGRIDGEN now returns a grid for all 11
+  targets, but four fall short of the matched count. Every finer attempt
+  failed, 13 builds in all; the other tools had none.
+
+  | Case | Target | VOROGRIDGEN cells | Failed builds |
+  |---|---|---|---|
+  | `c0_point_grading` | 3 000 | 1 807 | 5 |
+  | `v2_mms_uniform` | 8 000 | 6 560 | 4 |
+  | `v2_mms_graded` | 9 000 | 6 103 | 4 |
+  | `v3_thiem` | 3 000 | 2 826 (6 % short) | 0 |
+
+  On these cases VOROGRIDGEN seems unable to build much finer than the
+  counts shown. This is a result for the guide, not a harness bug.
+  `mf6_verification.csv` now carries each grid's `matched` flag.
+  `verification_summary.png` leaves out unmatched grids. The convergence
+  plots keep them, since they plot error against actual cell count.
+- **VOROGRIDGEN with XT3D stays competitive even with fewer cells:**
+  `v2_mms_uniform` gives 5.8e-5 at 6 560 cells against vorflow's 9.1e-5 at
+  8 039, and `v2_mms_graded` 2.0e-4 at 6 103 cells against 2.2e-4 to 5.1e-4
+  for the others at about 9 000. Without XT3D it is the worst tool in every
+  case (1e-2 to 6.5e-2).
 - **Centres:** written centres give exactly the same errors as centroids, which
   confirms the DISV carries centroids. Without XT3D, V1 linear gives 4.3e-3,
   ten times worse than the other tools' centroid rows, because the unconverged

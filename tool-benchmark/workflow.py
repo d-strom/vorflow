@@ -148,15 +148,18 @@ def _jsonable(value):
 
 
 def compile_tables(rows_d: Path, results_d: Path) -> tuple:
-    """Concatenate all JSON rows into metrics.csv and mf6_verification.csv."""
+    """Concatenate all JSON rows into metrics.csv and mf6_verification.csv (with each grid's matched flag)."""
     tables = []
-    for name, out in (("metrics", "metrics.csv"), ("mf6", "mf6_verification.csv")):
+    for name in ("metrics", "mf6"):
         rows = [r for f in sorted((rows_d / name).glob("*.json")) for r in json.loads(f.read_text())]
         assert rows, f"no {name} rows in {rows_d / name}; did the build jobs run?"
-        table = pd.DataFrame(rows)
-        table.to_csv(results_d / out, index=False)
-        tables.append(table)
-    return tuple(tables)
+        tables.append(pd.DataFrame(rows))
+    metrics, mf6 = tables
+    key = ["case", "tool", "target"]
+    mf6 = mf6.merge(metrics[key + ["matched"]], on=key, how="left")
+    metrics.to_csv(results_d / "metrics.csv", index=False)
+    mf6.to_csv(results_d / "mf6_verification.csv", index=False)
+    return metrics, mf6
 
 
 def load_grids(case, work_d: Path, target: int) -> dict:

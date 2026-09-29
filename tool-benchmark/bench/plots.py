@@ -150,15 +150,17 @@ def plot_verification(mf6: pd.DataFrame, case_ids: list, path: Path) -> None:
 
     Filled marker: centres as the tool writes them. Open marker joined by a thin
     line: the same grid with the other centre convention (generator for tools
-    that write centroids, centroid for tools that write generators).
+    that write centroids, centroid for tools that write generators). Grids
+    that missed the matched cell count are left out.
     """
     first = mf6.groupby("case")["target"].transform("first")
-    data = mf6[(mf6["target"] == first) & mf6["case"].isin(case_ids) & mf6["mf6_ok"]]
+    data = mf6[(mf6["target"] == first) & mf6["case"].isin(case_ids) & mf6["mf6_ok"] & mf6["matched"]]
     rows = list(dict.fromkeys(zip(data["case"], data["problem"])))
     tools = [t for t in TOOL_STYLE if t in set(data["tool"])]
     fig, axes = plt.subplots(1, 2, figsize=(11, 0.55 * len(rows) + 1.5), sharey=True)
     for ax, xt3d in zip(axes, (False, True)):
         sub = data[data["xt3d"] == xt3d]
+        labelled = set()
         for k, tool in enumerate(tools):
             style = TOOL_STYLE[tool]
             offset = (k - (len(tools) - 1) / 2) * 0.18
@@ -173,14 +175,16 @@ def plot_verification(mf6: pd.DataFrame, case_ids: list, path: Path) -> None:
                     ax.plot(other.iloc[0], y, style["marker"], ms=7, mfc="white", mec=style["color"], mew=1.5)
                 if len(written):
                     ax.plot(written.iloc[0], y, style["marker"], ms=7, color=style["color"],
-                            label=tool if i == 0 else None)
+                            label=None if tool in labelled else tool)
+                    labelled.add(tool)
         ax.set_xscale("log")
         ax.set_xlabel("L2 head error")
         ax.set_title(f"XT3D {'on' if xt3d else 'off'}", color=INK)
         _style_axes(ax)
     axes[0].set_yticks(range(len(rows)), [f"{c}\n{p}" for c, p in rows], fontsize=8)
     axes[0].invert_yaxis()
-    axes[1].legend(fontsize=8, frameon=False, loc="lower right")
-    fig.suptitle("Tier 0 head error. Filled: centres as written; open: same grid, other centre convention",
+    axes[1].legend(fontsize=8, frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1))
+    fig.suptitle("Tier 0 head error at matched cell count. Filled: centres as written; "
+                 "open: same grid, other centre convention",
                  color=INK, fontsize=10)
     _save(fig, path)
