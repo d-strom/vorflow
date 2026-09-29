@@ -210,9 +210,12 @@ def test_heal_remap_keeps_surfaces_with_identical_bounding_boxes_apart():
 
 
 # Three lines meeting near a thin sliver polygon (cleaning_limitations_demo,
-# Problem 4). healShapes duplicates the sliver's hole edges instead of sharing
-# them, so line pieces end on the domain surface's boundary without being in
-# its topology; embedding them made Gmsh hang forever.
+# Problem 4). While the sliver's hole in the domain surface was built inverted,
+# healShapes duplicated its edges instead of sharing them, so line pieces ended
+# on the domain surface's boundary without being in its topology; embedding
+# them made Gmsh hang forever. With the hole built correctly the pieces bound
+# the sliver instead; test_nonconforming_line_fragment_is_not_embedded covers
+# the guard directly.
 _HEALED_SLIVER_JUNCTION = """
 import json, sys
 import numpy as np
@@ -256,4 +259,118 @@ def test_healed_sliver_at_line_junction_meshes_without_hanging(line_kwargs):
     assert result.returncode == 0, result.stderr[-2000:]
     report = json.loads(result.stdout.strip().splitlines()[-1])
     assert report["cells"] > 0
-    assert report["skipped"] > 0
+    assert report["skipped"] == 0
+
+
+def _holed_domain_model():
+    """The basic example plus a hole: a zone, a river, a barrier running into the hole and a well."""
+    cm = ConceptualMesh()
+    domain = Polygon(box(0, 0, 200, 200).exterior.coords, [box(80, 80, 120, 120).exterior.coords])
+    cm.add_polygon(domain, zone_id=1)
+    cm.add_polygon(box(50, 50, 75, 75), zone_id=2, resolution=2.0, z_order=1)
+    river = LineString([(x, 75 + 20 * np.sin(0.1 * x)) for x in range(-10, 220, 10)])
+    cm.add_line(river, line_id="river", resolution=2.0)
+    cm.add_line(LineString([(100, 0), (100, 150)]), line_id="fault", resolution=2.0, is_barrier=True)
+    cm.add_point(Point(25, 25), point_id="well", resolution=1.0)
+    return cm.generate()
+
+
+def test_polygon_holes_are_not_inverted_in_occ():
+    # Shapely overlay output winds holes opposite to the shell; OCC
+    # addPlaneSurface reverses hole loops itself, so passing them as is gave
+    # a face of area shell + holes on which isInside() reported the hole as
+    # inside and much of the domain as outside.
+    import gmsh
+
+    poly = box(0, 0, 200, 200).difference(box(80, 80, 120, 120)).difference(box(50, 50, 75, 75))
+    assert poly.exterior.is_ccw != poly.interiors[0].is_ccw
+    mg = MeshGenerator(background_lc=20, verbosity=0)
+    mg._initialize_gmsh()
+    try:
+        s_tag, _ = mg._create_polygon_surface(poly)
+        gmsh.model.occ.synchronize()
+        assert gmsh.model.occ.getMass(2, s_tag) == pytest.approx(poly.area)
+        inside = [gmsh.model.isInside(2, s_tag, [x, y, 0]) for x, y in
+                  [(25, 25), (150, 150), (100, 100), (60, 60)]]
+    finally:
+        mg._finalize_gmsh()
+    assert inside == [1, 1, 0, 0]
+
+
+def test_features_in_a_holed_domain_are_embedded_as_triangle_vertices():
+    # With the domain face inverted, 154 river, fault-straddle and well
+    # entities matched no surface and were never embedded. Gmsh still meshed
+    # them as free entities, so their nodes were in mg.nodes without being
+    # triangle vertices and made sliver Voronoi cells along the lines.
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    assert mg.generate(*_holed_domain_model())
+    embedding = mg.diagnostics["embedding"]
+    assert embedding["skip_no_match"] == 0
+    assert embedding["skip_no_cand"] == 0
+    assert embedding["ok"] > 250
+    vertices = {tuple(xy) for geom in mg.get_element_grid().geometry
+                for xy in np.round(geom.exterior.coords, 9)}
+    free_nodes = [xy for xy in np.round(mg.nodes, 9) if tuple(xy) not in vertices]
+    assert free_nodes == []
+
+
+def test_dedup_keeps_renumbered_curves_in_the_feature_map():
+    # removeAllDuplicates renumbers curves (and reuses freed tags for other
+    # entities); only points were remapped, so 163 of the river's 177 curves
+    # were pruned from the map (no embedding, no refinement) and one entry
+    # pointed at a piece of the domain boundary.
+    import gmsh
+
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 200), zone_id=1)
+    cm.add_polygon(box(50, 50, 75, 75), zone_id=2, resolution=2.0, z_order=1)
+    river = LineString([(x, 75 + 20 * np.sin(0.1 * x)) for x in range(-10, 220, 10)])
+    cm.add_line(river, line_id="river", resolution=2.0)
+    cm.add_line(LineString([(100, 0), (100, 150)]), line_id="fault", resolution=2.0, is_barrier=True)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=20.0, verbosity=0)
+    mg._initialize_gmsh()
+    try:
+        river_curves = mg._add_geometry(polys, lines, points)["lines"][0]
+        centres = [Point(gmsh.model.occ.getCenterOfMass(1, tag)[:2]) for _dim, tag in river_curves]
+        total_length = sum(gmsh.model.occ.getMass(1, tag) for _dim, tag in river_curves)
+    finally:
+        mg._finalize_gmsh()
+    clean_river = lines.geometry.iloc[0]
+    assert max(clean_river.distance(c) for c in centres) < 1e-6
+    # Only the trim either side of the barrier is missing.
+    assert total_length == pytest.approx(clean_river.length, abs=2.0)
+
+
+def test_unembedded_entities_are_reported_with_a_warning(monkeypatch, caplog):
+    monkeypatch.setattr(MeshGenerator, "_surfaces_containing", staticmethod(lambda *args: []))
+    vorflow.set_verbosity(1, console=False)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vorflow"):
+            mg = MeshGenerator(background_lc=10, verbosity=0)
+            assert mg.generate(*_barrier_model(with_point=True))
+    finally:
+        vorflow.set_verbosity(1)
+    embedding = mg.diagnostics["embedding"]
+    assert embedding["skip_no_match"] > 0
+    assert len(embedding["unmatched_tags"]) == embedding["skip_no_match"]
+    assert (0, embedding["unmatched_tags"][0][1], (80.0, 80.0)) in embedding["unmatched_tags"]
+    assert any("no domain surface contains" in r.getMessage() for r in caplog.records
+               if r.levelno == logging.WARNING)
+
+
+def test_nonconforming_line_fragment_is_not_embedded(monkeypatch):
+    # A line piece ending on another surface's boundary without sharing a
+    # vertex with the target surface made Gmsh hang (see the healed sliver
+    # test above); such a piece must be skipped, not embedded.
+    import vorflow.engine as engine
+
+    monkeypatch.setattr(engine, "_endpoint_surfaces", lambda curve_tag: [{999}])
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 100, 100), zone_id=1, resolution=10)
+    cm.add_line(LineString([(20, 20), (80, 80)]), "line", resolution=10)
+    mg = MeshGenerator(background_lc=10, verbosity=0)
+    assert mg.generate(*cm.generate())
+    embedding = mg.diagnostics["embedding"]
+    assert embedding["nonconforming_skip"] > 0
+    assert embedding["ok"] == 0

@@ -41,6 +41,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   duplicate a hole's edges instead of sharing them) is no longer embedded; a
   warning names it and `diagnostics['embedding']['nonconforming_skip']`
   counts it.
+- Polygons with holes are no longer built as inverted OCC faces. Gmsh's
+  `addPlaneSurface` expects hole loops wound like the exterior, but Shapely
+  overlay output (overlap resolution, clipping) winds them the other way, so
+  every holed polygon became a face of area shell + holes. `isInside()` was
+  wrong on it, and points, lines and barrier straddle points inside it were
+  silently left unembedded. Gmsh still meshed them as free entities, so their
+  nodes made sliver cells along lines (the comprehensive demo lost 154
+  embeds). A line crossing a holed polygon also no longer fails to split it.
+  Meshes are unchanged where no clean polygon has a hole; a zone cut out of
+  the domain by overlap resolution counts as one (the basic example goes from
+  2746 to 2744 nodes).
+- `removeAllDuplicates` renumbers curves and surfaces as well as points, and
+  reuses freed tags for other entities. The fragment map now matches every
+  entry by location after it, not only killed point tags, so renumbered line
+  pieces keep their embedding and size fields.
+- Points and line fragments that no domain surface contains are now reported
+  with a warning, and listed in `diagnostics['embedding']['unmatched_tags']`,
+  instead of being skipped silently.
 
 ## [0.1.0rc1]
 

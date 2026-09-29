@@ -541,6 +541,7 @@ class _EmbedStats:
     boundary_tags: list = dataclasses.field(default_factory=list)
     nonconforming_tags: list = dataclasses.field(default_factory=list)
     multi_tags: list = dataclasses.field(default_factory=list)
+    unmatched_tags: list = dataclasses.field(default_factory=list)
     fail_tags: list = dataclasses.field(default_factory=list)
     inside_fail_tags: list = dataclasses.field(default_factory=list)
     records: list = dataclasses.field(default_factory=list)
@@ -553,6 +554,7 @@ class _EmbedStats:
         report.update(boundary_tags=list(self.boundary_tags),
                       nonconforming_tags=list(self.nonconforming_tags),
                       multi_tags=list(self.multi_tags),
+                      unmatched_tags=list(self.unmatched_tags),
                       fail_tags=list(self.fail_tags))
         if include_records:
             report['records'] = list(self.records)
@@ -618,6 +620,12 @@ def _entity_sample_points(dim, tag, bbox):
             seen.add(key)
             points.append(pt)
     return points
+
+
+def _unmatched_record(dim, tag, bbox):
+    """(dim, tag, bbox centre) of an entity no domain surface was found for."""
+    return (int(dim), int(tag),
+            (round((bbox[0] + bbox[3]) / 2.0, 6), round((bbox[1] + bbox[4]) / 2.0, 6)))
 
 
 def _surface_area(surf_tag):
@@ -1083,17 +1091,20 @@ class MeshGenerator:
         return grid.copy()
 
     def _dedup_and_remap_fragment_map(self, out_map, object_tags, input_tag_info):
-        """Run removeAllDuplicates and remap the point tags it kills, in place.
+        """Run removeAllDuplicates and remap the fragment map by entity location, in place.
 
         Unlike healShapes this does not delete or merge entities by a size
         tolerance, so it cannot destroy surfaces or turn interior lines into
-        boundaries. It can merge coincident entities (changing tags) without
-        returning a mapping, so point coordinates are snapshotted beforehand
-        and out_map tags that disappear are remapped to the nearest surviving
-        point within _DEDUP_MATCH_TOL.
+        boundaries. It does merge coincident entities and renumber others
+        (points, curves and surfaces alike), even reusing a freed tag number
+        for a different entity, without returning a mapping. Entity
+        signatures are therefore snapshotted beforehand and every out_map
+        entry is matched to the surviving entity of the same dimension within
+        _DEDUP_MATCH_TOL (the same tag on a tie). Dedup moves nothing, so a
+        merged duplicate maps onto the entity it was merged into.
         """
         pre_dedup = _snapshot_signatures(
-            {(int(d), int(t)) for entries in out_map for d, t in entries if int(d) == 0},
+            {(int(d), int(t)) for entries in out_map for d, t in entries if int(d) in (0, 1, 2)},
             "Pre-dedup snapshot",
         )
         gmsh.model.occ.removeAllDuplicates()
@@ -1102,7 +1113,7 @@ class MeshGenerator:
 
         occ_alive = {(int(d), int(t)) for dim in range(3) for d, t in gmsh.model.occ.getEntities(dim)}
         survivors = _SurvivorIndex(
-            _snapshot_signatures(sorted(dt for dt in occ_alive if dt[0] == 0), "Post-dedup survey"),
+            _snapshot_signatures(sorted(occ_alive), "Post-dedup survey"),
             _DEDUP_MATCH_TOL,
         )
 
@@ -1112,18 +1123,21 @@ class MeshGenerator:
             new_entries = []
             for dt in out_map[i]:
                 d, t = int(dt[0]), int(dt[1])
-                if (d, t) in occ_alive:
-                    new_entries.append(dt)
-                elif (d, t) in pre_dedup:
-                    # Tag was killed by dedup: find the surviving point.
-                    new_tag = survivors.match(d, t, pre_dedup[(d, t)])
-                    if new_tag is not None:
-                        new_entries.append((0, new_tag))
-                        remapped += 1
+                if (d, t) not in pre_dedup:
+                    # Unmeasurable before dedup: keep it only if still alive.
+                    if (d, t) in occ_alive:
+                        new_entries.append(dt)
                     else:
                         pruned += 1
-                else:
+                    continue
+                new_tag = survivors.match(d, t, pre_dedup[(d, t)])
+                if new_tag is None:
                     pruned += 1
+                elif new_tag == t:
+                    new_entries.append(dt)
+                else:
+                    new_entries.append((d, new_tag))
+                    remapped += 1
             out_map[i] = new_entries
         if pruned > 0 or remapped > 0:
             logger.info(f"removeAllDuplicates: remapped {remapped}, pruned {pruned} tag(s) from fragment map.")
@@ -1618,18 +1632,47 @@ class MeshGenerator:
             return None, []
         loops = [exterior_loop_tag]
         boundary_curve_tags = list(exterior_lines)
+        holes = []
         for interior in poly.interiors:
-            interior_loop_tag, interior_lines = self._create_curve_loop(list(interior.coords))
+            # OCC addPlaneSurface reverses the hole loops itself, so it needs
+            # them wound like the exterior. Shapely overlay output winds holes
+            # opposite to the shell; passed as is, they become an inverted
+            # face (area = shell + holes) on which isInside() is wrong, and
+            # features inside it are never embedded.
+            coords = list(interior.coords)
+            if interior.is_ccw != poly.exterior.is_ccw:
+                coords.reverse()
+            interior_loop_tag, interior_lines = self._create_curve_loop(coords)
             if interior_loop_tag is not None:
                 loops.append(interior_loop_tag)
                 boundary_curve_tags.extend(interior_lines)
+                holes.append(interior)
         try:
             s_tag = gmsh.model.occ.addPlaneSurface(loops)
         except Exception as e:
             # gmsh's Python API raises plain Exception on OCC errors.
             logger.error(f"Error creating surface: {e}")
             return None, []
+        if holes:
+            self._warn_if_holes_inverted(s_tag, poly.exterior, holes)
         return s_tag, boundary_curve_tags
+
+    @staticmethod
+    def _warn_if_holes_inverted(s_tag, exterior, holes):
+        """Warn if OCC measures a holed surface with any hole added instead of removed."""
+        hole_areas = [Polygon(hole).area for hole in holes]
+        expected = Polygon(exterior).area - sum(hole_areas)
+        try:
+            occ_area = float(gmsh.model.occ.getMass(2, s_tag))
+        except Exception:
+            # gmsh raises plain Exception for entities without mass properties.
+            return
+        # An inverted hole adds twice its area.
+        if abs(occ_area - expected) > 0.5 * min(hole_areas):
+            logger.warning(
+                f"Surface {s_tag}: OCC area {occ_area:.6g} differs from the polygon "
+                f"area {expected:.6g}, so its holes are probably inverted. Points and "
+                f"lines inside it may not be embedded.")
 
     @staticmethod
     def _create_curve_loop(coords):
@@ -2308,7 +2351,10 @@ class MeshGenerator:
         confirmed with gmsh.model.isInside() on the trimmed surfaces. Do not
         use getClosestPoint() here: for coplanar OCC surfaces it can project
         onto the support plane outside the trimmed face, causing false
-        multi-surface embeds and over-constraining Gmsh.
+        multi-surface embeds and over-constraining Gmsh. isInside() is only
+        right on faces whose holes are wound correctly (see
+        _create_polygon_surface); entities it places in no surface are
+        skipped with a warning.
         """
         if self._verbosity > 0:
             logger.info("Explicitly embedding features into domain surfaces...")
@@ -2322,6 +2368,13 @@ class MeshGenerator:
         for dim, tag in _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
             self._embed_entity(dim, tag, surface_bboxes, stats)
 
+        if stats.unmatched_tags:
+            logger.warning(
+                f"Skipped embedding {len(stats.unmatched_tags)} point(s)/line fragment(s) "
+                f"that no domain surface contains (dim, tag, bbox centre): "
+                f"{stats.unmatched_tags[:5]}. Gmsh still meshes them, but not as part "
+                f"of the triangulation, so their nodes can create sliver Voronoi cells. "
+                f"This usually follows heal_shapes=True or geometry outside the domain.")
         if stats.nonconforming_skip:
             logger.warning(
                 f"Skipped embedding {stats.nonconforming_skip} line fragment(s) whose "
@@ -2356,6 +2409,7 @@ class MeshGenerator:
             sample_points = []
         if not sample_points:
             stats.skip_no_match += 1
+            stats.unmatched_tags.append(_unmatched_record(dim, tag, bbox))
             return
 
         candidates = sorted({
@@ -2364,11 +2418,13 @@ class MeshGenerator:
         })
         if not candidates:
             stats.skip_no_cand += 1
+            stats.unmatched_tags.append(_unmatched_record(dim, tag, bbox))
             return
 
         matches = self._surfaces_containing(tag, sample_points, candidates, stats)
         if not matches:
             stats.skip_no_match += 1
+            stats.unmatched_tags.append(_unmatched_record(dim, tag, bbox))
             return
         if len(matches) > 1:
             stats.multi_match += 1
