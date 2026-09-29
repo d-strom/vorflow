@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 # floating-point slivers from a barrier that runs along a cell face.
 BARRIER_SLIVER_FRACTION = 1e-6
 
+# Rounds of barrier mirroring before leftover crossings go to the post-hoc split.
+BARRIER_MIRROR_PASSES = 3
+
+# A mirror generator is dropped when an existing node lies closer to it than
+# this fraction of its distance to the original node; the pair is then
+# already symmetric about the barrier up to a sliver.
+BARRIER_MIRROR_MERGE_FRACTION = 1e-3
+
 
 def _boundary_node_spacing(nodes, boundary_indices):
     """Return each boundary node's distance to its nearest distinct boundary node (NaN elsewhere)."""
@@ -131,7 +139,60 @@ def _straddled_pieces(cell_poly, line, sliver_fraction=BARRIER_SLIVER_FRACTION):
     significant = [piece for piece in pieces if piece.area > min_area]
     if len(significant) < 2:
         return []
-    return pieces
+    return [_snap_to_cell_vertices(piece, cell_poly) for piece in pieces]
+
+
+def _polygonal_part(geom):
+    """Return the polygons of a geometry (dropping line/point slivers from an intersection)."""
+    if isinstance(geom, (Polygon, MultiPolygon)):
+        return geom
+    polygons = [part for part in shapely.get_parts(geom) if isinstance(part, Polygon)]
+    return MultiPolygon(polygons) if polygons else Polygon()
+
+
+def _snap_to_cell_vertices(piece, cell_poly):
+    """Return a split piece with cut points that land on a cell vertex merged into that vertex.
+
+    A barrier through (or within roundoff of) a cell vertex makes split()
+    insert its own copy of the vertex next to the original, i.e. a
+    zero-length edge the neighbouring cell does not share.
+    """
+    tolerance = 1e-9 * cell_poly.length
+    snapped = shapely.remove_repeated_points(shapely.snap(piece, cell_poly, tolerance), tolerance)
+    if not snapped.is_valid or abs(snapped.area - piece.area) > 1e-9 * cell_poly.area:
+        return piece
+    return snapped
+
+
+def _line_segments(line):
+    """Return the (start, end) coordinates of every segment of a LineString or MultiLineString."""
+    parts = getattr(line, 'geoms', [line])
+    starts, ends = [], []
+    for part in parts:
+        coords = np.asarray(part.coords, dtype=float)[:, :2]
+        starts.append(coords[:-1])
+        ends.append(coords[1:])
+    return np.concatenate(starts), np.concatenate(ends)
+
+
+def _reflect_across_nearest_segment(point_xy, line, tolerance):
+    """Return the mirror of a point across the line through its nearest segment, or None if it lies on the line."""
+    starts, ends = _line_segments(line)
+    direction = ends - starts
+    length_sq = np.einsum('ij,ij->i', direction, direction)
+    valid = length_sq > 0
+    if not valid.any():
+        return None
+    starts, direction, length_sq = starts[valid], direction[valid], length_sq[valid]
+    t = np.clip(np.einsum('ij,ij->i', point_xy - starts, direction) / length_sq, 0.0, 1.0)
+    nearest = int(np.argmin(np.hypot(*(starts + t[:, None] * direction - point_xy).T)))
+    # Reflect across the segment's infinite line, not its closest point, so a
+    # node beyond a segment end still mirrors onto the other side of the line.
+    start, d = starts[nearest], direction[nearest]
+    foot = start + np.dot(point_xy - start, d) / length_sq[nearest] * d
+    if np.hypot(*(point_xy - foot)) <= tolerance:
+        return None
+    return 2.0 * foot - point_xy
 
 
 def _primary_piece_position(pieces, generator):
@@ -155,6 +216,20 @@ def _join_unmatched_to_nearest_zone(joined, pts_gdf, zones):
     logger.debug(f"  -> {len(missing)} generator(s) outside every zone; using the nearest zone.")
     nearest = gpd.sjoin_nearest(missing, zones, how='left')
     return pd.concat([joined[matched], nearest])
+
+
+def _mirror_metadata(tags, mirrors):
+    """Return node metadata rows for barrier mirror generators (never boundary-centred)."""
+    return pd.DataFrame(
+        {
+            "node_id": tags,
+            "source_x": mirrors[:, 0],
+            "source_y": mirrors[:, 1],
+            "boundary_centering": "clip",
+            "boundary_inset": 0.0,
+            "boundary_centered": False,
+        }
+    )
 
 
 def _explode_with_unique_ids(grid_gdf):
@@ -236,6 +311,7 @@ class VoronoiTessellator:
         self.cm = conceptual_mesh
         self.voronoi_gdf = None
         self.final_grid = None
+        self.n_barrier_mirrors = 0
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
         self.zones_gdf = mesh_generator.zones_gdf
@@ -417,23 +493,122 @@ class VoronoiTessellator:
         )
         return gdf
 
+    def _barrier_lines(self):
+        """Return the geometries of the clean lines marked is_barrier=True."""
+        lines = self.cm.clean_lines
+        if lines is None or lines.empty or 'is_barrier' not in lines.columns:
+            return []
+        mask = lines['is_barrier'].fillna(False).astype(bool)
+        return [geom for geom in lines.loc[mask].geometry if geom is not None and not geom.is_empty]
+
+    def _barrier_mirror_points(self, raw_gdf, generators, domain_geom):
+        """
+        Return mirror generators for nodes whose Voronoi cell a barrier crosses.
+
+        The straddle mechanism in MeshGenerator puts node pairs on either
+        side of a barrier so that their shared Voronoi face lies on it. Other
+        nodes near the line (mesh nodes between the pairs, nodes of a line
+        crossing the barrier) have no partner, and their cells straddle it.
+        Reflecting such a node across the barrier gives it that partner: the
+        bisector of the two is the barrier line, so after re-tessellation
+        both cells stop at the line and every face stays a Voronoi bisector.
+
+        A node on the line and a mirror that would duplicate an existing
+        generator are skipped; the post-hoc split in _enforce_barriers
+        handles what is left. A mirror outside the domain (a boundary node
+        near a barrier end) is kept: every point of the piece beyond the line
+        is nearer to the mirror than to any other node, so the mirror's
+        clipped cell covers it. That cell's x/y then lies outside the cell,
+        as with the engine's straddle pair at a barrier end.
+        """
+        barriers = self._barrier_lines()
+        cells = raw_gdf[raw_gdf['node_id'] != -1]
+        if not barriers or cells.empty:
+            return np.empty((0, 2))
+
+        scale = max(float(np.ptp(generators, axis=0).max()), 1.0)
+        tolerance = scale * 1e-8
+        tree = cKDTree(generators)
+        mirrors = []
+        for line in barriers:
+            for position in cells.sindex.query(line, predicate='intersects'):
+                cell = cells.iloc[position]
+                # A barrier ending on the domain boundary ends inside the raw
+                # cell of a boundary node, so test the cell as it will be clipped.
+                cell_geom = cell.geometry
+                if domain_geom is not None:
+                    cell_geom = _polygonal_part(cell_geom.intersection(domain_geom))
+                if cell_geom.is_empty or not _straddled_pieces(cell_geom, line):
+                    continue
+                node_xy = np.array([cell['x'], cell['y']], dtype=float)
+                mirror = _reflect_across_nearest_segment(node_xy, line, tolerance)
+                if mirror is None:
+                    continue
+                merge_distance = BARRIER_MIRROR_MERGE_FRACTION * np.hypot(*(mirror - node_xy))
+                if tree.query(mirror)[0] < merge_distance:
+                    continue
+                if any(np.hypot(*(mirror - other)) < merge_distance for other in mirrors):
+                    continue
+                mirrors.append(mirror)
+        return np.array(mirrors) if mirrors else np.empty((0, 2))
+
+    def _build_barrier_conforming_voronoi(self, nodes, tags, boundary_ghosts, far_ghosts, node_metadata):
+        """
+        Build the raw Voronoi diagram, adding barrier mirror generators until no cell straddles a barrier.
+
+        Mirror generators are real nodes: they get fresh node_ids above the
+        current maximum, x/y at the mirror point, and a row in node_metadata.
+        Their count is stored in ``self.n_barrier_mirrors``.
+
+        Returns:
+            tuple: (raw Voronoi GeoDataFrame, node metadata including mirrors).
+        """
+        domain_geom = self._domain_geometry() if self.clip_to_boundary else None
+        raw_gdf = self._build_raw_voronoi(np.vstack([nodes, boundary_ghosts, far_ghosts]), tags)
+        self.n_barrier_mirrors = 0
+        if raw_gdf.empty:
+            return raw_gdf, node_metadata
+
+        for _ in range(BARRIER_MIRROR_PASSES):
+            generators = np.vstack([nodes, boundary_ghosts])
+            mirrors = self._barrier_mirror_points(raw_gdf, generators, domain_geom)
+            if len(mirrors) == 0:
+                break
+            # Python ints avoid NumPy scalar overflow for large (e.g. uint64) node IDs.
+            first_id = int(np.max(tags)) + 1 if len(tags) else 0
+            new_tags = np.array([first_id + i for i in range(len(mirrors))], dtype=tags.dtype)
+            nodes = np.vstack([nodes, mirrors])
+            tags = np.concatenate([tags, new_tags])
+            node_metadata = pd.concat(
+                [node_metadata, _mirror_metadata(new_tags, mirrors)], ignore_index=True
+            )
+            self.n_barrier_mirrors += len(mirrors)
+            raw_gdf = self._build_raw_voronoi(np.vstack([nodes, boundary_ghosts, far_ghosts]), tags)
+
+        if self.n_barrier_mirrors:
+            logger.info(f"  -> Added {self.n_barrier_mirrors} barrier mirror generators")
+        return raw_gdf, node_metadata
+
     def _enforce_barriers(self, grid_gdf):
         """
-        Splits Voronoi cells that are straddled by barrier lines.
+        Splits Voronoi cells that are still straddled by barrier lines.
 
         Every line marked `is_barrier=True` is checked, whatever its meshing
-        method. Straddle-width and quad-buffer barriers usually already run
-        along cell faces, but not everywhere: quad_buffer_thickness=2 puts a
-        node row on the line, and end caps where a line meets the domain
-        boundary leave nodes on it. A cell is therefore split only when the
-        line leaves at least two pieces larger than BARRIER_SLIVER_FRACTION
-        of its area; cells the line merely runs along are left untouched.
+        method. Barrier mirror generators (_barrier_mirror_points) already
+        stop most cells at the line; what is left here is mainly nodes that
+        lie on the line itself (quad_buffer_thickness=2 puts a node row on
+        it) and cells the mirror passes did not finish. A cell is split only
+        when the line leaves at least two pieces larger than
+        BARRIER_SLIVER_FRACTION of its area; cells the line merely runs along
+        are left untouched. Cut points within roundoff of a cell vertex are
+        merged into it, so the split adds no zero-length edges.
 
         The piece covering the generator point (else the largest piece)
         keeps the original node_id and x/y. The other pieces get new,
         unique IDs above the current maximum. These fragments have no
         generator of their own, so their x/y are set to the fragment
-        centroid and do not denote a mesh node.
+        centroid and do not denote a mesh node; their connections are not
+        orthogonal.
 
         Args:
             grid_gdf (gpd.GeoDataFrame): The current Voronoi grid.
@@ -522,10 +697,11 @@ class VoronoiTessellator:
 
         This method orchestrates the process of:
         1. Adding "ghost" nodes to create a bounded Voronoi diagram.
-        2. Computing the raw Voronoi polygons.
+        2. Computing the raw Voronoi polygons, adding a mirror generator
+           across each barrier for every node whose cell straddles it.
         3. Clipping the grid to the model domain.
         4. Assigning zone IDs to cells based on their generator point location.
-        5. Enforcing barrier lines by splitting cells.
+        5. Enforcing barrier lines by splitting cells that still straddle them.
         6. Calculating final cell properties.
 
         Returns:
@@ -563,10 +739,10 @@ class VoronoiTessellator:
             [minx - buffer, maxy + buffer]
         ])
         
-        combined_nodes = np.vstack([nodes, boundary_ghost_nodes, ghost_nodes])
-        
         logger.info("Computing Mathematical Voronoi...")
-        raw_gdf = self._build_raw_voronoi(combined_nodes, tags)
+        raw_gdf, node_metadata = self._build_barrier_conforming_voronoi(
+            nodes, tags, boundary_ghost_nodes, ghost_nodes, node_metadata
+        )
         logger.info(f"  -> Raw Polygons: {len(raw_gdf)}")
         
         # Remove the cells generated by the ghost nodes.

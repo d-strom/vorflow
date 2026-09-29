@@ -1,11 +1,12 @@
 import numpy as np
 import geopandas as gpd
 import pytest
-from shapely.geometry import Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import unary_union
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.tessellator import VoronoiTessellator
+from vorflow.utils import build_connectivity
 
 
 class FakeMeshGenerator:
@@ -84,3 +85,39 @@ def test_pipeline_reports_empty_when_no_domain():
     grid = tessellator.generate()
 
     assert grid.empty
+
+
+def test_barrier_cells_keep_orthogonal_generator_centres():
+    """Catches barrier-split fragments carrying a centroid instead of a Voronoi generator.
+
+    A lattice has no straddle pairs, so the oblique barrier crosses a row of
+    cells, including both boundary cells at its ends. MODFLOW 6 uses x/y as
+    the cell centre; any fragment without a generator of its own gives
+    non-orthogonal connections (up to 49 degrees on this grid).
+    """
+    cm = _build_simple_conceptual_mesh()
+    barrier = LineString([(0, 0.6), (2, 1.3)])
+    cm.add_line(barrier, line_id="fault", resolution=1.0, is_barrier=True)
+    clean_polys, _, _ = cm.generate()
+    mesh_gen = FakeMeshGenerator(clean_polys)
+    tessellator = VoronoiTessellator(mesh_gen, cm, clip_to_boundary=True)
+
+    grid = tessellator.generate()
+
+    assert tessellator.n_barrier_mirrors > 0
+    # Every cell is a Voronoi cell: mesh nodes plus mirrors, no leftover fragments.
+    assert len(grid) == len(mesh_gen.nodes) + tessellator.n_barrier_mirrors
+    assert grid["node_id"].is_unique
+    original = grid.set_index("node_id").loc[mesh_gen.node_tags]
+    np.testing.assert_array_equal(original[["x", "y"]].to_numpy(), mesh_gen.nodes)
+    # The barrier runs along cell faces only.
+    faces = unary_union(grid.boundary).buffer(1e-9)
+    assert barrier.difference(faces).length == pytest.approx(0.0, abs=1e-9)
+    connectivity = build_connectivity(grid, center="generator")
+    assert connectivity["ortho_error"].max() < 1e-6
+    # Lattice nodes are cocircular, so Qhull leaves roundoff-length edges
+    # elsewhere; only the cells along the barrier are checked.
+    for cell in grid.geometry[grid.intersects(barrier)]:
+        coords = np.asarray(cell.exterior.coords)
+        assert np.hypot(*np.diff(coords, axis=0).T).min() > 1e-9
+    assert pytest.approx(unary_union(clean_polys.geometry).area, rel=1e-9) == grid.geometry.area.sum()

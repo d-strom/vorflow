@@ -5,9 +5,11 @@ Spec translation: ``resolution = h_f``, ``growth_factor = g``,
 Barrier lines keep ``is_barrier=True`` (vorflow is the only tool with barriers).
 
 vorflow has no DISV writer, so the grid goes through FloPy's ``to_cvfd``.
-Written centres are the generator points (``x``, ``y``); cells split by a
-barrier or exploded after clipping carry their centroid instead. Their count
-(cells minus mesh nodes) is ``info['n_split_cells']``.
+Written centres are the generator points (``x``, ``y``). Barrier mirror
+generators (reflections of nodes whose cell straddles a barrier) are true
+generators too; their count is ``info['n_barrier_mirrors']``. Cells still split
+by a barrier or exploded after clipping carry their centroid instead; their
+count (cells minus mesh nodes minus mirrors) is ``info['n_split_cells']``.
 """
 
 import time
@@ -29,11 +31,14 @@ def build(case: Case, scale: float, ws: Path) -> Grid:
     clean_polys, clean_lines, clean_pts = blueprint.generate()
     mesher = MeshGenerator(background_lc=case.h_max * scale, verbosity=0)
     mesher.generate(clean_polys, clean_lines, clean_pts)
-    cells = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True).generate()
+    tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
+    cells = tessellator.generate()
     t1 = time.perf_counter()
     grid = _to_grid(cells)
     grid.timings = {"mesh_s": t1 - t0, "export_s": time.perf_counter() - t1}
-    grid.info["n_split_cells"] = len(cells) - len(mesher.nodes)
+    n_mirrors = getattr(tessellator, "n_barrier_mirrors", 0)
+    grid.info["n_barrier_mirrors"] = n_mirrors
+    grid.info["n_split_cells"] = len(cells) - len(mesher.nodes) - n_mirrors
     return grid
 
 

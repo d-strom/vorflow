@@ -7,6 +7,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Cells that straddle a barrier now get a mirror generator across the line
+  instead of a centroid-centred fragment, so every face stays a Voronoi
+  bisector and MODFLOW 6 connections stay orthogonal. On a fault crossed by a
+  river (benchmark case F4) the linear-head L2 error drops from 3e-5 to 1e-10.
+  The primary cell keeps its `node_id` and `x`/`y`; mirrors get fresh IDs and
+  their count is `VoronoiTessellator.n_barrier_mirrors`. A mirror of a
+  boundary node near a barrier end can lie just outside the domain. Nodes on
+  the line itself still fall back to the post-hoc split.
+- Barrier splits no longer leave zero-length edges where the line passes
+  through (or within roundoff of) a cell vertex.
+
 ## [0.1.0rc1]
 
 ### Fixed

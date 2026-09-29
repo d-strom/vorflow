@@ -124,6 +124,25 @@ def test_enforce_barriers_keeps_id_on_piece_holding_the_generator():
     assert result[result["node_id"] == 3].iloc[0].geometry.area == pytest.approx(0.75)
 
 
+def test_straddled_pieces_merge_cut_point_into_nearby_cell_vertex():
+    """Catches split() leaving a zero-length edge where a barrier passes through a cell vertex."""
+    vertex = (1.0, 1.0)
+    cell = Polygon([(0, 0), (2, 0), (2, 1.5), vertex, (0, 1.2)])
+    direction = np.array([1.0, 1.7]) / np.hypot(1.0, 1.7)
+    # The barrier misses the vertex by roundoff, as on a Voronoi vertex of a straddle pair.
+    start = np.array(vertex) - 3 * direction + [3e-14, 0.0]
+    line = LineString([start, start + 6 * direction])
+
+    pieces = tessellator_module._straddled_pieces(cell, line)
+
+    assert len(pieces) == 2
+    assert sum(piece.area for piece in pieces) == pytest.approx(cell.area)
+    for piece in pieces:
+        coords = np.asarray(piece.exterior.coords)
+        assert np.hypot(*np.diff(coords, axis=0).T).min() > 1e-9
+        assert tuple(vertex) in {tuple(c) for c in coords}
+
+
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
     """Catches removing a cell when Shapely raises while splitting it."""
     tessellator, _ = _plain_barrier_tessellator()
