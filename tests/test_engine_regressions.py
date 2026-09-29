@@ -135,6 +135,10 @@ def test_mesh_generator_verbosity_scopes_generate_output(caplog):
     model = _barrier_model(with_point=False)
     vorflow.set_verbosity(1, console=False)
     try:
+        # caplog.records holds the whole test phase, and pytest >= 9.1 also
+        # captures from non-propagating loggers, so drop the ConceptualMesh
+        # progress messages logged while building the model.
+        caplog.clear()
         with caplog.at_level(logging.INFO, logger="vorflow"):
             MeshGenerator(background_lc=10, verbosity=0).generate(*model)
         assert not [r for r in caplog.records if r.levelno == logging.INFO]
