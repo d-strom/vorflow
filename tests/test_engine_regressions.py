@@ -341,7 +341,11 @@ def test_dedup_keeps_renumbered_curves_in_the_feature_map():
     finally:
         mg._finalize_gmsh()
     clean_river = lines.geometry.iloc[0]
-    assert max(clean_river.distance(c) for c in centres) < 1e-6
+    crossing = clean_river.intersection(lines.geometry.iloc[1])
+    off_river = [c for c in centres if clean_river.distance(c) > 1e-6]
+    # Only the two segments bent onto the fault's straddle pair leave the river.
+    assert len(off_river) == 2
+    assert all(crossing.distance(c) < 2.0 for c in off_river)
     # Only the trim either side of the barrier is missing.
     assert total_length == pytest.approx(clean_river.length, abs=2.0)
 
@@ -429,3 +433,52 @@ def test_oblique_barrier_end_pairs_stay_inside_the_domain(domain_key):
     assert not any(_face_crosses(face, part) for face in faces for part in barriers)
     # The end pairs' bisector reaches the boundary, so no cell needs a mirror.
     assert vt.n_barrier_mirrors == 0
+
+
+def _crossing_model(angle, offset):
+    """A lc-2 line crossing a vertical lc-2 barrier at (50, 50.7), ``angle`` degrees from it.
+
+    The crossing lies between two of the barrier's uniformly spaced pairs;
+    ``offset`` shifts the line's densified vertices along it, so the
+    crossing also falls between two of those.
+    """
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 100, 100), zone_id=1)
+    barrier = LineString([(50, 0), (50, 100)])
+    cm.add_line(barrier, line_id="barrier", resolution=2.0, is_barrier=True)
+    direction = np.array([np.sin(np.radians(angle)), np.cos(np.radians(angle))])
+    centre = np.array([50.0, 50.7])
+    cm.add_line(LineString([centre - (30 + offset) * direction, centre + 30 * direction]),
+                line_id="line", resolution=2.0)
+    return cm, barrier
+
+
+@pytest.mark.parametrize("angle, offset", [(90, 1.0), (30, 0.5)])
+def test_line_crossing_a_barrier_ends_on_its_straddle_pair(angle, offset):
+    # A line crossing a barrier was trimmed back by the barrier corridor, so
+    # its end nodes sat at an arbitrary offset from the nearest straddle pair,
+    # squeezed the cells there and needed 0-4 tessellator mirror cells. The
+    # crossing now carries a straddle pair and the line ends on it. Over
+    # 20-90 degree crossings and four vertex offsets of this model, the worst
+    # cell within 4 m of the crossing has compactness 0.69-0.79 (before
+    # 0.47-0.76; 0.47 for the 30 degree case here), so 0.65 leaves margin.
+    from vorflow import VoronoiTessellator
+    from vorflow.utils import build_connectivity
+
+    cm, barrier = _crossing_model(angle, offset)
+    mg = MeshGenerator(background_lc=10.0, verbosity=0)
+    assert mg.generate(*cm.generate())
+    assert mg.diagnostics["embedding"]["unmatched_tags"] == []
+    # The pair at the crossing is also the line's last node on each side.
+    for x in (49.6, 50.4):
+        assert np.hypot(mg.nodes[:, 0] - x, mg.nodes[:, 1] - 50.7).min() < 1e-9
+
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+    faces = build_connectivity(grid, center="generator").geometry
+    assert int(faces.crosses(barrier).sum()) == 0
+    assert vt.n_barrier_mirrors == 0
+
+    near = np.hypot(grid.x - 50.0, grid.y - 50.7) < 4.0
+    compactness = 4 * np.pi * grid.geometry.area / grid.geometry.length ** 2
+    assert compactness[near].min() > 0.65

@@ -4,10 +4,12 @@ Geometry transfer (``MeshGenerator._build_occ_model``) runs in a fixed order,
 because the order in which OCC entities are created determines their tags:
 
 1. point features;
-2. protection corridors, the barrier zone and quad-buffer plans (pure
-   geometry, see ``vorflow.buffer``);
+2. protection corridors, the barrier zone, quad-buffer plans and the
+   straddle pairs fixed where standard lines cross barriers (pure geometry,
+   see ``vorflow.buffer`` and ``vorflow._straddle``);
 3. lines: quad-buffer strip surfaces, straddle point pairs for barrier and
-   straddle lines, or plain curves trimmed off the barrier zone;
+   straddle lines, plain curves trimmed off the barrier zone, or, for a line
+   crossing a barrier, curves that end on the barrier's straddle pairs;
 4. polygons: quad-buffer bands first, then every embedded polygon minus the
    buffer footprints; field-only (embed=False) polygons are deferred;
 5. ``fragment`` + ``removeAllDuplicates`` (+ optional ``healShapes``), with
@@ -45,6 +47,13 @@ from .fields import (
 )
 from ._log import current_verbosity, verbosity_scope
 from . import buffer
+from ._straddle import (
+    _straddle_distances,
+    _straddle_pair,
+    plan_barrier_crossings,
+    straddle_epsilon,
+    straddle_probe,
+)
 from ._features import (
     feature_lc,
     is_embedded,
@@ -57,90 +66,6 @@ from ._features import (
 
 logger = logging.getLogger(__name__)
 
-
-
-def _unit_tangent(line, d, probe):
-    """Unit tangent of ``line`` at distance ``d`` along it.
-
-    The direction is estimated from a short chord of length ``probe``. The
-    caller chooses ``probe`` proportional to the line length so the estimate
-    is CRS-unit independent (a fixed absolute step would span whole features
-    on short lines and blunt corners on curved ones).
-    """
-    length = line.length
-    if d >= length - probe:
-        p1 = line.interpolate(max(d - probe, 0.0))
-        p2 = line.interpolate(d)
-    else:
-        p1 = line.interpolate(d)
-        p2 = line.interpolate(d + probe)
-    dx, dy = p2.x - p1.x, p2.y - p1.y
-    mag = math.hypot(dx, dy)
-    if mag == 0:
-        # Degenerate (zero-length) input: any unit vector keeps the straddle
-        # pair perpendicular and non-coincident.
-        return 1.0, 0.0
-    return dx / mag, dy / mag
-
-
-def _straddle_pair(line, d, epsilon, probe):
-    """The two straddle points at distance ``d`` along ``line``, +/-``epsilon`` along its normal."""
-    p = line.interpolate(d)
-    dx, dy = _unit_tangent(line, d, probe)
-    nx, ny = -dy, dx
-    return [(p.x + sign * nx * epsilon, p.y + sign * ny * epsilon) for sign in (1.0, -1.0)]
-
-
-def _end_pair_slide(line, at_end, epsilon, probe, domain, limit, tol):
-    """Distance to move an end pair inward along the line so both points lie in ``domain``.
-
-    Each point of the pair moves parallel to the line, so the pair stays
-    mirror-symmetric about it. The slide stops where the last point to enter
-    reaches the domain boundary; 0 if both already lie inside, None if one
-    does not enter within ``limit``.
-    """
-    d = line.length if at_end else 0.0
-    dx, dy = _unit_tangent(line, d, probe)
-    if at_end:
-        dx, dy = -dx, -dy
-    slide = 0.0
-    for x, y in _straddle_pair(line, d, epsilon, probe):
-        if shapely.dwithin(domain, Point(x, y), tol):
-            continue
-        path = shapely.LineString([(x, y), (x + dx * limit, y + dy * limit)])
-        entered = path.intersection(domain)
-        if entered.is_empty:
-            return None
-        entry = min(path.project(Point(c)) for c in shapely.get_coordinates(entered))
-        slide = max(slide, float(entry))
-    return slide
-
-
-def _straddle_distances(line, lc, epsilon, probe, domain, tol):
-    """Distances along ``line`` of its straddle pairs, with end pairs slid inside ``domain``.
-
-    Pairs are spaced about ``lc`` apart and include both endpoints. Where a
-    line meets the domain boundary obliquely, a pair at the endpoint has one
-    point outside; that pair moves inward along the line (see
-    _end_pair_slide) and interior pairs it comes within half a spacing of are
-    dropped. Without a domain the distances are returned unchanged.
-    """
-    length = line.length
-    num_segments = int(max(1, np.ceil(length / lc)))
-    distances = np.linspace(0, length, num_segments + 1)
-    if domain is None:
-        return distances
-    spacing = length / num_segments
-    start = _end_pair_slide(line, False, epsilon, probe, domain, length / 2.0, tol)
-    end = _end_pair_slide(line, True, epsilon, probe, domain, length / 2.0, tol)
-    lo = 0.0 if start is None else start + spacing / 2.0
-    hi = length if end is None else length - end - spacing / 2.0
-    positions = [] if start is None else [start]
-    positions += [d for d in distances[1:-1] if lo < d < hi]
-    # On a short line the two slid end pairs can meet; keep only the first.
-    if end is not None and (not positions or length - end - positions[-1] >= spacing / 2.0):
-        positions.append(length - end)
-    return np.array(positions)
 
 
 def _to_key(dim, tag):
@@ -1364,9 +1289,15 @@ class MeshGenerator:
         barrier_zone = self._build_barrier_zone(corridors)
         plans = buffer.plan_quad_buffers(polygons_gdf, lines_gdf, self.background_lc, domain)
         crossings = buffer.find_all_crossings(plans)
+        straddle_plan = plan_barrier_crossings(
+            lines_gdf, self.background_lc, domain, barrier_zone,
+            lambda b_idx: buffer.barrier_zone(
+                {k: v for k, v in corridors.items() if k != ('line', b_idx)}
+            ),
+        )
 
         line_strips = self._add_line_features(
-            lines_gdf, inventory, plans, corridors, barrier_zone, domain
+            lines_gdf, inventory, plans, corridors, barrier_zone, domain, straddle_plan
         )
         self._add_polygon_features(
             polygons_gdf, inventory, plans, corridors, domain, line_strips
@@ -1418,8 +1349,16 @@ class MeshGenerator:
             logger.info(f"Constructed Barrier Zone from {len(corridors)} protected features.")
         return zone
 
-    def _add_line_features(self, lines_gdf, inventory, plans, corridors, barrier_zone, domain):
-        """Add each line as a quad buffer, straddle point pairs or plain curves; returns the strip footprints."""
+    def _add_line_features(self, lines_gdf, inventory, plans, corridors, barrier_zone, domain,
+                           straddle_plan=None):
+        """Add each line as a quad buffer, straddle point pairs or plain curves; returns the strip footprints.
+
+        ``straddle_plan`` (see _straddle.plan_barrier_crossings) fixes the
+        straddle pairs at crossings of standard lines and gives those lines
+        the geometry that ends on them.
+        """
+        fixed = straddle_plan.fixed if straddle_plan is not None else {}
+        line_parts = straddle_plan.line_parts if straddle_plan is not None else {}
         line_strips = []
         for idx, row in lines_gdf.iterrows():
             is_barrier = row_bool(row, 'is_barrier', False)
@@ -1433,8 +1372,17 @@ class MeshGenerator:
                 ))
             elif is_barrier or straddle is not None:
                 self._add_straddle_points(
-                    idx, row.geometry, lc, straddle, embedded, inventory, domain
+                    idx, row.geometry, lc, straddle, embedded, inventory, domain,
+                    fixed=fixed.get(int(idx)),
                 )
+            elif int(idx) in line_parts:
+                if self._verbosity > 1:
+                    new_len = sum(part.length for part in line_parts[int(idx)])
+                    logger.info(f"  Line {idx} ends on barrier straddle pairs "
+                                f"(Len: {row.geometry.length:.2f} -> {new_len:.2f})")
+                for part in line_parts[int(idx)]:
+                    if part.length >= 1e-6:
+                        self._add_polyline(idx, part, embedded, inventory)
             else:
                 self._add_standard_line(idx, row.geometry, embedded, barrier_zone, inventory)
         return line_strips
@@ -1471,24 +1419,29 @@ class MeshGenerator:
             logger.warning(f"Warning: Structured buffer requested for line {idx}, but no buffer surface was created.")
         return strips
 
-    def _add_straddle_points(self, idx, line, lc, straddle, embedded, inventory, domain=None):
+    def _add_straddle_points(self, idx, line, lc, straddle, embedded, inventory, domain=None,
+                             fixed=None):
         """Place point pairs at +/-eps along a barrier/straddle line so Voronoi edges follow it.
 
         The line itself is not added; the pairs become mesh nodes whose
         Voronoi edges trace the original line. For an embedded line, every
         point is kept inside ``domain``: end pairs on an oblique boundary
         slide inward (see _straddle_distances) and any other point outside
-        the domain is dropped, since no surface could embed it.
+        the domain is dropped, since no surface could embed it. ``fixed``
+        maps distances along the line to pairs placed exactly there (at
+        crossings of standard lines, whose nodes they share; OCC dedup
+        merges the coincident points).
         """
-        length = line.length
-        epsilon = straddle / 2.0 if straddle else lc * 0.20
+        fixed = fixed or {}
+        epsilon = straddle_epsilon(lc, straddle)
         # Tangent probe proportional to line length so the offsets work for
         # any CRS units and for lines shorter than a fixed step.
-        probe = max(length * 1e-4, 1e-12)
+        probe = straddle_probe(line)
         clip = domain if embedded else None
         tol = epsilon * 1e-6
-        distances = _straddle_distances(line, lc, epsilon, probe, clip, tol)
-        coords = [xy for d in distances for xy in _straddle_pair(line, d, epsilon, probe)]
+        distances = _straddle_distances(line, lc, epsilon, probe, clip, tol, anchors=list(fixed))
+        coords = [xy for d in distances
+                  for xy in (fixed[d] if d in fixed else _straddle_pair(line, d, epsilon, probe))]
         if clip is not None and coords:
             coords = self._clip_straddle_points(idx, coords, clip, tol)
         for x, y in coords:

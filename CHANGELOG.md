@@ -20,6 +20,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A standard line crossing a barrier (or straddle) line now ends exactly on a
+  straddle pair placed at the crossing, instead of being trimmed back by the
+  barrier corridor with its end nodes at an arbitrary offset from the nearest
+  pair. The other pairs are spaced evenly between crossings and barrier ends.
+  The pair stays perpendicular to the barrier and the line bends onto it; on
+  an oblique crossing the line's nodes nearest the barrier are placed one
+  cell apart and mirrored across it, so the barrier cells stay symmetric.
+  Within 4 m of the river x fault crossing of the holed 200 x 200 example
+  model the worst cell compactness rises from 0.68 to 0.74 and no barrier
+  mirror cells are needed (4 before). A line T-junction that ends inside the barrier corridor
+  also ends on a pair. Crossings within half a barrier cell of a barrier end
+  or of another crossing keep the old trimming. Grids without such
+  crossings are unchanged.
 - Cells that straddle a barrier now get a mirror generator across the line
   instead of a centroid-centred fragment, so every face stays a Voronoi
   bisector and MODFLOW 6 connections stay orthogonal. On a fault crossed by a

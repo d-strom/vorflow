@@ -13,8 +13,15 @@ import numpy as np
 import pytest
 from shapely.geometry import Polygon, LineString, Point, box
 
+from vorflow import buffer
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator, _straddle_distances, _straddle_pair, _unit_tangent
+from vorflow._straddle import (
+    _straddle_distances,
+    _straddle_pair,
+    _unit_tangent,
+    plan_barrier_crossings,
+)
+from vorflow.engine import MeshGenerator
 from vorflow.tessellator import VoronoiTessellator
 
 
@@ -271,3 +278,70 @@ class TestStraddleDistances:
             # One point lands on the boundary; the pair's bisector stays on the line.
             assert min(domain.exterior.distance(p) for p in points) < 1e-9
             assert line.distance(Point(np.mean(pair, axis=0))) < 1e-9
+
+    def test_anchors_are_kept_and_each_gap_is_split_evenly(self):
+        line = LineString([(10, 0), (10, 10)])
+        probe = line.length * 1e-4
+        distances = _straddle_distances(line, self.LC, self.EPS, probe, box(0, 0, 20, 10),
+                                        self.EPS * 1e-6, anchors=[3.3])
+        # 3.3 in two steps, the remaining 6.7 in four.
+        assert distances == pytest.approx([0, 1.65, 3.3, 4.975, 6.65, 8.325, 10])
+
+
+def _crossing_plan(line, barrier=LineString([(50, 0), (50, 100)])):
+    """plan_barrier_crossings for a lc-2 line and a lc-2 barrier in a 100 x 100 domain."""
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 100, 100), zone_id=1)
+    cm.add_line(barrier, line_id="barrier", resolution=2.0, is_barrier=True)
+    cm.add_line(line, line_id="line", resolution=2.0)
+    polys, lines, _ = cm.generate()
+    corridors = buffer.protected_corridors(polys, lines, 10.0)
+    plan = plan_barrier_crossings(
+        lines, 10.0, buffer.domain_union_geometry(polys), buffer.barrier_zone(corridors),
+        lambda b_idx: None,
+    )
+    return plan, lines
+
+
+class TestBarrierCrossingPlan:
+    """A line crossing a barrier gets a straddle pair at the crossing and ends on it."""
+
+    def test_perpendicular_crossing_line_ends_on_the_anchor_pair(self):
+        plan, _ = _crossing_plan(LineString([(0, 50.7), (100, 50.7)]))
+        assert list(plan.fixed) == [0]
+        (distance, pair), = plan.fixed[0].items()
+        assert distance == pytest.approx(50.7)
+        assert sorted(pair) == [pytest.approx((49.6, 50.7)), pytest.approx((50.4, 50.7))]
+        ends = sorted(xy for part in plan.line_parts[1] for xy in (part.coords[0], part.coords[-1])
+                      if abs(xy[0] - 50) < 1)
+        assert ends == sorted(pair)
+        # The next node along the line is one cell away from the pair point.
+        for part in plan.line_parts[1]:
+            coords = list(part.coords)
+            end, nxt = (coords[-1], coords[-2]) if abs(coords[-1][0] - 50) < 1 else (coords[0], coords[1])
+            assert np.hypot(end[0] - nxt[0], end[1] - nxt[1]) == pytest.approx(2.0)
+
+    def test_oblique_crossing_mirrors_the_line_nodes_near_the_barrier(self):
+        angle = np.radians(30)
+        direction = np.array([np.sin(angle), np.cos(angle)])
+        plan, _ = _crossing_plan(LineString([(50, 50) - 60 * direction, (50, 50) + 60 * direction]))
+        fixed = plan.fixed[0]
+        anchor = fixed[min(fixed, key=lambda d: abs(d - 50))]
+        # The anchor pair stays perpendicular to the barrier.
+        assert sorted(anchor) == [pytest.approx((49.6, 50)), pytest.approx((50.4, 50))]
+        mirrored = [pair for d, pair in fixed.items() if abs(d - 50) > 1e-9]
+        assert len(mirrored) >= 2
+        line_nodes = {xy for part in plan.line_parts[1] for xy in part.coords}
+        for (x0, y0), (x1, y1) in mirrored:
+            # Each is a line node and its reflection across the barrier.
+            assert y0 == pytest.approx(y1) and x0 + x1 == pytest.approx(100.0)
+            assert ((x0, y0) in line_nodes) != ((x1, y1) in line_nodes)
+
+    def test_crossing_near_a_barrier_end_is_trimmed_as_before(self):
+        plan, _ = _crossing_plan(LineString([(0, 20.5), (100, 20.5)]),
+                                 barrier=LineString([(50, 20), (50, 100)]))
+        assert plan.fixed == {} and plan.line_parts == {}
+
+    def test_lines_without_crossings_are_left_out_of_the_plan(self):
+        plan, _ = _crossing_plan(LineString([(0, 50), (40, 50)]))
+        assert plan.fixed == {} and plan.line_parts == {}
