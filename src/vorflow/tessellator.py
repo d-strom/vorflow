@@ -514,7 +514,14 @@ class VoronoiTessellator:
             )
             return gpd.GeoDataFrame()
 
-        vor = Voronoi(nodes)
+        # Qhull loses precision on coordinates with a large offset relative
+        # to their extent (e.g. UTM northings around a small domain) and
+        # returns overlapping cells, so build the diagram about the bbox
+        # centre and shift the vertices back afterwards.
+        nodes = np.asarray(nodes, dtype=float)
+        origin = (nodes.min(axis=0) + nodes.max(axis=0)) / 2.0
+        vor = Voronoi(nodes - origin)
+        vertices = vor.vertices + origin
         polygons = []
         ids = []
         gen_x = []
@@ -526,7 +533,7 @@ class VoronoiTessellator:
             if not region or -1 in region:
                 continue
             
-            verts = vor.vertices[region]
+            verts = vertices[region]
             poly = Polygon(verts)
             
             if poly.is_valid:

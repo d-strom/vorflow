@@ -112,6 +112,28 @@ def test_lattice_grid_has_no_zero_length_edges(boundary_centering):
     assert unary_union(grid.geometry).area == pytest.approx(4.0, rel=1e-12)
 
 
+@pytest.mark.parametrize("offset", [(5e5, 5e6), (5e6, 5e6)])
+def test_offset_lattice_cells_do_not_overlap(offset):
+    """Catches Qhull precision loss on large coordinate offsets (UTM-like).
+
+    Without re-centring the generators before Voronoi, the 64 cells of this
+    2 x 2 m domain have an area sum of 15.8 at (5e5, 5e6) and 24.1 at
+    (5e6, 5e6) while their union is 4.0.
+    """
+    x0, y0 = offset
+    cm = ConceptualMesh(crs="EPSG:32610")
+    square = Polygon([(x0, y0), (x0 + 2, y0), (x0 + 2, y0 + 2), (x0, y0 + 2)])
+    cm.add_polygon(square, zone_id=1, densify=0.5)
+    clean_polys, _, _ = cm.generate()
+    mesh_gen = FakeMeshGenerator(clean_polys, spacing=0.3)
+
+    grid = VoronoiTessellator(mesh_gen, cm).generate()
+
+    domain_area = unary_union(clean_polys.geometry).area
+    assert grid.geometry.area.sum() == pytest.approx(domain_area, rel=1e-9)
+    assert grid.geometry.area.sum() == pytest.approx(unary_union(grid.geometry).area, rel=1e-9)
+
+
 def test_pipeline_reports_empty_when_no_domain():
     cm = ConceptualMesh()
     tessellator = VoronoiTessellator(EmptyMeshGenerator(), cm, clip_to_boundary=True)
