@@ -378,3 +378,54 @@ def test_nonconforming_line_fragment_is_not_embedded(monkeypatch):
     embedding = mg.diagnostics["embedding"]
     assert embedding["nonconforming_skip"] > 0
     assert embedding["ok"] == 0
+
+
+def _face_crosses(face, line, tol=1e-6):
+    """True if a face crosses ``line`` (touching it or lying on it does not count)."""
+    # Faces on an oblique barrier lie on it only to round-off, so
+    # face.crosses(line) flags most of them; require both ends off the line.
+    ends = [Point(face.coords[0]), Point(face.coords[-1])]
+    return face.intersects(line) and all(line.distance(p) > tol for p in ends)
+
+
+OBLIQUE_BARRIER_DOMAINS = {
+    # 60 degrees to the boundary at both ends, as in benchmark case v4_barrier.
+    "outer_boundary": (box(0, 0, 200, 100), LineString([(128.87, 0), (71.13, 100)])),
+    # Clipping splits the line at a hole whose edges it meets obliquely.
+    "hole_edge": (
+        Polygon(box(0, 0, 200, 100).exterior.coords,
+                [[(80, 40), (120, 30), (130, 70), (90, 80)]]),
+        LineString([(40, 0), (160, 100)]),
+    ),
+}
+
+
+@pytest.mark.parametrize("domain_key", OBLIQUE_BARRIER_DOMAINS)
+def test_oblique_barrier_end_pairs_stay_inside_the_domain(domain_key):
+    # A barrier meeting a boundary obliquely put one straddle point of each
+    # end pair outside the domain: no surface embedded it, its node was not a
+    # triangle vertex, and the boundary cell around the end straddled the line.
+    from vorflow import VoronoiTessellator
+    from vorflow.utils import build_connectivity
+
+    domain, line = OBLIQUE_BARRIER_DOMAINS[domain_key]
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1)
+    cm.add_line(line, line_id="barrier", resolution=2.0, is_barrier=True)
+    polys, lines, points = cm.generate()
+    mg = MeshGenerator(background_lc=10.0, verbosity=0)
+    assert mg.generate(polys, lines, points)
+    assert mg.diagnostics["embedding"]["unmatched_tags"] == []
+
+    vertices = {tuple(xy) for geom in mg.get_element_grid().geometry
+                for xy in np.round(geom.exterior.coords, 9)}
+    free_nodes = [xy for xy in np.round(mg.nodes, 9) if tuple(xy) not in vertices]
+    assert free_nodes == []
+
+    vt = VoronoiTessellator(mg, cm)
+    grid = vt.generate()
+    faces = build_connectivity(grid, center="generator").geometry
+    barriers = list(lines.geometry)
+    assert not any(_face_crosses(face, part) for face in faces for part in barriers)
+    # The end pairs' bisector reaches the boundary, so no cell needs a mirror.
+    assert vt.n_barrier_mirrors == 0

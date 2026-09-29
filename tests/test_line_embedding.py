@@ -9,11 +9,12 @@ the triangular mesh when polygons were also present. Root causes:
      were re-embedded into their own surface, corrupting the mesh.
 """
 
+import numpy as np
 import pytest
-from shapely.geometry import Polygon, LineString, Point
+from shapely.geometry import Polygon, LineString, Point, box
 
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator, _unit_tangent
+from vorflow.engine import MeshGenerator, _straddle_distances, _straddle_pair, _unit_tangent
 from vorflow.tessellator import VoronoiTessellator
 
 
@@ -234,3 +235,39 @@ class TestUnitTangent:
         line = LineString([(2, 2), (2, 2)])
         dx, dy = _unit_tangent(line, 0.0, 1e-12)
         assert dx * dx + dy * dy == pytest.approx(1.0)
+
+
+class TestStraddleDistances:
+    """Straddle pairs stay inside the domain where a barrier ends on its boundary."""
+
+    LC, EPS = 2.0, 0.4
+
+    def _pairs(self, line, domain):
+        probe = line.length * 1e-4
+        distances = _straddle_distances(line, self.LC, self.EPS, probe, domain, self.EPS * 1e-6)
+        return distances, [_straddle_pair(line, d, self.EPS, probe) for d in distances]
+
+    def test_perpendicular_end_pairs_are_unchanged(self):
+        line = LineString([(10, 0), (10, 10)])
+        distances, _ = self._pairs(line, box(0, 0, 20, 10))
+        assert distances == pytest.approx(np.linspace(0, 10, 6))
+
+    def test_without_domain_pairs_include_both_endpoints(self):
+        line = LineString([(10, 0), (4, 10)])
+        distances, _ = self._pairs(line, None)
+        assert distances[0] == 0.0 and distances[-1] == pytest.approx(line.length)
+
+    def test_oblique_end_pairs_slide_until_both_points_are_inside(self):
+        domain = box(0, 0, 20, 10)
+        line = LineString([(12.887, 0), (7.113, 10)])  # 60 degrees to the boundary
+        distances, pairs = self._pairs(line, domain)
+        # The slide is epsilon / tan(60 deg) at each end.
+        slide = self.EPS / np.tan(np.radians(60))
+        assert distances[0] == pytest.approx(slide, rel=1e-3)
+        assert line.length - distances[-1] == pytest.approx(slide, rel=1e-3)
+        for pair in (pairs[0], pairs[-1]):
+            points = [Point(xy) for xy in pair]
+            assert all(domain.buffer(1e-9).covers(p) for p in points)
+            # One point lands on the boundary; the pair's bisector stays on the line.
+            assert min(domain.exterior.distance(p) for p in points) < 1e-9
+            assert line.distance(Point(np.mean(pair, axis=0))) < 1e-9

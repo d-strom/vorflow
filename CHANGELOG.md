@@ -59,6 +59,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Points and line fragments that no domain surface contains are now reported
   with a warning, and listed in `diagnostics['embedding']['unmatched_tags']`,
   instead of being skipped silently.
+- Barrier and straddle lines that end on a domain or hole boundary at an
+  oblique angle no longer put one straddle point of the end pair outside the
+  domain, where no surface embedded it and its node was not a triangle
+  vertex. The end pair now slides inward along the line until its outer point
+  lies on the boundary, so the pair's bisector still runs along the line to
+  the boundary. Interior pairs it comes within half a spacing of, and any
+  other straddle point outside the domain, are dropped. On benchmark case
+  v4_barrier (30 degrees to the grid axes) this removes the two unmatched
+  points and both barrier mirrors, and each end has two cells of 10 and 18
+  m² instead of about 2 m². Pairs at perpendicular ends are unchanged, as are
+  the example notebooks' grids. Below about 24 degrees between line and
+  boundary, a boundary node still lies nearer the end than the slid pair, and
+  its cell is split with a mirror.
 
 ## [0.1.0rc1]
 
