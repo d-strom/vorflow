@@ -6,7 +6,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import LineString, MultiLineString, Point, box
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
 
 from vorflow import buffer
 from vorflow._features import (
@@ -17,6 +17,7 @@ from vorflow._features import (
     positive_number,
     row_bool,
     sanitize_coords,
+    unpinch_polygons,
 )
 
 
@@ -68,6 +69,37 @@ def test_sanitize_coords_drops_duplicates_and_closing_point():
     ring = [(0, 0), (0, 0), (1, 0), (1, 1), (float("nan"), 2), (0, 0)]
     assert sanitize_coords(ring, require_closed=True, min_points=3) == [(0, 0), (1, 0), (1, 1)]
     assert sanitize_coords([(0, 0), (0, 0)], min_points=2) == []
+
+
+def test_unpinch_polygons_turns_a_near_touching_notch_into_a_touching_hole():
+    # The ring visits (5, 0) twice, 1e-13 apart: simple to GEOS, pinched to OCC.
+    ring = [(0, 0), (5, 0), (4, 3), (6, 3), (5 + 1e-13, 0), (10, 0), (10, 10), (0, 10)]
+    pinched = Polygon(ring)
+    assert pinched.is_valid and pinched.exterior.is_simple
+
+    parts = polygon_parts(unpinch_polygons(pinched, 1e-5))
+    assert len(parts) == 1
+    assert len(parts[0].interiors) == 1
+    assert parts[0].is_valid
+    assert parts[0].area == pytest.approx(pinched.area)
+
+
+def test_unpinch_polygons_splits_a_near_touching_figure_eight():
+    ring = [(0, 0), (1, 0), (1, 1), (2, 1), (2, 2), (1, 2), (1, 1 + 1e-13), (0, 1)]
+    pinched = Polygon(ring)
+    assert pinched.is_valid
+
+    parts = polygon_parts(unpinch_polygons(pinched, 1e-5))
+    assert sorted(p.area for p in parts) == pytest.approx([1.0, 1.0])
+    assert all(not p.interiors for p in parts)
+
+
+def test_unpinch_polygons_leaves_clean_geometry_untouched():
+    # Close consecutive vertices are sanitize_coords' job, not a pinch.
+    poly = Polygon([(0, 0), (1, 0), (1 + 1e-7, 0), (1, 1), (0, 1)])
+    multi = box(0, 0, 1, 1).union(box(1 + 1e-7, 0, 2, 1))
+    assert unpinch_polygons(poly, 1e-5) is poly
+    assert unpinch_polygons(multi, 1e-5) is multi
 
 
 def test_part_helpers_flatten_collections():
