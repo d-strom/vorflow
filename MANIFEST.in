@@ -1,0 +1,6 @@
+prune .conda
+prune benchmarks
+prune docs
+global-exclude *.code-workspace
+global-exclude __pycache__
+global-exclude *.py[cod]

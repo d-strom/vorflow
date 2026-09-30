@@ -1,4 +1,60 @@
+from __future__ import annotations
+
+import logging
 import math
+import operator
+import warnings
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_GROWTH_FACTOR = 1.2
+_GROWTH_MODELS = {"edge_ratio", "continuous_metric"}
+
+
+def _positive_finite(value, name):
+    """Return ``value`` as a positive finite float or raise a clear error."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive finite number. Got {value!r}.") from exc
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be a positive finite number. Got {value!r}.")
+    return value
+
+
+def _positive_integer(value, name):
+    """Return ``value`` as a positive integer without silently truncating it."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer. Got {value!r}.")
+    try:
+        value = operator.index(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must be a positive integer. Got {value!r}.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer. Got {value!r}.")
+    return int(value)
+
+
+def _growth_gradient(growth_factor, growth_model):
+    """Convert an adjacent-size growth factor to a spatial size gradient."""
+    try:
+        growth_factor = float(growth_factor)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"growth_factor must be a finite number greater than 1.0. Got {growth_factor!r}."
+        ) from exc
+    if not math.isfinite(growth_factor) or growth_factor <= 1.0:
+        raise ValueError(
+            f"growth_factor must be a finite number greater than 1.0. Got {growth_factor!r}."
+        )
+    if not isinstance(growth_model, str) or growth_model not in _GROWTH_MODELS:
+        choices = ", ".join(sorted(_GROWTH_MODELS))
+        raise ValueError(f"growth_model must be one of: {choices}. Got {growth_model!r}.")
+    if growth_model == "edge_ratio":
+        return growth_factor, growth_factor - 1.0
+    return growth_factor, math.log(growth_factor)
+
 
 class MeshField:
     """
@@ -27,7 +83,13 @@ class MeshField:
 
 
 class DistanceField(MeshField):
-    """Creates a Gmsh Distance field from points/lines/surfaces tags."""
+    """Creates a Gmsh Distance field from points/lines/surfaces tags.
+
+    Internal — not part of the public API. This is a raw building block
+    (distance-to-feature, not a mesh size) combined by the size fields via
+    _distance_tags_for_growth(). Its create() signature differs from
+    MeshField's, so it cannot be passed as a user field via ``fields=``.
+    """
 
     def __init__(self, include_surfaces=True, sampling=20):
         self.include_surfaces = bool(include_surfaces)
@@ -111,11 +173,10 @@ def _distance_tags_for_growth(gmsh_api, tags_dict, sampling):
     # If no boundary curves could be recovered, fall back to the old surface
     # distance behavior instead of dropping the field.
     if polygon_surfaces and not boundary_curves:
-        if int(tags_dict.get("_verbosity", 0)) > 0:
-            print(
-                "Warning: could not recover boundary curves for a polygon size "
-                "field; falling back to surface-distance growth."
-            )
+        logger.warning(
+            "Warning: could not recover boundary curves for a polygon size "
+            "field; falling back to surface-distance growth."
+        )
         growth_tags["surfaces"].extend(polygon_surfaces)
 
     return DistanceField(include_surfaces=True, sampling=sampling).create(
@@ -158,9 +219,12 @@ def _combine_with_polygon_surface_constant(
 # --- Manual Fields ---
 
 class ConstantField(MeshField):
-    """Public/manual constant field.
+    """Internal — not part of the public API.
 
-    Polygon interior constants are handled by the internal
+    Used by the engine to set the global background size (which users control
+    through ``background_lc``). Not useful as a per-feature field: create()
+    ignores ``tags_dict``, so it cannot scope a size to a feature. Polygon
+    interior constants are handled by the internal
     _polygon_surface_constant() helper because they need SurfacesList scoping
     and are combined with a growth field.
     """
@@ -182,7 +246,7 @@ class ThresholdField(MeshField):
         self.dist_max = float(dist_max)
         self.size_max = float(size_max) if size_max is not None else None
         self.sampling = int(sampling)
-    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None, constant_in=False):
+    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
         # 1. Distance field for growth away from features. For polygon
         # surfaces, use boundary curves for growth and add a spatial constant
         # field below so the polygon interior remains flat.
@@ -205,21 +269,38 @@ class ThresholdField(MeshField):
         )
 
 class ExponentialField(MeshField):
+    """Exponential transition controlled by a physical decay length.
+
+    The field is ``H - (H - size_min) * exp(-d / decay_length)``. Its maximum
+    gradient occurs at the feature and equals ``(H - size_min) / decay_length``.
+    To keep that gradient below an edge-ratio bound ``r - 1``, choose
+    ``decay_length >= (H - size_min) / (r - 1)``.
+    """
+
     def __init__(self, size_min, decay_length, size_max=None, sampling=20):
-        self.size_min = float(size_min)
-        self.decay_length = float(decay_length)
-        self.size_max = float(size_max) if size_max is not None else None
-        self.sampling = int(sampling)
+        self.size_min = _positive_finite(size_min, "size_min")
+        self.decay_length = _positive_finite(decay_length, "decay_length")
+        self.size_max = (
+            _positive_finite(size_max, "size_max") if size_max is not None else None
+        )
+        if self.size_max is not None and self.size_max < self.size_min:
+            raise ValueError("size_max must be greater than or equal to size_min.")
+        self.sampling = _positive_integer(sampling, "sampling")
 
     def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
+        background_lc = _positive_finite(background_lc, "background_lc")
+        s_max = self.size_max if self.size_max is not None else background_lc
+        if s_max < self.size_min:
+            raise ValueError(
+                "background_lc must be greater than or equal to size_min when size_max is omitted."
+            )
+
         f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, self.sampling)
         if f_dist is None:
             return _combine_with_polygon_surface_constant(
                 gmsh_api, None, tags_dict, self.size_min, background_lc
             )
 
-        s_max = self.size_max if self.size_max else background_lc
-        
         f_math = gmsh_api.model.mesh.field.add("MathEval")
         expr = f"{s_max} - ({s_max} - {self.size_min}) * Exp(-F{f_dist} / {self.decay_length})"
         gmsh_api.model.mesh.field.setString(f_math, "F", expr)
@@ -227,58 +308,102 @@ class ExponentialField(MeshField):
             gmsh_api, f_math, tags_dict, self.size_min, background_lc
         )
 
-# --- Auto Fields ---
+# --- Automatic growth fields ---
 
-class AutoLinearField(MeshField):
-    def __init__(self, growth_factor=1.2, sampling=20):
-        self.fac = float(growth_factor)
-        self.sampling = int(sampling)
 
-    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
-        if feature_lc is None: return None
-        
-        cs = float(feature_lc)
-        cs_dom = float(background_lc)
-        fac = self.fac
+class GeometricGrowthField(MeshField):
+    """Grade target edge length away from a feature with a bounded gradient.
 
-        if fac <= 1.0: raise ValueError("Growth factor must be > 1.0")
-        if cs >= cs_dom: return None
+    ``growth_factor`` describes geometric characteristic-length growth by
+    element index. The Gmsh field is deliberately linear in physical distance:
 
-        # Calculate transition
-        min_trans_cells = math.log(cs_dom / cs) / math.log(fac)
-        min_trans_dist = cs * ((fac ** min_trans_cells) - 1) / math.log(fac)
-        
-        dist_min = cs / 2.0
-        dist_max = min_trans_dist / 2.0
+    - ``edge_ratio`` uses gradient ``growth_factor - 1``;
+    - ``continuous_metric`` uses gradient ``log(growth_factor)``.
 
-        # Delegate to ThresholdField logic
-        # We create a temporary ThresholdField to reuse its create logic
-        temp_field = ThresholdField(cs, dist_min, dist_max, cs_dom, sampling=self.sampling)
-        return temp_field.create(gmsh_api, tags_dict, background_lc)
+    Normal ``MeshGenerator`` use caps the result at ``background_lc`` through
+    the engine's global ``Min`` field. A direct low-level call to ``create()``
+    returns the uncapped growth field.
+    """
 
-class AutoExponentialField(MeshField):
-    def __init__(self, growth_factor=1.1):
-        self.fac = float(growth_factor)
+    def __init__(
+        self,
+        growth_factor=DEFAULT_GROWTH_FACTOR,
+        growth_model="edge_ratio",
+        sampling=20,
+    ):
+        self.growth_factor, self.gradient = _growth_gradient(
+            growth_factor, growth_model
+        )
+        self.growth_model = growth_model
+        self.sampling = _positive_integer(sampling, "sampling")
 
-    def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None, sampling=10):
-        if feature_lc is None: return None
-        
-        cs = float(feature_lc)
-        fac = self.fac
-        
-        if fac <= 1.0: raise ValueError("Growth factor must be > 1.0")
+    def create(
+        self,
+        gmsh_api,
+        tags_dict,
+        background_lc,
+        feature_lc=None,
+        sampling=None,
+    ):
+        if feature_lc is None:
+            return None
 
-        f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, int(sampling))
+        cs = _positive_finite(feature_lc, "feature_lc")
+        cs_dom = _positive_finite(background_lc, "background_lc")
+        if cs >= cs_dom:
+            return None
+
+        distance_sampling = (
+            self.sampling
+            if sampling is None
+            else _positive_integer(sampling, "sampling")
+        )
+
+        f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, distance_sampling)
         if f_dist is None:
             return _combine_with_polygon_surface_constant(
                 gmsh_api, None, tags_dict, cs, background_lc
             )
 
         f_math = gmsh_api.model.mesh.field.add("MathEval")
-        log_fac = math.log(fac)
-        expr = f"{cs} * {fac}^(Log(1 + F{f_dist} * 2 * {log_fac} / {cs}) / {log_fac})"
+        gradient = format(self.gradient, ".15g")
+        expr = f"{cs} + {gradient} * F{f_dist}"
 
         gmsh_api.model.mesh.field.setString(f_math, "F", expr)
         return _combine_with_polygon_surface_constant(
             gmsh_api, f_math, tags_dict, cs, background_lc
         )
+
+
+class AutoExponentialField(GeometricGrowthField):
+    """Deprecated compatibility name for :class:`GeometricGrowthField`."""
+
+    def __init__(
+        self,
+        growth_factor=DEFAULT_GROWTH_FACTOR,
+        growth_model="edge_ratio",
+        sampling=20,
+    ):
+        warnings.warn(
+            "AutoExponentialField is deprecated; use GeometricGrowthField instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(growth_factor, growth_model, sampling)
+
+
+class AutoLinearField(GeometricGrowthField):
+    """Deprecated compatibility name for :class:`GeometricGrowthField`."""
+
+    def __init__(
+        self,
+        growth_factor=DEFAULT_GROWTH_FACTOR,
+        sampling=20,
+        growth_model="edge_ratio",
+    ):
+        warnings.warn(
+            "AutoLinearField is deprecated; use GeometricGrowthField instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(growth_factor, growth_model, sampling)

@@ -7,21 +7,13 @@ returned gmsh_map, so that _embed_features and _setup_fields can find them.
 """
 import pytest
 import gmsh
-import geopandas as gpd
 from shapely.geometry import Point, Polygon, LineString
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.engine import MeshGenerator
 
+pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
-@pytest.fixture(autouse=True)
-def ensure_gmsh_finalized():
-    """Ensure gmsh is finalized before and after each test."""
-    if gmsh.is_initialized():
-        gmsh.finalize()
-    yield
-    if gmsh.is_initialized():
-        gmsh.finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +629,8 @@ class TestRawGmshPointBehavior:
         gmsh.model.add("test_dup_merge")
         occ = gmsh.model.occ
 
-        pt1 = occ.addPoint(5, 5, 0)
-        pt2 = occ.addPoint(5, 5, 0)
+        occ.addPoint(5, 5, 0)
+        occ.addPoint(5, 5, 0)
 
         pts_before = set(t for d, t in occ.getEntities(0))
         assert len(pts_before) == 2

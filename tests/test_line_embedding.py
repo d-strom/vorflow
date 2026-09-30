@@ -10,23 +10,12 @@ the triangular mesh when polygons were also present. Root causes:
 """
 
 import pytest
-import numpy as np
 from shapely.geometry import Polygon, LineString, Point
-import gmsh
 
 from vorflow.blueprint import ConceptualMesh
-from vorflow.engine import MeshGenerator
+from vorflow.engine import MeshGenerator, _unit_tangent
 from vorflow.tessellator import VoronoiTessellator
 
-
-@pytest.fixture(autouse=True)
-def ensure_gmsh_finalized():
-    """Ensure gmsh is finalized before and after each test."""
-    if gmsh.is_initialized():
-        gmsh.finalize()
-    yield
-    if gmsh.is_initialized():
-        gmsh.finalize()
 
 
 def _nodes_near_line(nodes, line, tolerance):
@@ -206,3 +195,42 @@ class TestLineEmbeddingWithPolygons:
             f"Area mismatch: {total_area:.1f} vs {expected_area:.1f} — "
             f"possible out-of-domain triangles"
         )
+
+
+class TestUnitTangent:
+    """Regression tests for the straddle-point tangent probe.
+
+    The old implementation used fixed absolute steps (0.01/0.001 CRS units),
+    which blended directions across corners of short lines and degenerated
+    on lines shorter than the step.
+    """
+
+    def test_straight_line_tangent(self):
+        line = LineString([(0, 0), (10, 0)])
+        probe = line.length * 1e-4
+        for d in (0.0, 5.0, 10.0):
+            dx, dy = _unit_tangent(line, d, probe)
+            assert (dx, dy) == pytest.approx((1.0, 0.0), abs=1e-9)
+
+    def test_bent_line_respects_local_direction(self):
+        # L-shape with legs much shorter than the old 0.01 fixed probe:
+        # tangent at the start must follow the first leg, at the end the
+        # second leg -- not the corner-cutting chord.
+        line = LineString([(0, 0), (0.005, 0), (0.005, 0.005)])
+        probe = line.length * 1e-4
+        dx, dy = _unit_tangent(line, 0.0, probe)
+        assert (dx, dy) == pytest.approx((1.0, 0.0), abs=1e-6)
+        dx, dy = _unit_tangent(line, line.length, probe)
+        assert (dx, dy) == pytest.approx((0.0, 1.0), abs=1e-6)
+
+    def test_tangent_is_unit_length_everywhere(self):
+        line = LineString([(0, 0), (3, 4), (10, 4)])
+        probe = line.length * 1e-4
+        for frac in (0.0, 0.2, 0.5, 0.8, 1.0):
+            dx, dy = _unit_tangent(line, line.length * frac, probe)
+            assert dx * dx + dy * dy == pytest.approx(1.0, abs=1e-12)
+
+    def test_degenerate_line_returns_unit_vector(self):
+        line = LineString([(2, 2), (2, 2)])
+        dx, dy = _unit_tangent(line, 0.0, 1e-12)
+        assert dx * dx + dy * dy == pytest.approx(1.0)

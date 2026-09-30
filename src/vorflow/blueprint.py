@@ -1,15 +1,36 @@
+from __future__ import annotations
+
+import logging
+import math
+import warnings
 import geopandas as gpd
 import pandas as pd
 import numpy as np
-from shapely.geometry import Polygon, LineString, Point, box, MultiPolygon
-from shapely.ops import unary_union, snap, linemerge
+from shapely.geometry import Polygon, LineString, MultiPolygon
+from shapely.ops import unary_union, snap
+from shapely.prepared import prep
 from shapely.validation import make_valid
-from .fields import ThresholdField, ExponentialField, AutoLinearField, AutoExponentialField, ConstantField
 from shapely.strtree import STRtree
+
+logger = logging.getLogger(__name__)
 
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
 DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+
+
+def _validate_growth_factor(value):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"growth_factor must be a number greater than 1.0 (or None). Got {value!r}."
+        )
+    if not math.isfinite(value):
+        raise ValueError(f"growth_factor must be finite. Got {value}.")
+    if value <= 1.0:
+        raise ValueError(f"growth_factor must be greater than 1.0. Got {value}.")
+    return float(value)
 
 def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance"):
     if isinstance(value, bool):
@@ -24,8 +45,36 @@ def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance
         raise ValueError(f"{parameter_name} must be non-negative. Got {value}.")
     return float(value)
 
+
+def _warn_if_geographic_crs(crs):
+    """Warn when the project CRS is geographic (lat/lon degrees).
+
+    Mesh sizes (resolution, background_lc, buffer thicknesses) are expressed
+    in CRS units, and MODFLOW needs real length units for cell areas and
+    conductances -- meshing in degrees is almost certainly a mistake.
+    """
+    if crs is None:
+        return
+    try:
+        from pyproj import CRS
+        is_geographic = CRS.from_user_input(crs).is_geographic
+    except Exception:
+        # Unparseable CRS spec: GeoDataFrame construction will surface it.
+        return
+    if is_geographic:
+        warnings.warn(
+            f"The project CRS ({crs}) is geographic (latitude/longitude "
+            "degrees). Mesh sizes will be in degrees and the resulting "
+            "MODFLOW grid will be physically meaningless (1 deg of longitude "
+            "and latitude differ in length, and cell areas/conductances need "
+            "length units). Reproject your data to a projected CRS (e.g. a "
+            "UTM zone) with GeoDataFrame.to_crs() before building the mesh.",
+            stacklevel=3,
+        )
+
+
 class ConceptualMesh:
-    def __init__(self, crs="EPSG:4326", connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE):
+    def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE):
         """
         Initializes the conceptual model, which holds raw geometric inputs.
 
@@ -34,12 +83,19 @@ class ConceptualMesh:
         inputs for the mesh generator.
 
         Args:
-            crs: The coordinate reference system for the project (e.g., "EPSG:4326").
+            crs: The coordinate reference system for the project. Use a
+                *projected* CRS (e.g. a UTM zone like "EPSG:32618") so mesh
+                sizes are in real length units. Geographic CRSs (lat/lon
+                degrees, e.g. "EPSG:4326") produce physically meaningless
+                grids and trigger a warning -- reproject your data first with
+                GeoDataFrame.to_crs(). None (default) means local/unspecified
+                coordinates; output GeoDataFrames then carry no CRS.
             connectivity_tolerance (float, optional): Default snapping tolerance used
                 during topology cleanup in generate(). Larger values make lines and
                 points connect more aggressively to nearby geometry.
         """
         self.crs = crs
+        _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
@@ -64,6 +120,9 @@ class ConceptualMesh:
         fields=None,
         embed=True,
         simplify_tolerance=None,
+        quad_buffer=False,
+        quad_buffer_thickness=1,
+        growth_factor=None,
     ):
         """
         Adds a polygon feature, such as a model boundary or a refinement zone.
@@ -74,11 +133,20 @@ class ConceptualMesh:
             resolution (float, optional): Target mesh size within this polygon. If None,
                 the background mesh size will be used.
             z_order (int): Stacking order for resolving overlaps. Higher values are
-                processed first and will "cut" into lower-order polygons.
-            dist_min (float, optional): Distance from the polygon boundary where the mesh
-                size is held constant at the boundary's resolution.
-            dist_max (float, optional): Distance from the polygon boundary over which the mesh
-                transitions to the background resolution.
+                processed first and will "cut" into lower-order polygons. Also acts
+                as the crossing priority when this polygon's quad buffer crosses
+                another quad-buffered feature (higher stays continuous). To control
+                the two independently, add the zone without ``quad_buffer`` and add
+                its boundary as a separate quad-buffered line with its own z_order.
+            dist_min (float, optional): DEPRECATED. Distance from the polygon boundary where
+                the mesh size is held constant at the boundary's resolution. Supplying
+                dist_min/dist_max selects the legacy linear ThresholdField transition and
+                emits a DeprecationWarning; omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): DEPRECATED. Distance from the polygon boundary over
+                which the mesh transitions to the background resolution. See dist_min.
+            growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
+                GeometricGrowthField size transition away from the feature. Defaults to 1.2.
+                Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
             densify (float|bool|None, optional): Controls polygon boundary densification:
                 - If False, disables densification.
                 - If True, densifies using `resolution` (lc). Requires `resolution` to be set.
@@ -89,6 +157,24 @@ class ConceptualMesh:
                 Raises ValueError if negative. Boolean values are not supported.
             fields (list, optional): List of MeshField objects.
             embed (bool): If True, the polygon is embedded in the mesh. If False, it is used only for fields.
+            quad_buffer (bool): If True, replaces the meshed polygon outline
+                with a quad band straddling it (the annulus between the
+                ``+/- thickness * resolution / 2`` offsets, meshed as
+                recombined quads; annuli cannot be 4-corner transfinite). The
+                outline itself never becomes mesh edges: with
+                ``quad_buffer_thickness=1`` no nodes fall on it, so the Voronoi
+                cell faces trace the shapefile shape; with ``2`` a node row
+                lands on it, giving a row of ~square cells centered on the
+                shape. (For the triangular element-grid deliverable the reading
+                is opposite: ``2`` puts element edges along the outline.)
+                When the band crosses another quad buffer, the higher-priority
+                feature (``z_order``, then finer resolution, wider strip, lines
+                over polygons) stays continuous and only the other is trimmed
+                with a warning; polygons narrower than the band fall back to a
+                plain outline with a warning.
+            quad_buffer_thickness (int): Band width in local cell widths
+                (multiples of ``resolution``, like gmshflow's ``cs_thick``).
+                Supported values are 1 and 2.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -115,6 +201,11 @@ class ConceptualMesh:
         if dist_min is not None and dist_min < 0:
             raise ValueError(f"dist_min must be non-negative (or None). Got {dist_min}.")
 
+        if quad_buffer_thickness not in (1, 2):
+            raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+
+        growth_factor = _validate_growth_factor(growth_factor)
+
         if fields is None:
             fields = []
 
@@ -129,12 +220,17 @@ class ConceptualMesh:
                 "densify": densify,
                 "simplify_tolerance": simplify_tolerance,
                 'fields': fields,
-                'embed': embed
+                'embed': embed,
+                'quad_buffer': bool(quad_buffer),
+                'quad_buffer_thickness': int(quad_buffer_thickness),
+                'growth_factor': growth_factor,
             }
         )
 
-    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,                 
-                  dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True, simplify_tolerance=None):
+    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,
+                  dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True,
+                  simplify_tolerance=None, quad_buffer=False, quad_buffer_thickness=1, z_order=0,
+                  growth_factor=None):
         """
         Adds a line feature, such as a river, fault, or other linear boundary.
 
@@ -146,10 +242,12 @@ class ConceptualMesh:
                 nearby polygon boundaries to ensure connectivity.
             is_barrier (bool): If True, the line is treated as a flow barrier. The mesh
                 will be constructed to prevent cell faces from crossing it.
-            dist_min (float, optional): Distance from the line where the mesh size is
-                held constant at the line's resolution.
-            dist_max (float, optional): Distance from the line over which the mesh
-                transitions to the background resolution.
+            dist_min (float, optional): DEPRECATED. Distance from the line where the mesh size
+                is held constant at the line's resolution. Supplying dist_min/dist_max selects
+                the legacy linear ThresholdField transition and emits a DeprecationWarning;
+                omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): DEPRECATED. Distance from the line over which the mesh
+                transitions to the background resolution. See dist_min.
             straddle_width (float, optional): If set, forces Voronoi cell edges to align
                 perfectly with the line by creating a "virtual straddle" of mesh nodes.
             fields (list, optional): List of MeshField objects.
@@ -162,6 +260,30 @@ class ConceptualMesh:
             simplify_tolerance (float|int|None, optional): If a number > 0, simplifies the line with
                 this tolerance using Douglas-Peucker algorithm. If None or 0, no simplification is applied.
                 Raises ValueError if negative. Boolean values are not supported.
+            quad_buffer (bool): If True, creates an opt-in structured quad buffer
+                strip around the line instead of the lightweight straddle points.
+                The strip is meshed as a 4-corner transfinite surface (structured
+                quad rows): with ``quad_buffer_thickness=1`` no nodes fall on
+                the line, so the Voronoi faces align with it (sharp barrier);
+                with ``2`` a node row lands on it, giving a row of ~square
+                Voronoi cells centered on the line. (For the triangular
+                element-grid deliverable the reading is opposite: ``2`` puts
+                element edges along the line.) When two quad buffers cross,
+                the higher-priority one stays continuous and only the other is
+                trimmed at the crossing with a warning (priority: ``z_order``,
+                then finer resolution, wider strip, lines over polygons,
+                insertion order). Strips crossing a barrier/straddle corridor
+                are still trimmed there. Independent of ``is_barrier``.
+            quad_buffer_thickness (int): Strip width in local cell widths
+                (multiples of ``resolution``, like gmshflow's ``cs_thick``).
+                Supported values are 1 and 2.
+            z_order (int): Crossing priority for quad buffers. When this
+                feature's quad buffer crosses another one, the feature with the
+                higher ``z_order`` keeps its strip continuous and the other is
+                trimmed. Lines do not participate in polygon overlap stacking.
+            growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
+                GeometricGrowthField size transition away from the line. Defaults to 1.2.
+                Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -177,13 +299,19 @@ class ConceptualMesh:
         if isinstance(densify, (int, float)) and not isinstance(densify, bool) and densify <= 0:
             raise ValueError(f"densify must be positive when specified as a float. Got {densify}.")
 
+        if quad_buffer_thickness not in (1, 2):
+            raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+
+        growth_factor = _validate_growth_factor(growth_factor)
+
         if fields is None:
             fields = []
-        
+
         self.raw_lines.append({
             'geometry': geometry,
             'line_id': line_id,
             'lc': resolution,
+            'snap_to_polygons': snap_to_polygons,
             'is_barrier': is_barrier,
             'dist_min': dist_min,
             'dist_max': dist_max,
@@ -191,10 +319,14 @@ class ConceptualMesh:
             'fields': fields,
             'embed': embed,
             'densify': densify,
-            'simplify_tolerance': simplify_tolerance
+            'simplify_tolerance': simplify_tolerance,
+            'quad_buffer': bool(quad_buffer),
+            'quad_buffer_thickness': int(quad_buffer_thickness),
+            'z_order': z_order,
+            'growth_factor': growth_factor,
         })
 
-    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None, embed=True, simplify_tolerance=None):
+    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None, embed=True, simplify_tolerance=None, growth_factor=None):
         """
         Adds a point feature, such as a well or an observation point.
 
@@ -202,13 +334,18 @@ class ConceptualMesh:
             geometry (shapely.Point): The point geometry.
             point_id (str): A unique identifier for the point.
             resolution (float): Target mesh size at the point.
-            dist_min (float, optional): Distance from the point where the mesh size is
-                held constant at the point's resolution.
-            dist_max (float, optional): Distance from the point over which the mesh
-                transitions to the background resolution.
+            dist_min (float, optional): DEPRECATED. Distance from the point where the mesh size
+                is held constant at the point's resolution. Supplying dist_min/dist_max selects
+                the legacy linear ThresholdField transition and emits a DeprecationWarning;
+                omit them to use the default GeometricGrowthField.
+            dist_max (float, optional): DEPRECATED. Distance from the point over which the mesh
+                transitions to the background resolution. See dist_min.
             simplify_tolerance (float|int|None, optional): If a number > 0, merges points that are closer
                 than this tolerance. If None or 0, no merging is applied. Raises ValueError if negative.
                 Boolean values are not supported.
+            growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
+                GeometricGrowthField size transition away from the point. Defaults to 1.2.
+                Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
         """
         if isinstance(simplify_tolerance, bool):
             raise ValueError(
@@ -217,6 +354,8 @@ class ConceptualMesh:
             )
         if isinstance(simplify_tolerance, (int, float)) and simplify_tolerance < 0:
             raise ValueError(f"simplify_tolerance must be non-negative. Got {simplify_tolerance}.")
+
+        growth_factor = _validate_growth_factor(growth_factor)
 
         if fields is None:
             fields = []
@@ -228,7 +367,8 @@ class ConceptualMesh:
             'dist_max': dist_max,
             'fields': fields,
             'embed': embed,
-            'simplify_tolerance': simplify_tolerance
+            'simplify_tolerance': simplify_tolerance,
+            'growth_factor': growth_factor,
         })
     def _apply_simplification(self):
         """
@@ -257,9 +397,9 @@ class ConceptualMesh:
                 if new_area < org_area and org_area > 0:
                     reduction_pct = 100 * (org_area - new_area) / org_area
                     if reduction_pct > SIGNIFICANT_REDUCTION_PCT:
-                        print(
-                            f"Simplified polygon (zone_id={poly_data['zone_id']}) "
-                            f"reduced area by {reduction_pct:.2f}% using tolerance {tol}."
+                        logger.info(
+                                  f"Simplified polygon (zone_id={poly_data['zone_id']}) "
+                                  f"reduced area by {reduction_pct:.2f}% using tolerance {tol}."
                         )
 
         # Simplify Lines
@@ -279,9 +419,9 @@ class ConceptualMesh:
                 if new_length < org_length and org_length > 0:
                     reduction_pct = 100 * (org_length - new_length) / org_length
                     if reduction_pct > SIGNIFICANT_REDUCTION_PCT:
-                        print(
-                            f"Simplified line (line_id={line_data['line_id']}) "
-                            f"reduced length by {reduction_pct:.2f}% using tolerance {tol}."
+                        logger.info(
+                                  f"Simplified line (line_id={line_data['line_id']}) "
+                                  f"reduced length by {reduction_pct:.2f}% using tolerance {tol}."
                         )
 
         # Merge points that are very close to each other (deduplication)
@@ -330,9 +470,9 @@ class ConceptualMesh:
                     kept_indices.add(i)
 
             if len(self.raw_points) != len(final_points):
-                print(
-                    f"Simplification merged {len(self.raw_points) - len(final_points)} "
-                    f"points out of {len(self.raw_points)}"
+                logger.info(
+                          f"Simplification merged {len(self.raw_points) - len(final_points)} "
+                          f"points out of {len(self.raw_points)}"
                 )
             self.raw_points = final_points
 
@@ -357,14 +497,16 @@ class ConceptualMesh:
                     "simplify_tolerance",
                     "fields",
                     "embed",
+                    "quad_buffer",
+                    "quad_buffer_thickness",
+                    "growth_factor",
                 ],
                 crs=self.crs,
             )
             return
         df = pd.DataFrame(self.raw_polygons)
-        df = df.sort_values(by='z_order', ascending=False)
+        df = df.sort_values(by='z_order', ascending=False, kind='mergesort')
         
-        processed_geoms = []
         occupied_space = None # Tracks the union of all higher-priority polygons.
         
         final_features = []
@@ -380,7 +522,7 @@ class ConceptualMesh:
                 # Subtract the already-occupied space from the current polygon.
                 try:
                     final_geo = current_geo.difference(occupied_space)
-                except Exception as e:
+                except Exception:
                     # If the standard difference fails, try again with valid geometries.
                     current_geo = make_valid(current_geo)
                     occupied_space = make_valid(occupied_space)
@@ -432,8 +574,10 @@ class ConceptualMesh:
         # 2. Snap lines to polygon boundaries.
         # This ensures that features like rivers connect precisely to zone edges.
         if self.raw_lines and poly_boundaries is not None and not poly_boundaries.is_empty:
-            print(f"Snapping {len(self.raw_lines)} lines to polygon boundaries (tol={tolerance})...")
+            logger.info(f"Snapping {len(self.raw_lines)} lines to polygon boundaries (tol={tolerance})...")
             for i, line_data in enumerate(self.raw_lines):
+                if not line_data.get('snap_to_polygons', True):
+                    continue
                 original_line = line_data['geometry']
                 snapped_line = snap(original_line, poly_boundaries, tolerance)
                 self.raw_lines[i]['geometry'] = snapped_line
@@ -453,7 +597,7 @@ class ConceptualMesh:
             if geoms_to_snap_to:
                 reference_geom = unary_union(geoms_to_snap_to)
                 
-                print(f"Snapping {len(self.raw_points)} points to geometry (tol={tolerance})...")
+                logger.info(f"Snapping {len(self.raw_points)} points to geometry (tol={tolerance})...")
                 for i, point_data in enumerate(self.raw_points):
                     original_point = point_data['geometry']
                     snapped_point = snap(original_point, reference_geom, tolerance)
@@ -469,16 +613,25 @@ class ConceptualMesh:
         if domain_union.is_empty:
             return
         domain_union = make_valid(domain_union)
+        # Prepared-geometry fast paths: most features are entirely inside
+        # (or outside) the domain, where a cheap predicate avoids the full
+        # boolean intersection.
+        domain_prep = prep(domain_union)
 
         clipped_lines = []
         for line_data in self.raw_lines:
             geom = line_data.get("geometry")
             if geom is None or geom.is_empty:
                 continue
-            try:
-                clipped = geom.intersection(domain_union)
-            except Exception:
-                clipped = make_valid(geom).intersection(domain_union)
+            if not domain_prep.intersects(geom):
+                continue
+            if domain_prep.covers(geom):
+                clipped = geom
+            else:
+                try:
+                    clipped = geom.intersection(domain_union)
+                except Exception:
+                    clipped = make_valid(geom).intersection(domain_union)
 
             if clipped.is_empty:
                 continue
@@ -506,7 +659,7 @@ class ConceptualMesh:
 
         removed_lines = len(self.raw_lines) - len(clipped_lines)
         if removed_lines > 0:
-            print(f"Clipped/removed {removed_lines} line feature(s) outside the domain.")
+            logger.info(f"Clipped/removed {removed_lines} line feature(s) outside the domain.")
         self.raw_lines = clipped_lines
 
         kept_points = []
@@ -519,7 +672,7 @@ class ConceptualMesh:
 
         removed_points = len(self.raw_points) - len(kept_points)
         if removed_points > 0:
-            print(f"Removed {removed_points} point feature(s) outside the domain.")
+            logger.info(f"Removed {removed_points} point feature(s) outside the domain.")
         self.raw_points = kept_points
 
 
@@ -527,13 +680,27 @@ class ConceptualMesh:
         """
         Runs the full preprocessing workflow: resolves polygon overlaps,
         ensures topological connectivity, and prepares clean GeoDataFrames
-        for the mesher.
+        for the mesher. Registered raw features remain unchanged so repeated
+        calls with the same inputs produce the same clean features.
 
         Args:
             connectivity_tolerance (float, optional): Override for the instance's
                 default topology snapping tolerance during this preprocessing run.
         """
-        print("Applying optional geometry simplification...")
+        raw_inputs = self.raw_polygons, self.raw_lines, self.raw_points
+        # Preprocessing replaces geometries and filters feature records, but does
+        # not modify their nested field objects. Copy each record for this run.
+        self.raw_polygons, self.raw_lines, self.raw_points = (
+            [feature.copy() for feature in raw_features]
+            for raw_features in raw_inputs
+        )
+        try:
+            return self._generate_working_features(connectivity_tolerance)
+        finally:
+            self.raw_polygons, self.raw_lines, self.raw_points = raw_inputs
+
+    def _generate_working_features(self, connectivity_tolerance):
+        logger.info("Applying optional geometry simplification...")
         self._apply_simplification()
 
         # --- Embed semantics for polygons ---
@@ -547,13 +714,13 @@ class ConceptualMesh:
         # Only embedded polygons are used to build the domain partition.
         self.raw_polygons = embedded_polys
 
-        print("Resolving polygon overlaps...")
+        logger.info("Resolving polygon overlaps...")
         self._resolve_overlaps()
         
-        print("Enforcing strict topology...")
+        logger.info("Enforcing strict topology...")
         self._enforce_connectivity(connectivity_tolerance=connectivity_tolerance)
 
-        print("Clipping features to domain...")
+        logger.info("Clipping features to domain...")
         self._clip_features_to_domain()
         
         # Promote the processed raw geometries to final "clean" GeoDataFrames.
@@ -565,6 +732,7 @@ class ConceptualMesh:
                     'geometry',
                     'line_id',
                     'lc',
+                    'snap_to_polygons',
                     'is_barrier',
                     'dist_min',
                     'dist_max',
@@ -573,16 +741,20 @@ class ConceptualMesh:
                     'embed',
                     'densify',
                     'simplify_tolerance',
+                    'quad_buffer',
+                    'quad_buffer_thickness',
+                    'z_order',
+                    'growth_factor',
                 ],
                 crs=self.crs,
             )
-   
+
         # Clean Points
         if self.raw_points:
             self.clean_points = gpd.GeoDataFrame(self.raw_points, crs=self.crs)
         else:
             self.clean_points = gpd.GeoDataFrame(
-                columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max', 'fields', 'embed', 'simplify_tolerance'],
+                columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max', 'fields', 'embed', 'simplify_tolerance', 'growth_factor'],
                 crs=self.crs,
             )
 
@@ -592,6 +764,7 @@ class ConceptualMesh:
         if field_only_polys and not self.clean_polygons.empty:
             domain_union = unary_union(self.clean_polygons.geometry)
             domain_union = make_valid(domain_union)
+            domain_prep = prep(domain_union)
 
             clipped_features = []
             for poly_data in field_only_polys:
@@ -599,10 +772,15 @@ class ConceptualMesh:
                 if geom is None or geom.is_empty:
                     continue
                 geom = make_valid(geom)
-                try:
-                    clipped = geom.intersection(domain_union)
-                except Exception:
-                    clipped = make_valid(geom).intersection(make_valid(domain_union))
+                if not domain_prep.intersects(geom):
+                    continue
+                if domain_prep.covers(geom):
+                    clipped = geom
+                else:
+                    try:
+                        clipped = geom.intersection(domain_union)
+                    except Exception:
+                        clipped = make_valid(geom).intersection(make_valid(domain_union))
 
                 if clipped.is_empty:
                     continue
@@ -626,6 +804,9 @@ class ConceptualMesh:
                     'embed',
                     'densify',
                     'simplify_tolerance',
+                    'quad_buffer',
+                    'quad_buffer_thickness',
+                    'growth_factor',
                 ]
                 self.clean_polygons = self.clean_polygons.reindex(columns=polygon_columns)
                 field_only_gdf = field_only_gdf.reindex(columns=polygon_columns)
@@ -640,7 +821,7 @@ class ConceptualMesh:
                     crs=self.crs,
                 )
 
-        print("Densifying geometry...")
+        logger.info("Densifying geometry...")
         self._apply_densification()
         
         return self.clean_polygons, self.clean_lines, self.clean_points
