@@ -120,6 +120,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the example notebooks' grids. Below about 24 degrees between line and
   boundary, a boundary node still lies nearer the end than the slid pair, and
   its cell is split with a mirror.
+- With pandas 1.5 / GeoPandas 0.13, clipping to the domain no longer puts
+  cell geometries on the wrong rows, which gave most cells another
+  generator's `node_id` and `x`/`y`. The grid is clipped without `gpd.clip`
+  and keeps the Voronoi row order. Barrier fragment merging also works with
+  Shapely 2.0, whose `STRtree` made the cell array read-only.
 
 ### Added
 

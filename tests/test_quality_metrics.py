@@ -4,8 +4,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-import shapely
-from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 
 import vorflow.engine as engine_module
 from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
@@ -268,14 +267,12 @@ def _generated_voronoi_grid():
 
 
 def _square_lattice_voronoi(n=4):
-    """Return the clipped Voronoi grid of an n x n unit square lattice."""
+    """Return the clipped Voronoi grid of an n x n unit square lattice: unit boxes."""
     centers = np.arange(n) + 0.5
     points = np.array([(x, y) for y in centers for x in centers])
-    domain = box(0, 0, n, n)
-    cells = shapely.voronoi_polygons(MultiPoint(points), extend_to=domain, ordered=True)
     return gpd.GeoDataFrame(
         {"x": points[:, 0], "y": points[:, 1]},
-        geometry=[cell.intersection(domain) for cell in cells.geoms],
+        geometry=[box(x - 0.5, y - 0.5, x + 0.5, y + 0.5) for x, y in points],
     )
 
 
