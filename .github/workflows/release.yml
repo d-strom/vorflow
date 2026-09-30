@@ -1,22 +1,27 @@
-# Build, verify, and publish a release candidate (tags like v0.1.0rc1) to
-# TestPyPI using OIDC Trusted Publishing; no API token is stored in GitHub.
+# Build, verify, and publish a release using OIDC Trusted Publishing; no API
+# token is stored in GitHub. The tag decides where the build goes:
+#   v0.1.0rc1 (release candidate) -> TestPyPI, through the "testpypi" environment
+#   v0.1.0    (final release)     -> PyPI,     through the "pypi" environment
+# Any other v* tag fails scripts/check_dist.py before anything is uploaded.
 #
-# One-time setup on the upstream repository before the first rc tag:
-#   1. On test.pypi.org, add a pending Trusted Publisher for project "vorflow":
-#      owner "rhugman", repository "vorflow", workflow "testpypi.yml",
-#      environment "testpypi".
-#   2. In GitHub (Settings > Environments), create the "testpypi" environment
-#      and add at least one required reviewer so each upload is approved by hand.
+# One-time setup on the upstream repository before the first tag of each kind:
+#   1. On test.pypi.org (for rc tags) and pypi.org (for final tags), add a
+#      pending Trusted Publisher for project "vorflow": owner "rhugman",
+#      repository "vorflow", workflow "release.yml", and environment
+#      "testpypi" or "pypi" respectively.
+#   2. In GitHub (Settings > Environments), create the "testpypi" and "pypi"
+#      environments and add at least one required reviewer to each, so every
+#      upload is approved by hand.
 #
 # The version is read from pyproject.toml; bump it there before tagging.
 # scripts/check_dist.py fails the build if the tag and pyproject disagree.
 
-name: Publish release candidate to TestPyPI
+name: Release
 
 on:
   push:
     tags:
-      - "v*rc*"
+      - "v*"
 
 permissions:
   contents: read
@@ -66,6 +71,7 @@ jobs:
 
   publish-testpypi:
     needs: build
+    if: contains(github.ref_name, 'rc')
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -81,3 +87,22 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    needs: build
+    # check_dist.py has already rejected every tag that is neither vX.Y.Z
+    # nor vX.Y.ZrcN, so a tag without "rc" here is a final release.
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/vorflow
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
