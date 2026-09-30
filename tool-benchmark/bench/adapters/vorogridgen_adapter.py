@@ -7,7 +7,8 @@ produces the grids.
 
 Spec translation (manual section 3.3): the per-vertex spacing of every
 boundary, line and point is its ``h_f``; the outer and inner boundaries get
-``h_max``; refinement polygons get ``max_centroid_separation = h_f``;
+``h_max``, except at vertices on a boundary line (``boundary: true``), which
+take its ``h_f``; refinement polygons get ``max_centroid_separation = h_f``;
 ``poly_growth_rate = g``, ``max_centroid_separation = h_max``. Control values
 not in the spec are those of the example shipped with the program.
 VOROGRIDGEN has no barriers, so barrier lines are ordinary inner lines.
@@ -24,6 +25,8 @@ import platform
 import subprocess
 import time
 from pathlib import Path
+
+from shapely.geometry import Point
 
 from ..case import Case, line_parts
 from ..grid import Grid, read_disv
@@ -75,15 +78,19 @@ def _run(exe: str, ws: Path, lloyd_fac: float) -> tuple:
 def write_inputs(case: Case, scale: float, ws: Path, lloyd_fac: float = LLOYD_FACS[0]) -> Path:
     """Write the BLN files and vg.in for one case; return the vg.in path."""
     h_max = case.h_max * scale
-    blocks = [_boundary_block("OUTER_BOUNDARY", ws / "outer_boundary.bln", case.domain.exterior.coords, h_max)]
+    blocks = [_boundary_block("OUTER_BOUNDARY", ws / "outer_boundary.bln", case.domain.exterior.coords,
+                              _vertex_spacing(case.domain.exterior, case, scale))]
     for i, ring in enumerate(case.domain.interiors):
-        blocks.append(_boundary_block("INNER_BOUNDARY", ws / f"inner_boundary_{i}.bln", ring.coords, h_max))
+        blocks.append(_boundary_block("INNER_BOUNDARY", ws / f"inner_boundary_{i}.bln", ring.coords,
+                                      _vertex_spacing(ring, case, scale)))
     points = case.features_of("point")
     if points:
         path = ws / "points.dat"
         _write_bln(path, [(*p.geometry.coords[0], p.h * scale) for p in points])
         blocks.append(f"START INNER_POINTS\n  bln_file={path.name}\nEND INNER_POINTS\n")
     for f in case.features_of("line"):
+        if f.boundary:
+            continue                    # applied as boundary vertex spacing (_vertex_spacing)
         for i, part in enumerate(line_parts(f.geometry)):
             path = ws / f"line_{f.id}_{i}.bln"
             _write_bln(path, [(x, y, f.h * scale) for x, y in part.coords])
@@ -100,9 +107,21 @@ def write_inputs(case: Case, scale: float, ws: Path, lloyd_fac: float = LLOYD_FA
     return vg_in
 
 
-def _boundary_block(name: str, path: Path, coords, spacing: float) -> str:
-    """A closed-boundary block with a uniform per-vertex spacing."""
-    _write_bln(path, [(x, y, spacing) for x, y in coords])
+def _vertex_spacing(ring, case: Case, scale: float) -> list:
+    """Spacing per ring vertex: the finest boundary line through it, else h_max."""
+    boundary = [f for f in case.features_of("line") if f.boundary]
+    tol = 1e-9 * max(case.domain.bounds[2] - case.domain.bounds[0], case.domain.bounds[3] - case.domain.bounds[1])
+    spacing = []
+    for x, y in ring.coords:
+        point = Point(x, y)
+        sizes = [f.h * scale for f in boundary if f.geometry.distance(point) <= tol]
+        spacing.append(min(sizes, default=case.h_max * scale))
+    return spacing
+
+
+def _boundary_block(name: str, path: Path, coords, spacing: list) -> str:
+    """A closed-boundary block with a per-vertex spacing."""
+    _write_bln(path, [(x, y, h) for (x, y), h in zip(coords, spacing)])
     return f"START {name}\n  bln_file={path.name}\nEND {name}\n"
 
 

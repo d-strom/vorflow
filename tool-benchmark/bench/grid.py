@@ -76,10 +76,14 @@ def grid_from_polygons(tool: str, polygons: list, xc: np.ndarray, generators=Non
     )
 
 
-def to_gridprops(grid: Grid, centres: str = "written") -> dict:
-    """DISV gridprops for flopy.mf6.ModflowGwfdisv, with the chosen centres."""
-    xy = grid.centres(centres)
-    vertices = [[i, float(x), float(y)] for i, (x, y) in enumerate(grid.vertices)]
+def to_gridprops(grid: Grid, centres: str = "written", origin=(0.0, 0.0)) -> dict:
+    """DISV gridprops for flopy.mf6.ModflowGwfdisv, with the chosen centres.
+
+    Coordinates are written relative to ``origin``. FloPy writes 9 significant
+    digits, which at UTM northings is about 1 cm and can collapse short faces.
+    """
+    xy = grid.centres(centres) - origin
+    vertices = [[i, float(x), float(y)] for i, (x, y) in enumerate(grid.vertices - origin)]
     cell2d = [
         [i, float(xy[i, 0]), float(xy[i, 1]), len(ring)] + [int(v) for v in ring]
         for i, ring in enumerate(grid.iverts)

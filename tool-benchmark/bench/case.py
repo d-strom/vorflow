@@ -1,9 +1,18 @@
 """Tool-neutral benchmark case: geometry, sizing spec and MF6 problems.
 
 A case is one YAML file in ``tool-benchmark/cases``. Geometry is inline WKT (small
-synthetic cases), or ``domain: {circle: [x, y, r], segments: n}`` for a circle,
-and every feature is clipped to the domain on load, so all tools see exactly
-the same inputs.
+synthetic cases), ``domain: {circle: [x, y, r], segments: n}`` for a circle, or
+``{file: <path>, layer: <name>}`` for a vector file (relative to
+``tool-benchmark/``; the other tools' examples, which ``fetch.py`` downloads into
+``data/``). Every feature is clipped to the domain on load, so all tools see
+exactly the same inputs.
+
+A feature read from a file becomes one feature per point or polygon part (ids
+``<id>-0``, ``<id>-1``, ...); its lines are merged into one. Without ``h`` in
+the YAML, each row takes its size from the file's ``h`` column. A line with
+``boundary: true`` lies on the domain boundary and sets the size there
+(VOROGRIDGEN's per-vertex boundary spacing); adapters apply it to the boundary
+instead of adding it as an interior line.
 
 ``target_ncpl`` is one cell count or a list (a convergence sweep); the first
 target is the one plotted. ``mf6_problems`` lists problem names, or
@@ -39,6 +48,7 @@ class Feature:
     geometry: object
     h: float
     barrier: bool = False
+    boundary: bool = False
 
 
 @dataclass
@@ -70,10 +80,11 @@ class Case:
 def load_case(path: Path) -> Case:
     """Read a case YAML file and clip its features to the domain."""
     spec = yaml.safe_load(Path(path).read_text())
-    domain = _load_domain(spec["domain"])
+    base_d = Path(path).resolve().parent.parent
+    domain = _load_domain(spec["domain"], base_d)
     assert isinstance(domain, Polygon) and domain.is_valid, f"{path}: domain must be one valid Polygon"
     assert spec["growth"] > 1.0, f"{path}: growth must be > 1"
-    features = [_load_feature(item, domain) for item in spec.get("features", [])]
+    features = [f for item in spec.get("features", []) for f in _load_features(item, domain, base_d)]
     targets = spec["target_ncpl"]
     targets = tuple(int(t) for t in (targets if isinstance(targets, list) else [targets]))
     return Case(
@@ -86,15 +97,17 @@ def load_case(path: Path) -> Case:
         h_max=float(spec["h_max"]),
         growth=float(spec["growth"]),
         targets=targets,
-        features=[f for f in features if f is not None],
+        features=features,
         mf6_problems=[_load_problem(item) for item in spec.get("mf6_problems", [])],
     )
 
 
-def _load_domain(item) -> Polygon:
-    """Domain polygon from WKT or a {circle: [x, y, r], segments: n} mapping."""
+def _load_domain(item, base_d: Path) -> Polygon:
+    """Domain polygon from WKT, a {circle: [x, y, r], segments: n} mapping or a {file:, layer:} mapping."""
     if isinstance(item, str):
         return wkt.loads(item)
+    if "file" in item:
+        return shapely.union_all(list(_read_file(item, base_d).geometry))
     x, y, r = item["circle"]
     n = int(item.get("segments", 128))
     assert n % 4 == 0, "circle segments must be a multiple of 4"
@@ -106,25 +119,51 @@ def _load_problem(item) -> dict:
     return {"name": item} if isinstance(item, str) else dict(item)
 
 
-def _load_feature(item: dict, domain: Polygon) -> Feature | None:
-    """Parse one feature entry; None if it falls entirely outside the domain."""
+def _load_features(item: dict, domain: Polygon, base_d: Path) -> list:
+    """Parse one feature entry into features clipped to the domain (none if it falls outside)."""
     kind = item["kind"]
     assert kind in FEATURE_KINDS, f"feature {item['id']}: unknown kind {kind!r}"
-    geom = wkt.loads(item["wkt"]).intersection(domain)
+    if "file" not in item:
+        return _clipped(item["id"], kind, wkt.loads(item["wkt"]), float(item["h"]), item, domain)
+    rows = _read_file(item, base_d)
+    sizes = [float(item["h"])] * len(rows) if "h" in item else [float(h) for h in rows["h"]]
+    if kind == "line" and len(set(sizes)) == 1:
+        geom = shapely.line_merge(shapely.union_all(list(rows.geometry)))
+        return _clipped(item["id"], kind, geom, sizes[0], item, domain)
+    parts = [(part, h) for geom, h in zip(rows.geometry, sizes) for part in getattr(geom, "geoms", [geom])]
+    features = []
+    for i, (part, h) in enumerate(parts):
+        features += _clipped(f"{item['id']}-{i}", kind, part, h, item, domain)
+    return features
+
+
+def _clipped(feature_id: str, kind: str, geom, h: float, item: dict, domain: Polygon) -> list:
+    """Features of one geometry clipped to the domain: one per polygon part, else one."""
+    geom = geom.intersection(domain)
     if geom.is_empty:
-        return None
+        return []
+    flags = {"barrier": bool(item.get("barrier", False)), "boundary": bool(item.get("boundary", False))}
+    if kind == "polygon":
+        parts = [g for g in getattr(geom, "geoms", [geom]) if isinstance(g, Polygon) and g.area > 0]
+        ids = [feature_id] if len(parts) == 1 else [f"{feature_id}.{i}" for i in range(len(parts))]
+        return [Feature(id=i, kind=kind, geometry=g, h=h, **flags) for i, g in zip(ids, parts)]
     if kind == "line":
-        geom = shapely.line_merge(geom) if not isinstance(geom, LineString) else geom
-        assert isinstance(geom, (LineString, MultiLineString)), f"feature {item['id']}: clipped to {geom.geom_type}"
+        lines = [g for g in getattr(geom, "geoms", [geom]) if isinstance(g, (LineString, MultiLineString))]
+        geom = shapely.line_merge(shapely.union_all(lines))
+        assert isinstance(geom, (LineString, MultiLineString)), f"feature {feature_id}: clipped to {geom.geom_type}"
     if kind == "point":
-        assert isinstance(geom, Point), f"feature {item['id']}: points must be single Points"
-    return Feature(
-        id=str(item["id"]),
-        kind=kind,
-        geometry=geom,
-        h=float(item["h"]),
-        barrier=bool(item.get("barrier", False)),
-    )
+        assert isinstance(geom, Point), f"feature {feature_id}: points must be single Points"
+    return [Feature(id=str(feature_id), kind=kind, geometry=geom, h=h, **flags)]
+
+
+def _read_file(item: dict, base_d: Path):
+    """GeoDataFrame of a {file:, layer:} entry; tells the user to fetch it if missing."""
+    import geopandas as gpd
+
+    path = base_d / item["file"]
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is missing; run `python fetch.py` in tool-benchmark/")
+    return gpd.read_file(path, layer=item.get("layer"))
 
 
 def line_parts(geom) -> list:

@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import fetch
 from bench.adapters import TOOLS
 from bench.case import load_case, size_field
 from bench.isolate import run_isolated
@@ -38,6 +39,11 @@ BIN_D = HERE / ".bin"
 
 CASES = ("c0_point_grading", "v1_linear", "v2_mms_uniform", "v2_mms_graded",
          "v3_thiem", "v4_barrier", "f4_vorflow_demo")
+# The other tools' own problems: FloPy autotest grids, VOROGRIDGEN's example and
+# mf6Voronoi test cases (the last two fetched into data/ by fetch.py).
+OTHER_TOOL_CASES = ("f1_flopy_circle", "f1_flopy_nested_circles", "f2_flopy_polygons",
+                    "f2_flopy_many_polygons", "f3_flopy_polygon", "f6_vorogridgen_example",
+                    "r1_mf6voronoi_river_aquifer", "r3_mf6voronoi_trench_excavation")
 CALIBRATION_CASE = "c0_point_grading"
 MULTIPLIERS = (1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5, 2.0)
 
@@ -106,6 +112,15 @@ def build_one(case, tool: str, target: int, kwargs: dict, run_models: bool,
     _write_rows(rows_d / "mf6" / f"{key}.json", mf6_rows)
     print(f"{case.id:18s} {tool:12s} n={target:<6d} {result['status']:11s} "
           f"ncpl={getattr(grid, 'ncpl', '-')} scale={result['scale']:.3f} builds={len(result['history'])}")
+
+
+def run_saved_models(case, target: int, work_d: Path, rows_d: Path, mf6_exe: str) -> None:
+    """MF6 problems on the grids saved by an earlier build, replacing their rows."""
+    for tool, grid in load_grids(case, work_d, target).items():
+        ws = work_d / case.id / tool / f"n{target}"
+        _write_rows(rows_d / "mf6" / f"{case.id}__{tool}__n{target}.json",
+                    run_models_on(case, grid, target, ws, mf6_exe))
+        print(f"{case.id:18s} {tool:12s} n={target:<6d} MF6 rerun on the saved grid")
 
 
 def run_models_on(case, grid, target: int, ws: Path, mf6_exe: str) -> list:
@@ -193,9 +208,15 @@ def make_figures(cases, mf6_table: pd.DataFrame, work_d: Path, figures_d: Path) 
                                 figures_d / "verification_summary.png")
 
 
-def main(cases=CASES, tools=TOOLS, calibrate=False, build=True, run_models=True, report=True):
-    """Run the benchmark steps selected by the flags."""
+def main(cases=CASES + OTHER_TOOL_CASES, tools=TOOLS, calibrate=False, build=True, run_models=True, report=True,
+         rerun_models=False):
+    """Run the benchmark steps selected by the flags.
+
+    ``rerun_models`` reruns the MF6 problems on the grids saved in work/ (with
+    ``build=False``), e.g. after a change to bench/models.py.
+    """
     RESULTS_D.mkdir(parents=True, exist_ok=True)
+    fetch.ensure()
     loaded = [load_case(CASES_D / f"{case_id}.yml") for case_id in cases]
     multiplier = None
     if calibrate:
@@ -208,6 +229,10 @@ def main(cases=CASES, tools=TOOLS, calibrate=False, build=True, run_models=True,
                 for target in case.targets:
                     build_one(case, tool, target, kwargs[tool], run_models,
                               WORK_D, RESULTS_D / "rows", str(exe_path(BIN_D, "mf6")))
+    elif rerun_models:
+        for case in loaded:
+            for target in case.targets:
+                run_saved_models(case, target, WORK_D, RESULTS_D / "rows", str(exe_path(BIN_D, "mf6")))
     if report:
         _, mf6_table = compile_tables(RESULTS_D / "rows", RESULTS_D)
         make_figures(loaded, mf6_table, WORK_D, RESULTS_D / "figures")

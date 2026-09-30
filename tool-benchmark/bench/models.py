@@ -156,7 +156,9 @@ def _build_model(grid: Grid, centres: str, setup: Setup, bnd: np.ndarray,
     flopy.mf6.ModflowIms(sim, complexity="SIMPLE", inner_dvclose=1e-10, outer_dvclose=1e-10,
                          inner_maximum=500, linear_acceleration="BICGSTAB")
     gwf = flopy.mf6.ModflowGwf(sim, modelname="bench")
-    flopy.mf6.ModflowGwfdisv(gwf, nlay=1, top=TOP, botm=BOT, **to_gridprops(grid, centres))
+    origin = grid.vertices.min(axis=0)      # local coordinates keep FloPy's 9 digits enough
+    flopy.mf6.ModflowGwfdisv(gwf, nlay=1, top=TOP, botm=BOT, xorigin=float(origin[0]), yorigin=float(origin[1]),
+                             **to_gridprops(grid, centres, origin))
     flopy.mf6.ModflowGwfnpf(gwf, icelltype=0, k=K, xt3doptions=xt3d)
     flopy.mf6.ModflowGwfic(gwf, strt=float(np.mean(setup.h_exact[bnd])))
     chd = [[(0, int(c)), float(setup.h_exact[c])] for c in np.flatnonzero(bnd)]

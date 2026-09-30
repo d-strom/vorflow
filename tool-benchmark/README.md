@@ -38,12 +38,27 @@ Edit the flags in `workflow.py`'s `__main__` block, then:
 python workflow.py
 ```
 
+After a change to the MF6 problems (`bench/models.py`),
+`workflow.main(build=False, rerun_models=True)` reruns them on the grids saved
+in `work/` without rebuilding the grids.
+
+Besides the verification cases, `workflow.py` runs the other tools' own
+problems (`OTHER_TOOL_CASES`): FloPy's autotest grids (`f1_*`–`f3_*`, geometry
+in the YAML), VOROGRIDGEN's shipped example (`f6_*`) and two mf6Voronoi test
+cases (`r1_*`, `r3_*`). The last two can't be committed, so `fetch.py`
+downloads them into `data/` on first use: mf6Voronoi's shapefiles at a pinned
+commit, and VOROGRIDGEN's example from its freeware zip (or from
+`.bin/vorogridgen_dist`, where CI unpacks it), converted to a GeoPackage.
+Each of these cases targets the owner tool's own cell count.
+
 ## Notebook
 
-`compare_generators.ipynb` walks through two cases (the vorflow demo geometry
-and the 30° barrier) with the same adapters, matched-count search, metrics
-and MF6 checks, and plots the grids side by side. Start Jupyter in this folder,
-in the benchmark environment. It writes only under `work/notebook/`.
+`compare_generators.ipynb` walks through the vorflow demo geometry, the 30°
+barrier and the other tools' own problems with the same adapters,
+matched-count search, metrics and MF6 checks, and plots the grids side by
+side. Start Jupyter in this folder, in the benchmark environment. It reuses
+grids that `workflow.py` saved in `work/` and writes only under
+`work/notebook/` (and `data/`, via `fetch.py`).
 
 ## CI
 
@@ -64,7 +79,9 @@ To merge a CI run into a local checkout, download the `rows-*` artifacts into
 
 ## Layout
 
-- `cases/`: one YAML per case (inline WKT geometry, sizing spec, MF6 problems).
+- `cases/`: one YAML per case (geometry as inline WKT or a file in `data/`,
+  sizing spec, MF6 problems).
+- `fetch.py`: downloads the inputs that can't be committed into `data/`.
 - `bench/adapters/`: one module per tool, `build(case, scale, ws) -> Grid`.
 - `bench/`: common grid form (`grid.py`), metrics as MF6 reads the grid
   (`metrics.py`), verification models (`models.py`), matched-count search
@@ -73,5 +90,5 @@ To merge a CI run into a local checkout, download the `rows-*` artifacts into
 - `results/`: `metrics.csv`, `mf6_verification.csv` (compiled from the rows),
   calibration table and figures.
 - `ci.py`: one entry point per CI job.
-- `work/`: every build's files. `work/`, `results/`, `.venv/` and `.bin/` are
-  git-ignored; CI regenerates the results.
+- `work/`: every build's files. `work/`, `results/`, `data/`, `.venv/` and
+  `.bin/` are git-ignored; CI regenerates the results.
