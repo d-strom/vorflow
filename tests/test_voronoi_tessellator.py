@@ -201,6 +201,20 @@ def test_merge_close_vertices_keeps_cell_whose_hole_collapses(caplog):
     assert "  -> Kept 1 cells unmerged: merging close vertices made them invalid" in caplog.messages
 
 
+@pytest.mark.parametrize('piece', [
+    # A sliver at a cell vertex, narrower than the snap tolerance (4e-8 here).
+    Polygon([(10, 10), (10 - 1e-8, 10), (10, 10 - 1e-8)]),
+    # A piece with a hole narrower than the snap tolerance.
+    Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [[(5, 5), (5 + 1e-8, 5), (5, 5 + 1e-8)]]),
+])
+def test_snap_to_cell_vertices_keeps_piece_whose_ring_collapses(piece):
+    """Catches GEOS raising when snapping collapses a ring of a split piece to two points."""
+    cell = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+    # GEOS 3.13 raises on the collapsed ring; GEOS 3.11 leaves the ring as is.
+    assert tessellator_module._snap_to_cell_vertices(piece, cell).equals(piece)
+
+
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
     """Catches removing a cell when Shapely raises while splitting it."""
     tessellator, _ = _plain_barrier_tessellator()
