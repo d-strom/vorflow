@@ -7,21 +7,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
-
-- A quad-buffer footprint whose corner touches a zone's outline no longer
-  drops the zone surface. The difference left a ring that passed through the
-  touch point twice, a few ulp apart; OCC merged the copies and could not
-  close the curve loop, so most of the domain went unmeshed with only log
-  warnings. Such rings are now rebuilt as a shell with a touching hole, or as
-  separate polygons.
-
-### Changed
-
-- `MeshGenerator.generate()` raises `RuntimeError` when an embedded polygon or
-  quad-buffer piece wider than a sliver cannot become an OCC surface, instead
-  of logging a warning and meshing around the hole.
-
 ## [0.1.0rc1]
 
 ### Fixed
@@ -151,6 +136,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   smaller than the vertex-snapping tolerance. Such a piece now keeps its
   unsnapped geometry, as a piece that snapping would make invalid already
   did.
+- A quad-buffer footprint whose corner touches a zone's outline no longer
+  drops the zone surface. The difference left a ring that passed through the
+  touch point twice, a few ulp apart; OCC merged the copies and could not
+  close the curve loop, so most of the domain went unmeshed with only log
+  warnings. Such rings are now rebuilt as a shell with a touching hole, or as
+  separate polygons.
 
 ### Added
 
@@ -190,6 +181,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   At 0.25 the median is 1.4 degrees there, and 1.3 vs 6.9 degrees on the
   comprehensive demo model. Pass `boundary_inset_fraction=0.5` for the old
   behaviour.
+- `MeshGenerator.generate()` raises `RuntimeError` when an embedded polygon or
+  quad-buffer piece wider than a sliver cannot become an OCC surface, instead
+  of logging a warning and meshing around the hole.
 
 ### Deprecated
 
