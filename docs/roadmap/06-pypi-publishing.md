@@ -1,6 +1,6 @@
 # Milestone 6 — First PyPI release
 
-**Status:** in progress · **Current target:** TestPyPI `0.1.0rc1` · **Risk:** low · **Behavior change:** none (packaging/metadata only)
+**Status:** TestPyPI verified · **Current target:** PyPI `0.1.0` · **Risk:** low · **Behavior change:** none (packaging/metadata only)
 **Back to** [ROADMAP.md](../../ROADMAP.md)
 
 ## Goal
@@ -51,35 +51,44 @@ folded into its changelog section.
 - [x] Add a Trusted Publishing workflow: rc tags to TestPyPI, final tags to
   PyPI.
 
-## Remaining TestPyPI rehearsal
+## TestPyPI rehearsal (verified 2026-09-30)
 
-- [ ] Re-enable the `pytest` workflow on GitHub. It was disabled for
+`v0.1.0rc1` (33fcd30) was built, tested and published by `release.yml` after a
+manual approval. The TestPyPI page renders the README, banner and links, and
+its metadata matches `pyproject.toml`. A fresh venv installed
+`vorflow==0.1.0rc1` from TestPyPI (dependencies from PyPI): `pip check` was
+clean, `vorflow.__version__` was `0.1.0rc1`, and `examples/basic_usage.py`
+generated 2372 cells.
+
+
+- [x] Re-enable the `pytest` workflow on GitHub. It was disabled for
   inactivity (weekly `schedule` trigger), so it did not run on the
   `develop` -> `main` PR: `gh workflow enable python-app.yml`.
-- [ ] Get a green `pytest` run on the release PR and integrate `develop` into
+- [x] Get a green `pytest` run on the release PR and integrate `develop` into
   `main`.
-- [ ] Create the upstream `testpypi` GitHub environment (with a required
+- [x] Create the upstream `testpypi` GitHub environment (with a required
   reviewer) and the TestPyPI pending Trusted Publisher (workflow
   `release.yml`, environment `testpypi`; see the header of
   `.github/workflows/release.yml`).
-- [ ] Create and push the annotated `v0.1.0rc1` tag.
-- [ ] Review the GitHub build and manually approve the protected `testpypi`
+- [x] Create and push the annotated `v0.1.0rc1` tag.
+- [x] Review the GitHub build and manually approve the protected `testpypi`
   deployment.
-- [ ] Inspect the TestPyPI project page and install `0.1.0rc1` independently.
-- [ ] Record the result as **TestPyPI verified**. Real PyPI publication remains
+- [x] Inspect the TestPyPI project page and install `0.1.0rc1` independently.
+- [x] Record the result as **TestPyPI verified**. Real PyPI publication remains
   a separate approval gate.
 
 ## Final PyPI release (`0.1.0`)
 
 Only after the TestPyPI rehearsal is verified:
 
-- [ ] Create the upstream `pypi` GitHub environment (with a required reviewer)
-  and the PyPI pending Trusted Publisher (workflow `release.yml`, environment
-  `pypi`).
-- [ ] Bump `version` in `pyproject.toml` to `0.1.0`.
-- [ ] In `README.md`, replace the "not yet published on PyPI" installation text
+- [x] Create the upstream `pypi` GitHub environment (with a required
+  reviewer and a `v*` tag rule).
+- [ ] Add the PyPI pending Trusted Publisher (workflow `release.yml`,
+  environment `pypi`).
+- [x] Bump `version` in `pyproject.toml` to `0.1.0`.
+- [x] In `README.md`, replace the "not yet published on PyPI" installation text
   with `pip install vorflow`; keep the GLU note for Linux.
-- [ ] In `CHANGELOG.md`, add a dated `## [0.1.0] - YYYY-MM-DD` section above
+- [x] In `CHANGELOG.md`, add a dated `## [0.1.0] - YYYY-MM-DD` section above
   `[0.1.0rc1]` (listing any changes since the candidate, or stating that there
   were none) and its compare link.
 - [ ] Merge to `main`, then create and push the annotated `v0.1.0` tag from

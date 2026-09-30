@@ -48,11 +48,10 @@ or useful enough to port.
 
 | # | Milestone | Status | Risk | Behavior change | Doc |
 |---|-----------|--------|------|-----------------|-----|
-| 6 | First PyPI release | In progress | Low | None (packaging/metadata only) | [06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md) |
+| 6 | First PyPI release | TestPyPI verified | Low | None (packaging/metadata only) | [06-pypi-publishing.md](docs/roadmap/06-pypi-publishing.md) |
 
-The current release scope is a `0.1.0rc1` TestPyPI rehearsal. A successful
-rehearsal changes this status to **TestPyPI verified**. The milestone becomes
-**Done** only after `vorflow` is published to real PyPI.
+`0.1.0rc1` was published to TestPyPI and verified on 2026-09-30. The
+milestone becomes **Done** once `0.1.0` is published to PyPI.
 
 ## Completed Milestones
 
