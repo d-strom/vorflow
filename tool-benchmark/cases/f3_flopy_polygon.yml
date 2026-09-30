@@ -1,0 +1,21 @@
+id: f3_flopy_polygon
+tier: 1
+description: >
+  FloPy autotest voronoi_polygon: an irregular 17-vertex polygon about 9 x 7
+  km with one uniform size (maximum area 100^2). Sizes are the edges of
+  equilateral triangles of FloPy's Triangle maximum areas; the target is
+  FloPy's own cell count in that test.
+source: https://github.com/modflowpy/flopy/blob/develop/autotest/test_grid_cases.py (voronoi_polygon)
+crs: EPSG:32610
+h_max: 151.967
+growth: 1.2
+target_ncpl: 3803
+domain: >
+  POLYGON ((1831.381546 6335.543757, 4337.733475 6851.136153,
+  6428.747084 6707.916043, 8662.980804 6493.085878, 9350.437333 5891.561415,
+  9235.861245 4717.156511, 8963.743036 3685.971717, 8691.624826 2783.685023,
+  8047.134330 2038.940450, 7416.965845 578.095325, 6414.425073 105.468961,
+  5354.596258 205.723039, 4624.173696 363.265160, 3363.836725 563.773314,
+  1330.111160 1809.788273, 399.180444 2998.515188, 914.772840 5132.494831,
+  1831.381546 6335.543757))
+mf6_problems: [linear]

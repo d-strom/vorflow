@@ -1,0 +1,20 @@
+id: v3_thiem
+tier: 0
+description: >
+  Steady radial flow to a well pumping 100 m3/d at the centre of a 1000 m
+  radius circle (Thiem). Point refinement 2 m at the well, 80 m far field.
+source: new (docs/benchmark-plan.md, V3)
+crs: EPSG:32610
+h_max: 80.0
+growth: 1.2
+target_ncpl: 3000
+domain:
+  circle: [0, 0, 1000]
+  segments: 128
+features:
+  - id: well
+    kind: point
+    h: 2.0
+    wkt: POINT (0 0)
+mf6_problems:
+  - {name: thiem, well: well, rate: 100.0}

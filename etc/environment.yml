@@ -3,15 +3,18 @@ channels:
   - nodefaults
   - conda-forge
 dependencies:
-  - python>3.9
+  - python>=3.10
   - pip
   - gmsh
+  # python-gmsh carries the pip metadata for conda's gmsh. Without it, pip
+  # installs the PyPI wheel on top, whose bundled OpenMP aborts on macOS.
+  - python-gmsh
   - geopandas
   - shapely
   - numpy
   - pandas
+  - scipy
   - pyproj
-  - meshio
   - pytest
   - jupyter
   - matplotlib

@@ -1,0 +1,23 @@
+id: v4_barrier
+tier: 0
+description: >
+  Flow across a straight flow barrier that crosses a 1000 x 600 m rectangle at
+  30 degrees to the grid axes. The head drops linearly on each side and jumps
+  at the barrier (series resistance; the barrier takes about 46 % of the drop). Only
+  vorflow aligns cell faces with the line; the other tools get the barrier as
+  a refinement line and HFB on the zig-zag of crossing connections.
+source: new (docs/benchmark-plan.md, V4)
+crs: EPSG:32610
+h_max: 40.0
+growth: 1.2
+target_ncpl: 2000
+domain: POLYGON ((0 0, 1000 0, 1000 600, 0 600, 0 0))
+features:
+  - id: barrier
+    kind: line
+    h: 10.0
+    barrier: true
+    wkt: LINESTRING (673.205081 0, 326.794919 600)
+mf6_problems:
+  - {name: barrier, barrier: barrier, hydchr: 1.0e-3}
+  - linear

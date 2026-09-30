@@ -1,8 +1,8 @@
 # vorflow
 
-Voronoi mesh generation for MODFLOW 6 using Gmsh and Geopandas.
+Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas.
 
-`vorflow` is a Python package for creating 2D unstructured Voronoi cell meshes for groundwater modeling, particularly for MODFLOW 6. It leverages the power of `Gmsh` for robust triangular meshing and `Shapely`/`Geopandas` for geometric operations.
+`vorflow` is a Python package for creating 2D unstructured Voronoi cell meshes for groundwater modeling, particularly for MODFLOW 6. It leverages the power of `Gmsh` for robust triangular meshing and `Shapely`/`GeoPandas` for geometric operations.
 
 The process is designed to translate a conceptual model—defined by geometric features like polygons, lines, and points—into a high-quality Voronoi grid suitable for numerical simulation.
 
@@ -28,49 +28,133 @@ The typical workflow follows these steps:
 
 ## Installation
 
-The package dependencies are listed in `pyproject.toml`. You can install them using pip:
+`vorflow` requires Python 3.10 or newer. It is not yet published on PyPI, so
+install it from GitHub:
 
 ```bash
-pip install numpy pandas geopandas shapely scipy gmsh matplotlib
+pip install "git+https://github.com/rhugman/vorflow.git"
 ```
 
-To install `vorflow` itself, you can install it in editable mode from the root of the repository:
+On Linux, the `gmsh` wheel from PyPI needs the system GLU library (for example
+`sudo apt-get install libglu1-mesa` on Debian/Ubuntu).
+
+Release candidates are rehearsed on TestPyPI first. Once one is published
+there, it can be installed with (dependencies still come from PyPI):
 
 ```bash
-pip install -e .
+pip install --pre --index-url https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ vorflow
+```
+
+### Development installation
+
+Clone the repository and install it in editable mode:
+
+```bash
+git clone https://github.com/rhugman/vorflow.git
+cd vorflow
+pip install -e ".[dev]"
+```
+
+For plotting examples and notebooks without all development tools:
+
+```bash
+pip install -e ".[examples]"
+```
+
+Alternatively, create the Conda development environment from
+[`etc/environment.yml`](https://github.com/rhugman/vorflow/blob/main/etc/environment.yml),
+which installs the package in editable mode with the `dev` extra:
+
+```bash
+micromamba env create -f etc/environment.yml
 ```
 
 ## Basic Usage
 
-Here is a simple example of how to generate a grid:
+Here is a simple example of how to generate a non-empty Voronoi grid:
+
+The complete runnable version is
+[examples/basic_usage.py](https://github.com/rhugman/vorflow/blob/main/examples/basic_usage.py).
 
 ```python
-from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
-from shapely.geometry import box, Point, LineString
+from shapely.geometry import LineString, Point, box
 
-# 1. Define conceptual model features
+from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
+
 domain = box(0, 0, 200, 200)
 well_point = Point(25, 25)
 fault_line = LineString([(100, 0), (100, 150)])
 
-# 2. Create a blueprint
 blueprint = ConceptualMesh(crs="EPSG:3857")
 blueprint.add_polygon(domain, zone_id=1)
-blueprint.add_point(well_point, point_id="Well-A", resolution=2, dist_max=300)
-blueprint.add_line(fault_line, line_id="Fault-1", resolution=1, is_barrier=True)
+blueprint.add_point(
+    well_point,
+    point_id="Well-A",
+    resolution=2,
+    growth_factor=1.2,
+)
+blueprint.add_line(
+    fault_line,
+    line_id="Fault-1",
+    resolution=1,
+    is_barrier=True,
+)
 
 clean_polys, clean_lines, clean_pts = blueprint.generate()
 
-# 3. Generate the triangular mesh
 mesher = MeshGenerator(background_lc=100)
 mesher.generate(clean_polys, clean_lines, clean_pts)
 
-# 4. Convert to Voronoi grid
 tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
 grid_gdf = tessellator.generate()
-
-# 5. Save the output
-grid_gdf.to_file("mf6_grid.shp")
-
-print("Grid generation complete.")
+if grid_gdf.empty:
+    raise RuntimeError("Basic Usage generated an empty Voronoi grid")
 ```
+
+### Optional file export
+
+GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
+such as Pyogrio or Fiona. Install one of those engines before calling:
+
+```python
+grid_gdf.to_file("mf6_grid.gpkg", driver="GPKG")
+```
+
+### Mesh gradation
+
+Feature resolutions use `GeometricGrowthField` by default. Its
+`growth_factor` is an upper target for neighboring characteristic edge-length
+growth, not cell area growth and not an exact guarantee for every generated
+neighbor pair. The default `growth_factor=1.2` uses the transparent spatial law
+
+```text
+h(d) = feature_lc + (growth_factor - 1) * d.
+```
+
+For the continuous-metric convention, pass an explicit
+`GeometricGrowthField(growth_model="continuous_metric")`; this uses the gentler
+gradient `log(growth_factor)`. In normal `MeshGenerator` use, the global
+background field caps either result at `background_lc`.
+
+> **Coordinate systems:** always work in a *projected* CRS (e.g. UTM or a
+> national grid) so mesh sizes are in real length units (meters/feet).
+> Geographic coordinates (lat/lon degrees, e.g. EPSG:4326) produce
+> physically meaningless MODFLOW grids — reproject your data first with
+> `GeoDataFrame.to_crs()`.
+
+## Examples
+
+The [examples/](https://github.com/rhugman/vorflow/tree/main/examples)
+folder contains runnable scripts and notebooks
+covering field-based refinement, mesh quality diagnostics, structured quad
+buffers, active-domain workflows, and triangular element-grid export.
+
+## Roadmap
+
+See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
+for planned and completed milestones.
+
+## License
+
+MIT — see [LICENSE](https://github.com/rhugman/vorflow/blob/main/LICENSE).

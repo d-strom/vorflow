@@ -1,0 +1,23 @@
+name: vorflow-bench
+channels:
+  - nodefaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - gmsh
+  - geopandas
+  - shapely>=2
+  - numpy
+  - pandas
+  - scipy
+  - pyproj
+  - matplotlib
+  - fiona
+  - rasterio
+  - pyyaml
+  - psutil
+  - flopy>=3.10
+  - pip:
+      - -e ..
+      - mf6Voronoi==0.0.38

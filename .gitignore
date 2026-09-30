@@ -210,8 +210,14 @@ __marimo__/
 .DS_Store
 
 # vscode
-.code-workspace
+*.code-workspace
 
 # 
 .pyc
 __pycache__
+
+# Internal benchmarks / scratch experiments (not tracked)
+benchmarks/
+
+# Local conda environment in repo root
+.conda/

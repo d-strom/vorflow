@@ -1,0 +1,20 @@
+id: c0_point_grading
+tier: 0
+description: >
+  Calibration case: one refined point in a large square. The spec size grows
+  from 5 m at the point to 100 m at 475 m distance (growth 1.2). Used to fit
+  mf6Voronoi's ring multiplier to the spec, and to plot size vs distance for
+  every tool.
+source: new
+crs: EPSG:32610
+h_max: 100.0
+growth: 1.2
+target_ncpl: 3000
+domain: POLYGON ((0 0, 2000 0, 2000 2000, 0 2000, 0 0))
+features:
+  - id: well
+    kind: point
+    h: 5.0
+    wkt: POINT (1000 1000)
+# Exact heads on every boundary cell (holes included) keep the linear solution exact.
+mf6_problems: [linear]

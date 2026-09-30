@@ -1,0 +1,83 @@
+# Build, verify, and publish a release candidate (tags like v0.1.0rc1) to
+# TestPyPI using OIDC Trusted Publishing; no API token is stored in GitHub.
+#
+# One-time setup on the upstream repository before the first rc tag:
+#   1. On test.pypi.org, add a pending Trusted Publisher for project "vorflow":
+#      owner "rhugman", repository "vorflow", workflow "testpypi.yml",
+#      environment "testpypi".
+#   2. In GitHub (Settings > Environments), create the "testpypi" environment
+#      and add at least one required reviewer so each upload is approved by hand.
+#
+# The version is read from pyproject.toml; bump it there before tagging.
+# scripts/check_dist.py fails the build if the tag and pyproject disagree.
+
+name: Publish release candidate to TestPyPI
+
+on:
+  push:
+    tags:
+      - "v*rc*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Gmsh system library
+        run: sudo apt-get update && sudo apt-get install --yes libglu1-mesa
+      - name: Install build and test tools
+        # [dev] provides build, twine, and packaging (used by check_dist.py).
+        run: python -m pip install -e ".[dev]"
+      - name: Run Ruff
+        run: ruff check src tests scripts
+      - name: Run pytest
+        run: pytest --cov=vorflow --cov-report=term-missing
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Check package metadata rendering
+        run: python -m twine check dist/*
+      - name: Validate tag, metadata, and archive contents
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check_dist.py dist --expected-tag "$RELEASE_TAG"
+      - name: Smoke-test the built wheel
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          export EXPECTED_VERSION="${RELEASE_TAG#v}"
+          python -m venv "$RUNNER_TEMP/vorflow-smoke"
+          "$RUNNER_TEMP/vorflow-smoke/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/vorflow-smoke/bin/python" -m pip check
+          "$RUNNER_TEMP/vorflow-smoke/bin/python" -c "import os, vorflow; assert vorflow.__version__ == os.environ['EXPECTED_VERSION'], vorflow.__version__"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/vorflow-smoke/bin/python" "$GITHUB_WORKSPACE/examples/basic_usage.py"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vorflow
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish package distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
