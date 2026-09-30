@@ -13,6 +13,7 @@ fetch by hand.
 """
 
 import io
+import os
 import urllib.request
 import warnings
 import zipfile
@@ -36,6 +37,8 @@ MF6VORONOI_CASES = {
 SHAPEFILE_PARTS = ("shp", "shx", "dbf", "prj")
 
 VOROGRIDGEN_URL = "https://hydrosymple.com/?sdm_process_download=1&download_id=7123"
+# Hydrosymple answers 403 to urllib's default "Python-urllib" agent.
+USER_AGENT = "vorflow-benchmark (+https://github.com/rhugman/vorflow)"
 VOROGRIDGEN_EXAMPLE = "vorogridgen_example/example.gpkg"
 
 
@@ -54,9 +57,14 @@ def ensure(data_d: Path = DATA_D) -> None:
 def _download(url: str, target: Path) -> None:
     """Write one URL to target."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url, timeout=120) as response:
+    with _open(url, timeout=120) as response:
         target.write_bytes(response.read())
-    print(f"fetched {target.relative_to(HERE)}")
+    print(f"fetched {os.path.relpath(target, HERE)}")
+
+
+def _open(url: str, timeout: float):
+    """urlopen with the benchmark's User-Agent."""
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT}), timeout=timeout)
 
 
 def _vorogridgen_example_files() -> dict:
@@ -64,7 +72,7 @@ def _vorogridgen_example_files() -> dict:
     unpacked = BIN_D / "vorogridgen_dist" / "example"
     if unpacked.is_dir():
         return {p.name: p.read_text() for p in unpacked.iterdir() if p.is_file()}
-    with urllib.request.urlopen(VOROGRIDGEN_URL, timeout=300) as response:
+    with _open(VOROGRIDGEN_URL, timeout=300) as response:
         archive = zipfile.ZipFile(io.BytesIO(response.read()))
     return {Path(name).name: archive.read(name).decode()
             for name in archive.namelist() if "/example/" in f"/{name}" and not name.endswith("/")}
@@ -107,7 +115,7 @@ def convert_vorogridgen_example(files: dict, target: Path) -> None:
         warnings.filterwarnings("ignore", message="'crs' was not provided")   # the example has no .prj
         for name, gdf in layers.items():
             gdf.to_file(target, layer=name, driver="GPKG")
-    print(f"converted the VOROGRIDGEN example to {target.relative_to(HERE)}")
+    print(f"converted the VOROGRIDGEN example to {os.path.relpath(target, HERE)}")
 
 
 def _read_bln(text: str) -> list:

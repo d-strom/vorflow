@@ -37,8 +37,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install harness dependencies (no meshing tools needed)
-        run: python -m pip install numpy pandas shapely pyyaml psutil matplotlib "flopy>=3.10"
+      - name: Install harness dependencies (no meshing tools; geopandas reads the fetched case geometry)
+        run: python -m pip install numpy pandas shapely geopandas pyyaml psutil matplotlib "flopy>=3.10"
       - name: Install MODFLOW 6
         run: mkdir -p .bin && get-modflow --subset mf6 .bin
       - name: Download VOROGRIDGEN
@@ -107,7 +107,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install report dependencies
-        run: python -m pip install numpy pandas shapely pyyaml matplotlib "flopy>=3.10"
+        run: python -m pip install numpy pandas shapely geopandas pyyaml matplotlib "flopy>=3.10"
       - uses: actions/download-artifact@v4
         with:
           pattern: rows-*
