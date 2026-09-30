@@ -4,14 +4,28 @@ import numpy as np
 from shapely.geometry import Polygon, LineString, Point, box, MultiPolygon
 from shapely.ops import unary_union, snap, linemerge
 from shapely.validation import make_valid
+from .fields import ThresholdField, ExponentialField, AutoLinearField, AutoExponentialField, ConstantField
 from shapely.strtree import STRtree
 
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
-DEFAULT_TOLERANCE = 1e-3
+DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+
+def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance"):
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{parameter_name} must be a non-negative number. Boolean values are not supported."
+        )
+    if not isinstance(value, (int, float)):
+        raise TypeError(
+            f"{parameter_name} must be a non-negative number. Got {type(value).__name__}."
+        )
+    if value < 0:
+        raise ValueError(f"{parameter_name} must be non-negative. Got {value}.")
+    return float(value)
 
 class ConceptualMesh:
-    def __init__(self, crs="EPSG:4326"):
+    def __init__(self, crs="EPSG:4326", connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE):
         """
         Initializes the conceptual model, which holds raw geometric inputs.
 
@@ -21,8 +35,12 @@ class ConceptualMesh:
 
         Args:
             crs: The coordinate reference system for the project (e.g., "EPSG:4326").
+            connectivity_tolerance (float, optional): Default snapping tolerance used
+                during topology cleanup in generate(). Larger values make lines and
+                points connect more aggressively to nearby geometry.
         """
         self.crs = crs
+        self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
         self.raw_lines = []
@@ -40,12 +58,11 @@ class ConceptualMesh:
         zone_id,
         resolution=None,
         z_order=0,
-        mesh_refinement=True,
         dist_min=None,
         dist_max=None,
-        dist_max_in=None,
-        dist_max_out=None,
         densify=None,
+        fields=None,
+        embed=True,
         simplify_tolerance=None,
     ):
         """
@@ -58,15 +75,10 @@ class ConceptualMesh:
                 the background mesh size will be used.
             z_order (int): Stacking order for resolving overlaps. Higher values are
                 processed first and will "cut" into lower-order polygons.
-            mesh_refinement (bool): If True, this polygon will be used to control mesh
-                refinement. If False, it is used only for tagging the final cells.
             dist_min (float, optional): Distance from the polygon boundary where the mesh
                 size is held constant at the boundary's resolution.
-            dist_max (float, optional): Legacy alias for `dist_max_out`.
-            dist_max_in (float, optional): Distance inside the polygon over which the mesh
-                transitions from the boundary resolution to the internal resolution.
-            dist_max_out (float, optional): Distance outside the polygon over which the
-                mesh transitions to the background resolution.
+            dist_max (float, optional): Distance from the polygon boundary over which the mesh
+                transitions to the background resolution.
             densify (float|bool|None, optional): Controls polygon boundary densification:
                 - If False, disables densification.
                 - If True, densifies using `resolution` (lc). Requires `resolution` to be set.
@@ -75,6 +87,8 @@ class ConceptualMesh:
             simplify_tolerance (float|int|None, optional): If a number > 0, applies Douglas-Peucker
                 simplification with this tolerance. If None or 0, no simplification is applied.
                 Raises ValueError if negative. Boolean values are not supported.
+            fields (list, optional): List of MeshField objects.
+            embed (bool): If True, the polygon is embedded in the mesh. If False, it is used only for fields.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
@@ -92,9 +106,17 @@ class ConceptualMesh:
         if densify is True and (resolution is None or resolution <= 0):
             raise ValueError("densify=True for polygons requires a positive `resolution` (lc).")
 
-        # For backward compatibility, allow 'dist_max' to function as 'dist_max_out'.
-        if dist_max is not None and dist_max_out is None:
-            dist_max_out = dist_max
+        if resolution is not None and resolution <= 0:
+            raise ValueError(f"resolution must be positive (or None). Got {resolution}.")
+
+        if dist_max is not None and dist_max < 0:
+            raise ValueError(f"dist_max must be non-negative (or None). Got {dist_max}.")
+    
+        if dist_min is not None and dist_min < 0:
+            raise ValueError(f"dist_min must be non-negative (or None). Got {dist_min}.")
+
+        if fields is None:
+            fields = []
 
         self.raw_polygons.append(
             {
@@ -102,17 +124,17 @@ class ConceptualMesh:
                 "zone_id": zone_id,
                 "lc": resolution,
                 "z_order": z_order,
-                "refine": mesh_refinement,
                 "dist_min": dist_min,
-                "dist_max_in": dist_max_in,
-                "dist_max_out": dist_max_out,
+                "dist_max": dist_max,
                 "densify": densify,
                 "simplify_tolerance": simplify_tolerance,
+                'fields': fields,
+                'embed': embed
             }
         )
 
-    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,
-                  dist_min=None, dist_max=None, straddle_width=None, densify=True, simplify_tolerance=None):
+    def add_line(self, geometry, line_id, resolution, snap_to_polygons=True, is_barrier=False,                 
+                  dist_min=None, dist_max=None, straddle_width=None, fields=None, embed=True, densify=True, simplify_tolerance=None):
         """
         Adds a line feature, such as a river, fault, or other linear boundary.
 
@@ -130,6 +152,8 @@ class ConceptualMesh:
                 transitions to the background resolution.
             straddle_width (float, optional): If set, forces Voronoi cell edges to align
                 perfectly with the line by creating a "virtual straddle" of mesh nodes.
+            fields (list, optional): List of MeshField objects.
+            embed (bool): If True, the line is embedded in the mesh. If False, it is used only for fields.
             densify (float or bool, optional): Controls line densification:
                 - If False, disables densification.
                 - If True, densifies the line using the `resolution` value.
@@ -152,6 +176,9 @@ class ConceptualMesh:
         
         if isinstance(densify, (int, float)) and not isinstance(densify, bool) and densify <= 0:
             raise ValueError(f"densify must be positive when specified as a float. Got {densify}.")
+
+        if fields is None:
+            fields = []
         
         self.raw_lines.append({
             'geometry': geometry,
@@ -161,11 +188,13 @@ class ConceptualMesh:
             'dist_min': dist_min,
             'dist_max': dist_max,
             'straddle_width': straddle_width,
+            'fields': fields,
+            'embed': embed,
             'densify': densify,
             'simplify_tolerance': simplify_tolerance
         })
 
-    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, simplify_tolerance=None):
+    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None, embed=True, simplify_tolerance=None):
         """
         Adds a point feature, such as a well or an observation point.
 
@@ -188,12 +217,17 @@ class ConceptualMesh:
             )
         if isinstance(simplify_tolerance, (int, float)) and simplify_tolerance < 0:
             raise ValueError(f"simplify_tolerance must be non-negative. Got {simplify_tolerance}.")
+
+        if fields is None:
+            fields = []
         self.raw_points.append({
             'geometry': geometry,
             'point_id': point_id,
             'lc': resolution,
             'dist_min': dist_min,
             'dist_max': dist_max,
+            'fields': fields,
+            'embed': embed,
             'simplify_tolerance': simplify_tolerance
         })
     def _apply_simplification(self):
@@ -317,12 +351,12 @@ class ConceptualMesh:
                     "zone_id",
                     "lc",
                     "z_order",
-                    "refine",
                     "dist_min",
-                    "dist_max_in",
-                    "dist_max_out",
+                    "dist_max",
                     "densify",
                     "simplify_tolerance",
+                    "fields",
+                    "embed",
                 ],
                 crs=self.crs,
             )
@@ -376,13 +410,18 @@ class ConceptualMesh:
 
         self.clean_polygons = gpd.GeoDataFrame(final_features, crs=self.crs)
 
-    def _enforce_connectivity(self, tolerance=DEFAULT_TOLERANCE):
+    def _enforce_connectivity(self, connectivity_tolerance=None):
         """
         Snaps features together to ensure they are topologically connected before
         being passed to the mesher. This is crucial for Gmsh to correctly
 
         interpret shared boundaries.
         """
+        if connectivity_tolerance is None:
+            tolerance = self.connectivity_tolerance
+        else:
+            tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
+
         # 1. Collect all polygon boundaries into a single geometry.
         # We snap to the linear boundaries, not the polygon areas.
         if not self.clean_polygons.empty:
@@ -421,32 +460,185 @@ class ConceptualMesh:
                     self.raw_points[i]['geometry'] = snapped_point
 
 
-    def generate(self):
+    def _clip_features_to_domain(self):
+        """Remove or trim line/point features that remain outside the meshing domain."""
+        if self.clean_polygons.empty:
+            return
+
+        domain_union = unary_union(self.clean_polygons.geometry)
+        if domain_union.is_empty:
+            return
+        domain_union = make_valid(domain_union)
+
+        clipped_lines = []
+        for line_data in self.raw_lines:
+            geom = line_data.get("geometry")
+            if geom is None or geom.is_empty:
+                continue
+            try:
+                clipped = geom.intersection(domain_union)
+            except Exception:
+                clipped = make_valid(geom).intersection(domain_union)
+
+            if clipped.is_empty:
+                continue
+
+            line_parts = []
+            if clipped.geom_type in ("LineString", "MultiLineString"):
+                line_parts = [clipped] if clipped.geom_type == "LineString" else list(clipped.geoms)
+            elif clipped.geom_type == "GeometryCollection":
+                line_parts = [
+                    part for part in clipped.geoms
+                    if part.geom_type in ("LineString", "MultiLineString") and not part.is_empty
+                ]
+
+            for part in line_parts:
+                if part.geom_type == "MultiLineString":
+                    for subpart in part.geoms:
+                        if subpart.length > 0:
+                            feat = line_data.copy()
+                            feat["geometry"] = subpart
+                            clipped_lines.append(feat)
+                elif part.length > 0:
+                    feat = line_data.copy()
+                    feat["geometry"] = part
+                    clipped_lines.append(feat)
+
+        removed_lines = len(self.raw_lines) - len(clipped_lines)
+        if removed_lines > 0:
+            print(f"Clipped/removed {removed_lines} line feature(s) outside the domain.")
+        self.raw_lines = clipped_lines
+
+        kept_points = []
+        for point_data in self.raw_points:
+            geom = point_data.get("geometry")
+            if geom is None or geom.is_empty:
+                continue
+            if domain_union.covers(geom):
+                kept_points.append(point_data)
+
+        removed_points = len(self.raw_points) - len(kept_points)
+        if removed_points > 0:
+            print(f"Removed {removed_points} point feature(s) outside the domain.")
+        self.raw_points = kept_points
+
+
+    def generate(self, connectivity_tolerance=None):
         """
         Runs the full preprocessing workflow: resolves polygon overlaps,
         ensures topological connectivity, and prepares clean GeoDataFrames
         for the mesher.
+
+        Args:
+            connectivity_tolerance (float, optional): Override for the instance's
+                default topology snapping tolerance during this preprocessing run.
         """
         print("Applying optional geometry simplification...")
         self._apply_simplification()
+
+        # --- Embed semantics for polygons ---
+        # Polygons with embed=True define the actual meshing domain and therefore
+        # participate in the cookie-cutter (overlap resolution) process.
+        # Polygons with embed=False are refinement-only (field-only) regions and
+        # must NOT affect domain topology.
+        embedded_polys = [p for p in self.raw_polygons if bool(p.get("embed", True))]
+        field_only_polys = [p for p in self.raw_polygons if not bool(p.get("embed", True))]
+
+        # Only embedded polygons are used to build the domain partition.
+        self.raw_polygons = embedded_polys
 
         print("Resolving polygon overlaps...")
         self._resolve_overlaps()
         
         print("Enforcing strict topology...")
-        self._enforce_connectivity()
+        self._enforce_connectivity(connectivity_tolerance=connectivity_tolerance)
+
+        print("Clipping features to domain...")
+        self._clip_features_to_domain()
         
         # Promote the processed raw geometries to final "clean" GeoDataFrames.
         if self.raw_lines:
             self.clean_lines = gpd.GeoDataFrame(self.raw_lines, crs=self.crs)
         else:
-            self.clean_lines = gpd.GeoDataFrame(columns=['geometry', 'line_id', 'lc', 'is_barrier', 'dist_min', 'dist_max', 'straddle_width'], crs=self.crs)
+            self.clean_lines = gpd.GeoDataFrame(
+                columns=[
+                    'geometry',
+                    'line_id',
+                    'lc',
+                    'is_barrier',
+                    'dist_min',
+                    'dist_max',
+                    'straddle_width',
+                    'fields',
+                    'embed',
+                    'densify',
+                    'simplify_tolerance',
+                ],
+                crs=self.crs,
+            )
    
         # Clean Points
         if self.raw_points:
             self.clean_points = gpd.GeoDataFrame(self.raw_points, crs=self.crs)
         else:
-            self.clean_points = gpd.GeoDataFrame(columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max'], crs=self.crs)
+            self.clean_points = gpd.GeoDataFrame(
+                columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max', 'fields', 'embed', 'simplify_tolerance'],
+                crs=self.crs,
+            )
+
+        # Clip field-only polygons to the final embedded domain.
+        # Field-only polygons should not extend outside the domain, but they also
+        # should not cut/modify domain topology.
+        if field_only_polys and not self.clean_polygons.empty:
+            domain_union = unary_union(self.clean_polygons.geometry)
+            domain_union = make_valid(domain_union)
+
+            clipped_features = []
+            for poly_data in field_only_polys:
+                geom = poly_data.get("geometry")
+                if geom is None or geom.is_empty:
+                    continue
+                geom = make_valid(geom)
+                try:
+                    clipped = geom.intersection(domain_union)
+                except Exception:
+                    clipped = make_valid(geom).intersection(make_valid(domain_union))
+
+                if clipped.is_empty:
+                    continue
+
+                feat = poly_data.copy()
+                feat["geometry"] = make_valid(clipped)
+                clipped_features.append(feat)
+
+            if clipped_features:
+                field_only_gdf = gpd.GeoDataFrame(clipped_features, crs=self.crs)
+                # Align schemas before concat to avoid pandas dtype inference warnings
+                # while preserving the canonical polygon columns.
+                polygon_columns = [
+                    'geometry',
+                    'zone_id',
+                    'lc',
+                    'z_order',
+                    'dist_min',
+                    'dist_max',
+                    'fields',
+                    'embed',
+                    'densify',
+                    'simplify_tolerance',
+                ]
+                self.clean_polygons = self.clean_polygons.reindex(columns=polygon_columns)
+                field_only_gdf = field_only_gdf.reindex(columns=polygon_columns)
+                # Drop all-null non-geometry columns only during concat; they are
+                # restored immediately after so the public GeoDataFrame shape is unchanged.
+                concat_frames = [
+                    frame.dropna(axis=1, how='all')
+                    for frame in (self.clean_polygons, field_only_gdf)
+                ]
+                self.clean_polygons = gpd.GeoDataFrame(
+                    pd.concat(concat_frames, ignore_index=True).reindex(columns=polygon_columns),
+                    crs=self.crs,
+                )
 
         print("Densifying geometry...")
         self._apply_densification()

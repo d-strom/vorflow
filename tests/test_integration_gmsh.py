@@ -5,6 +5,7 @@ import gmsh
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.engine import MeshGenerator
+from vorflow.fields import AutoExponentialField
 from vorflow.tessellator import VoronoiTessellator
 
 @pytest.fixture(autouse=True)
@@ -25,7 +26,7 @@ def test_gmsh_integration_simple_square():
     # 10x10 square
     square = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
     # Zone ID 1, resolution 2.0 (coarse mesh for speed)
-    cm.add_polygon(square, zone_id=1, resolution=2.0)
+    cm.add_polygon(square, zone_id=1, resolution=2.0, dist_max=10.0)
     
     clean_polys, clean_lines, clean_points = cm.generate()
     
@@ -59,7 +60,7 @@ def test_gmsh_integration_with_internal_line():
     """
     cm = ConceptualMesh(crs="EPSG:3857")
     square = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
-    cm.add_polygon(square, zone_id=1, resolution=5.0)
+    cm.add_polygon(square, zone_id=1, resolution=5.0, dist_max=25.0)
     
     # Diagonal line with finer resolution
     line = LineString([(1, 1), (9, 9)])
@@ -81,6 +82,172 @@ def test_gmsh_integration_with_internal_line():
     # because of the 1.0 resolution line.
     assert len(grid) > 10
 
+
+def test_gmsh_integration_tolerates_duplicate_line_vertices():
+    """Duplicate consecutive line vertices should not crash mesh generation."""
+    cm = ConceptualMesh(crs="EPSG:3857")
+    square = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    cm.add_polygon(square, zone_id=1, resolution=4.0, dist_max=20.0)
+
+    line = LineString([(1, 1), (5, 5), (5, 5), (9, 9)])
+    cm.add_line(line, line_id="duplicate_vertices", resolution=1.0)
+
+    clean_polys, clean_lines, clean_points = cm.generate()
+
+    mg = MeshGenerator(background_lc=4.0, verbosity=0)
+    success = mg.generate(clean_polys, clean_lines, clean_points)
+
+    assert success
+    assert mg.nodes is not None
+    assert len(mg.nodes) > 0
+
+
+def test_gmsh_integration_tolerates_near_duplicate_line_vertices():
+    """Near-zero segments should be cleaned before OCC line creation."""
+    cm = ConceptualMesh(crs="EPSG:3857")
+    square = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    cm.add_polygon(square, zone_id=1, resolution=4.0, dist_max=20.0)
+
+    line = LineString([(1, 8), (5, 8), (5 + 1e-9, 8), (9, 8)])
+    cm.add_line(line, line_id="near_duplicate_vertices", resolution=1.0)
+
+    clean_polys, clean_lines, clean_points = cm.generate()
+
+    mg = MeshGenerator(background_lc=4.0, verbosity=0)
+    success = mg.generate(clean_polys, clean_lines, clean_points)
+
+    assert success
+    assert mg.nodes is not None
+    assert len(mg.nodes) > 0
+
+
+def test_gmsh_integration_with_field_only_line_refinement():
+    """A non-embedded (field-only) line should refine the mesh without partitioning it."""
+    cm = ConceptualMesh(crs="EPSG:3857")
+    square = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    cm.add_polygon(square, zone_id=1, resolution=5.0, dist_max=25.0)
+
+    # Field-only diagonal line with finer resolution.
+    line = LineString([(1, 1), (9, 9)])
+    cm.add_line(line, line_id="fault", resolution=1.0, embed=False)
+
+    clean_polys, clean_lines, clean_points = cm.generate()
+
+    mg = MeshGenerator(background_lc=5.0, verbosity=1)
+    success = mg.generate(clean_polys, clean_lines, clean_points)
+    assert success
+
+    vt = VoronoiTessellator(mg, cm, clip_to_boundary=True)
+    grid = vt.generate()
+    assert not grid.empty
+
+    # Still expect refinement from the line-based size field.
+    assert len(grid) > 10
+
+
+def _constant_fields_for_surfaces(surface_tags, expected_vin):
+    matches = []
+    expected_surfaces = {float(tag) for tag in surface_tags}
+
+    for field_id in gmsh.model.mesh.field.list():
+        if gmsh.model.mesh.field.getType(field_id) != "Constant":
+            continue
+
+        surfaces = set(gmsh.model.mesh.field.getNumbers(field_id, "SurfacesList"))
+        if surfaces != expected_surfaces:
+            continue
+
+        vin = gmsh.model.mesh.field.getNumber(field_id, "VIn")
+        if vin == pytest.approx(expected_vin):
+            matches.append(field_id)
+
+    return matches
+
+
+def test_embedded_polygon_field_has_constant_interior():
+    """Embedded polygon size fields should stay constant inside the surface."""
+    cm = ConceptualMesh(crs="EPSG:3857")
+    domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    inner = Polygon([(5, 5), (15, 5), (15, 15), (5, 15)])
+
+    cm.add_polygon(domain, zone_id=1, resolution=10.0, z_order=0)
+    cm.add_polygon(
+        inner,
+        zone_id=2,
+        resolution=2.0,
+        z_order=1,
+        fields=[AutoExponentialField(growth_factor=1.2)],
+    )
+    clean_polys, clean_lines, clean_points = cm.generate()
+
+    mg = MeshGenerator(background_lc=10.0, verbosity=0)
+    gmsh.initialize()
+    try:
+        gmsh.model.add("embedded_polygon_field")
+        gmsh_map = mg._add_geometry(clean_polys, clean_lines, clean_points)
+        mg._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
+
+        inner_idx = int(clean_polys.index[clean_polys["zone_id"] == 2][0])
+        inner_surfaces = set(gmsh_map["surfaces"][inner_idx])
+        inner_surface_tags = {
+            float(tag) for dim, tag in inner_surfaces if int(dim) == 2
+        }
+
+        constant_fields = _constant_fields_for_surfaces(inner_surface_tags, 2.0)
+
+        assert constant_fields, "Expected a constant field inside the embedded polygon surface"
+    finally:
+        gmsh.finalize()
+
+
+def test_field_only_polygon_field_has_constant_interior_without_partitioning():
+    """Field-only polygons should get flat interior sizing without becoming domain zones."""
+    cm = ConceptualMesh(crs="EPSG:3857")
+    domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
+    field_poly = Polygon([(5, 5), (15, 5), (15, 15), (5, 15)])
+
+    cm.add_polygon(domain, zone_id=1, resolution=10.0, z_order=0)
+    cm.add_polygon(
+        field_poly,
+        zone_id="field-only",
+        resolution=2.0,
+        fields=[AutoExponentialField(growth_factor=1.2)],
+        embed=False,
+    )
+    clean_polys, clean_lines, clean_points = cm.generate()
+
+    field_idx = int(clean_polys.index[clean_polys["zone_id"] == "field-only"][0])
+    domain_idx = int(clean_polys.index[clean_polys["zone_id"] == 1][0])
+    assert bool(clean_polys.loc[field_idx, "embed"]) is False
+
+    mg = MeshGenerator(background_lc=10.0, verbosity=0)
+    gmsh.initialize()
+    try:
+        gmsh.model.add("field_only_polygon_field")
+        gmsh_map = mg._add_geometry(clean_polys, clean_lines, clean_points)
+        mg._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points)
+
+        field_surfaces = set(gmsh_map["surfaces"][field_idx])
+        field_surface_tags = {
+            float(tag) for dim, tag in field_surfaces if int(dim) == 2
+        }
+
+        constant_fields = _constant_fields_for_surfaces(field_surface_tags, 2.0)
+        assert constant_fields, "Expected a constant field inside the field-only polygon surface"
+
+        embedded_domain_ids = [
+            int(i)
+            for i, row in clean_polys.iterrows()
+            if bool(row.get("embed", True))
+        ]
+        assert embedded_domain_ids == [domain_idx]
+    finally:
+        gmsh.finalize()
+
+    assert mg.generate(clean_polys, clean_lines, clean_points)
+    assert len(mg.nodes) > 0
+
+
 def test_gmsh_integration_overlapping_polygon_with_hole():
     """
     Test the case where an overlapping polygon (Zone 2) has a hole in its center.
@@ -91,7 +258,7 @@ def test_gmsh_integration_overlapping_polygon_with_hole():
     # 1. Base Domain (Large Square) - Zone 1
     # 20x20 square
     domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
-    cm.add_polygon(domain, zone_id=1, resolution=5.0, z_order=0)
+    cm.add_polygon(domain, zone_id=1, resolution=5.0, dist_max=25.0, z_order=0)
     
     # 2. Overlapping Polygon with Hole (Donut) - Zone 2
     # Outer: 5,5 to 15,15
@@ -100,7 +267,7 @@ def test_gmsh_integration_overlapping_polygon_with_hole():
     donut_hole = [(8, 8), (12, 8), (12, 12), (8, 12)]
     donut = Polygon(donut_shell, [donut_hole])
     
-    cm.add_polygon(donut, zone_id=2, resolution=2.0, z_order=1)
+    cm.add_polygon(donut, zone_id=2, resolution=2.0, dist_max=10.0, z_order=1)
     
     # 3. Generate Conceptual Mesh
     clean_polys, clean_lines, clean_points = cm.generate()
