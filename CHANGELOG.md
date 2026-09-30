@@ -7,17 +7,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- `VoronoiTessellator(boundary_inset_fraction=...)` now defaults to 0.25
-  instead of 0.5. At 0.5, `boundary_centering="inset_mirror"` moved boundary
-  nodes past the point where their cells are centred on Gmsh meshes and made
-  centroid-to-centroid boundary orthogonality worse than `"clip"` (median
-  ortho_error 12.0 vs 6.4 degrees on a 200 x 200 box at `background_lc=20`).
-  At 0.25 the median is 1.4 degrees there, and 1.3 vs 6.9 degrees on the
-  comprehensive demo model. Pass `boundary_inset_fraction=0.5` for the old
-  behaviour.
-
 ### Fixed
 
 - Enforcing a barrier no longer crashes with a GEOS `Invalid number of points
@@ -25,6 +14,42 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   smaller than the vertex-snapping tolerance. Such a piece now keeps its
   unsnapped geometry, as a piece that snapping would make invalid already
   did.
+
+## [0.1.0rc1]
+
+### Fixed
+
+- Kept conceptual-mesh inputs intact across repeated preprocessing calls.
+- Made overlapping-zone tie-breaking deterministic.
+- Honored the `snap_to_polygons=False` opt-out for line features.
+- Preserved integer cell IDs when splitting cells along barrier lines.
+- Kept quality reports usable with Gmsh 4.11 by retaining unsupported metrics as `NaN`.
+- Restored Shapely 2.0 resampling plus stable lint and minimum-dependency CI.
+- Kept barrier straddle points separate from point features with the same
+  index; a point's size field no longer leaks onto an unrelated barrier.
+- Enforced barriers wherever cells actually straddle them, including quad
+  buffers with `quad_buffer_thickness=2` and cells at barrier ends.
+- Field-only (`embed=False`) polygons no longer assign zones or change the
+  clip domain, in both the Voronoi grid and the element grid.
+- Kept `node_id` unique when clipping splits a cell into several parts.
+- Cells whose generator sits on a slanted domain edge get the nearest zone
+  instead of no `zone_id` (about 3% of cells on a simple pentagon domain).
+- Polygon simplification no longer opens gaps along edges shared with
+  neighbouring polygons.
+- Point deduplication no longer depends on which point of a close pair has
+  `simplify_tolerance`, and clean points keep their insertion order.
+- Face skewness now reports the standard CVFD measure; the generator-mode
+  value was always zero.
+- `MeshGenerator(verbosity=...)` no longer changes the package-wide log
+  level; the setting applies only while `generate()` runs.
+- Custom `MeshField` subclasses with unhashable attributes can be grouped.
+- With `heal_shapes=True`, surfaces or curves with identical bounding boxes
+  (e.g. two triangles tiling a square) no longer swap feature ownership, which
+  gave one zone's refinement to its neighbour. Entities are matched across
+  `removeAllDuplicates`/`healShapes` by location within a tolerance, so near
+  coincident points also resolve to the nearest survivor.
+- Inset-mirror boundary centering skips nodes whose mirror ghost would land
+  inside the domain, and is about 20x faster on large meshes.
 - A standard line crossing a barrier (or straddle) line now ends exactly on a
   straddle pair placed at the crossing, instead of being trimmed back by the
   barrier corridor with its end nodes at an arbitrary offset from the nearest
@@ -103,42 +128,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the example notebooks' grids. Below about 24 degrees between line and
   boundary, a boundary node still lies nearer the end than the slid pair, and
   its cell is split with a mirror.
-
-## [0.1.0rc1]
-
-### Fixed
-
-- Kept conceptual-mesh inputs intact across repeated preprocessing calls.
-- Made overlapping-zone tie-breaking deterministic.
-- Honored the `snap_to_polygons=False` opt-out for line features.
-- Preserved integer cell IDs when splitting cells along barrier lines.
-- Kept quality reports usable with Gmsh 4.11 by retaining unsupported metrics as `NaN`.
-- Restored Shapely 2.0 resampling plus stable lint and minimum-dependency CI.
-- Kept barrier straddle points separate from point features with the same
-  index; a point's size field no longer leaks onto an unrelated barrier.
-- Enforced barriers wherever cells actually straddle them, including quad
-  buffers with `quad_buffer_thickness=2` and cells at barrier ends.
-- Field-only (`embed=False`) polygons no longer assign zones or change the
-  clip domain, in both the Voronoi grid and the element grid.
-- Kept `node_id` unique when clipping splits a cell into several parts.
-- Cells whose generator sits on a slanted domain edge get the nearest zone
-  instead of no `zone_id` (about 3% of cells on a simple pentagon domain).
-- Polygon simplification no longer opens gaps along edges shared with
-  neighbouring polygons.
-- Point deduplication no longer depends on which point of a close pair has
-  `simplify_tolerance`, and clean points keep their insertion order.
-- Face skewness now reports the standard CVFD measure; the generator-mode
-  value was always zero.
-- `MeshGenerator(verbosity=...)` no longer changes the package-wide log
-  level; the setting applies only while `generate()` runs.
-- Custom `MeshField` subclasses with unhashable attributes can be grouped.
-- With `heal_shapes=True`, surfaces or curves with identical bounding boxes
-  (e.g. two triangles tiling a square) no longer swap feature ownership, which
-  gave one zone's refinement to its neighbour. Entities are matched across
-  `removeAllDuplicates`/`healShapes` by location within a tolerance, so near
-  coincident points also resolve to the nearest survivor.
-- Inset-mirror boundary centering skips nodes whose mirror ghost would land
-  inside the domain, and is about 20x faster on large meshes.
+- With pandas 1.5 / GeoPandas 0.13, clipping to the domain no longer puts
+  cell geometries on the wrong rows, which gave most cells another
+  generator's `node_id` and `x`/`y`. The grid is clipped without `gpd.clip`
+  and keeps the Voronoi row order. Barrier fragment merging also works with
+  Shapely 2.0, whose `STRtree` made the cell array read-only.
 
 ### Added
 
@@ -170,6 +164,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Barrier straddle offsets use a tangent probe proportional to line length,
   which can move barrier nodes by floating-point amounts.
 - Python 3.10 is now the minimum; matplotlib is optional (`examples` extra).
+- `VoronoiTessellator(boundary_inset_fraction=...)` now defaults to 0.25
+  instead of 0.5. At 0.5, `boundary_centering="inset_mirror"` moved boundary
+  nodes past the point where their cells are centred on Gmsh meshes and made
+  centroid-to-centroid boundary orthogonality worse than `"clip"` (median
+  ortho_error 12.0 vs 6.4 degrees on a 200 x 200 box at `background_lc=20`).
+  At 0.25 the median is 1.4 degrees there, and 1.3 vs 6.9 degrees on the
+  comprehensive demo model. Pass `boundary_inset_fraction=0.5` for the old
+  behaviour.
 
 ### Deprecated
 

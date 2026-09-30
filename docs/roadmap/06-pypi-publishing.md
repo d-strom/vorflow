@@ -22,16 +22,21 @@ verifying `0.1.0rc1`; real PyPI publication remains a separate approval gate.
 - One canonical Basic Usage script that runs against an installed wheel.
 - Cross-platform CI plus a Python 3.10 job for the six exact dependency floors.
 - Automated wheel/sdist content and built-metadata validation.
-- A `v*rc*` GitHub Actions workflow that builds once and publishes only to
-  TestPyPI through the protected `testpypi` environment and short-lived OIDC
-  credentials.
+- One tag-triggered workflow (`.github/workflows/release.yml`) that builds,
+  tests and validates once, then publishes `vX.Y.ZrcN` tags to TestPyPI
+  (protected `testpypi` environment) and `vX.Y.Z` tags to PyPI (protected
+  `pypi` environment), both with short-lived OIDC credentials. Any other tag
+  fails `scripts/check_dist.py` before upload.
 - `__version__` resolved from installed metadata, with a neutral source-tree
   fallback instead of a duplicated release number.
 
-An earlier local rehearsal passed Ruff, the full test suite, isolated archive
-builds, Twine checks, archive validation, fresh-wheel installation, `pip check`,
-and the Basic Usage example outside the source tree. The current PR head still
-requires fresh CI and release-workflow verification.
+A local rehearsal on 2026-09-30 (`develop` at 427e30e plus the release
+workflow changes) passed Ruff, the full test suite (331 tests), an isolated
+archive build, Twine checks, archive validation against `v0.1.0rc1`,
+fresh-wheel installation, `pip check`, and the Basic Usage example outside the
+source tree. `0.1.0rc1` has not been tagged or published yet, so the changes
+listed under `[Unreleased]` since the first release-candidate preparation were
+folded into its changelog section.
 
 ## Completed release preparation
 
@@ -43,21 +48,45 @@ requires fresh CI and release-workflow verification.
 - [x] Record Oscar's primary authorship and name-only co-maintainer metadata
   for rhugman.
 - [x] Add the changelog, modern licence metadata, and package keywords.
-- [x] Add an RC-only, TestPyPI-only Trusted Publishing workflow.
+- [x] Add a Trusted Publishing workflow: rc tags to TestPyPI, final tags to
+  PyPI.
 
 ## Remaining TestPyPI rehearsal
 
-- [ ] Address release code-review findings and integrate the focused release
-  branch into `main`.
-- [ ] Verify the upstream `testpypi` GitHub environment (with a required
-  reviewer) and the TestPyPI Trusted Publisher identity (see the header of
-  `.github/workflows/testpypi.yml`).
+- [ ] Re-enable the `pytest` workflow on GitHub. It was disabled for
+  inactivity (weekly `schedule` trigger), so it did not run on the
+  `develop` -> `main` PR: `gh workflow enable python-app.yml`.
+- [ ] Get a green `pytest` run on the release PR and integrate `develop` into
+  `main`.
+- [ ] Create the upstream `testpypi` GitHub environment (with a required
+  reviewer) and the TestPyPI pending Trusted Publisher (workflow
+  `release.yml`, environment `testpypi`; see the header of
+  `.github/workflows/release.yml`).
 - [ ] Create and push the annotated `v0.1.0rc1` tag.
 - [ ] Review the GitHub build and manually approve the protected `testpypi`
   deployment.
 - [ ] Inspect the TestPyPI project page and install `0.1.0rc1` independently.
 - [ ] Record the result as **TestPyPI verified**. Real PyPI publication remains
   a separate approval gate.
+
+## Final PyPI release (`0.1.0`)
+
+Only after the TestPyPI rehearsal is verified:
+
+- [ ] Create the upstream `pypi` GitHub environment (with a required reviewer)
+  and the PyPI pending Trusted Publisher (workflow `release.yml`, environment
+  `pypi`).
+- [ ] Bump `version` in `pyproject.toml` to `0.1.0`.
+- [ ] In `README.md`, replace the "not yet published on PyPI" installation text
+  with `pip install vorflow`; keep the GLU note for Linux.
+- [ ] In `CHANGELOG.md`, add a dated `## [0.1.0] - YYYY-MM-DD` section above
+  `[0.1.0rc1]` (listing any changes since the candidate, or stating that there
+  were none) and its compare link.
+- [ ] Merge to `main`, then create and push the annotated `v0.1.0` tag from
+  `main`.
+- [ ] Review the build and approve the protected `pypi` deployment.
+- [ ] Install `vorflow==0.1.0` from PyPI in a fresh environment, check
+  `vorflow.__version__`, and mark this milestone **Done**.
 
 ## Phase 3 — Nice-to-have (can follow in later 0.x releases)
 
@@ -75,12 +104,12 @@ requires fresh CI and release-workflow verification.
 ## Release sequence
 
 1. Integrate the reviewed release branch into `main`.
-2. Tag `v0.1.0rc1`; only the `v*rc*` TestPyPI workflow can match.
+2. Tag `v0.1.0rc1`; `release.yml` routes rc tags to TestPyPI only.
 3. Let GitHub rebuild, retest, and validate one wheel and one sdist.
 4. Review the build results, then manually approve the protected `testpypi`
    deployment.
-5. Verify the rendered TestPyPI page and an independent installation, then stop
-   before real PyPI.
+5. Verify the rendered TestPyPI page and an independent installation.
+6. Follow **Final PyPI release** above; the `v0.1.0` tag goes to PyPI only.
 
 ## Verification
 
