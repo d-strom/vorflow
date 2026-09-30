@@ -7,9 +7,11 @@ import geopandas as gpd
 import pandas as pd
 import numpy as np
 from shapely.geometry import Polygon, LineString, MultiPolygon
-from shapely.ops import unary_union, snap
+from shapely.ops import unary_union, snap, polygonize
 from shapely.prepared import prep
 from shapely.validation import make_valid
+
+from ._features import line_parts as _line_parts
 from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,114 @@ def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance
     if value < 0:
         raise ValueError(f"{parameter_name} must be non-negative. Got {value}.")
     return float(value)
+
+
+def _simplify_keeping_shared_edges(geom, tol, neighbours):
+    """Simplify a polygon without moving boundary it shares with ``neighbours``.
+
+    Simplifying adjacent polygons independently pulls their common edge apart
+    and opens gaps in the domain. Boundary that coincides with a neighbour's
+    boundary is kept verbatim; only the free parts are simplified, and the
+    polygon is rebuilt from the resulting linework. Falls back to the
+    unsimplified geometry (with a warning) if the rebuild is not a valid
+    areal geometry.
+    """
+    others = [n.boundary for n in neighbours if n.intersects(geom)]
+    shared = unary_union(others).intersection(geom.boundary) if others else None
+    shared_lines = _line_parts(shared) if shared is not None else []
+    if not shared_lines:
+        return geom.simplify(tol, preserve_topology=True)
+
+    shared_union = unary_union(shared_lines)
+    free = geom.boundary.difference(shared_union)
+    free_lines = [part.simplify(tol, preserve_topology=True) for part in _line_parts(free)]
+    faces = list(polygonize(unary_union(shared_lines + free_lines)))
+    kept = [face for face in faces if face.intersection(geom).area > 0.5 * face.area]
+    rebuilt = unary_union(kept) if kept else None
+    if rebuilt is None or rebuilt.is_empty or not rebuilt.is_valid or rebuilt.area <= 0:
+        warnings.warn(
+            "Could not simplify a polygon while preserving its shared edges; "
+            "keeping it unsimplified.",
+            stacklevel=3,
+        )
+        return geom
+    return rebuilt
+
+
+def _deduplicate_points(points):
+    """Drop points within tolerance of a finer point; keep insertion order.
+
+    Points are visited finest-first (by ``lc``). A point is dropped when it
+    lies closer than ``max(its tolerance, the kept point's tolerance)`` to an
+    already kept point, so the result does not depend on which of a close
+    pair carries the tolerance. Returns the kept points in their original
+    order.
+    """
+    def tolerance(point):
+        tol = point.get("simplify_tolerance")
+        return float(tol) if tol is not None and tol > 0 else 0.0
+
+    order = sorted(
+        range(len(points)),
+        key=lambda i: points[i]["lc"] if points[i]["lc"] is not None else float("inf"),
+    )
+    max_tol = max(tolerance(p) for p in points)
+    if max_tol == 0.0:
+        return list(points)
+
+    geoms = [p["geometry"] for p in points]
+    tree = STRtree(geoms)
+    kept = set()
+    for i in order:
+        own_tol = tolerance(points[i])
+        candidates = tree.query(geoms[i].buffer(max_tol))
+        is_duplicate = any(
+            j in kept and geoms[j].distance(geoms[i]) < max(own_tol, tolerance(points[j]))
+            for j in candidates
+        )
+        if not is_duplicate:
+            kept.add(i)
+    return [points[i] for i in sorted(kept)]
+
+
+def _warn_deprecated(message):
+    """Emit a DeprecationWarning pointing at the caller of add_polygon()."""
+    warnings.warn(message, DeprecationWarning, stacklevel=4)
+
+
+def _resolve_legacy_polygon_args(densify, dist_max, mesh_refinement, border_density,
+                                 dist_max_in, dist_max_out):
+    """Map pre-0.1 add_polygon keywords onto the current API.
+
+    Returns ``(densify, dist_max, border_lc)``.
+    """
+    if mesh_refinement is not None:
+        _warn_deprecated("add_polygon(mesh_refinement=...) is deprecated and has no effect; omit it.")
+    if dist_max_out is not None:
+        _warn_deprecated("add_polygon(dist_max_out=...) is deprecated; use dist_max instead.")
+        assert dist_max is None or dist_max == dist_max_out, (
+            "dist_max and dist_max_out were both given with different values."
+        )
+        dist_max = dist_max_out
+    border_lc = None
+    if border_density is not None:
+        _warn_deprecated(
+            "add_polygon(border_density=...) is deprecated; use densify=<spacing> for "
+            "boundary densification."
+        )
+        assert border_density > 0, f"border_density must be positive. Got {border_density}."
+        border_lc = float(border_density)
+        if densify is None:
+            densify = border_lc
+    if dist_max_in is not None:
+        _warn_deprecated("add_polygon(dist_max_in=...) is deprecated.")
+        if border_density is None:
+            warnings.warn(
+                "dist_max_in only applies together with border_density; it is ignored.",
+                UserWarning,
+                stacklevel=4,
+            )
+    return densify, dist_max, border_lc
 
 
 def _warn_if_geographic_crs(crs):
@@ -123,6 +233,10 @@ class ConceptualMesh:
         quad_buffer=False,
         quad_buffer_thickness=1,
         growth_factor=None,
+        mesh_refinement=None,
+        border_density=None,
+        dist_max_in=None,
+        dist_max_out=None,
     ):
         """
         Adds a polygon feature, such as a model boundary or a refinement zone.
@@ -154,7 +268,9 @@ class ConceptualMesh:
                 Raises ValueError if non-positive when specified as a float.
             simplify_tolerance (float|int|None, optional): If a number > 0, applies Douglas-Peucker
                 simplification with this tolerance. If None or 0, no simplification is applied.
-                Raises ValueError if negative. Boolean values are not supported.
+                Boundary shared exactly with another polygon is left unsimplified so
+                neighbouring zones never open gaps. Raises ValueError if negative.
+                Boolean values are not supported.
             fields (list, optional): List of MeshField objects.
             embed (bool): If True, the polygon is embedded in the mesh. If False, it is used only for fields.
             quad_buffer (bool): If True, replaces the meshed polygon outline
@@ -175,9 +291,22 @@ class ConceptualMesh:
             quad_buffer_thickness (int): Band width in local cell widths
                 (multiples of ``resolution``, like gmshflow's ``cs_thick``).
                 Supported values are 1 and 2.
+            mesh_refinement (bool, optional): DEPRECATED, has no effect (it was
+                never read by the mesh generator).
+            border_density (float, optional): DEPRECATED. Densifies the boundary
+                to this spacing (use ``densify``) and grades the interior from this
+                finer border size up to ``resolution`` over ``dist_min`` to
+                ``dist_max_in``.
+            dist_max_in (float, optional): DEPRECATED. Interior grading distance
+                for ``border_density``.
+            dist_max_out (float, optional): DEPRECATED alias for ``dist_max``.
         """
         if not geometry.is_valid:
             geometry = make_valid(geometry)
+
+        densify, dist_max, border_lc = _resolve_legacy_polygon_args(
+            densify, dist_max, mesh_refinement, border_density, dist_max_in, dist_max_out
+        )
 
         if isinstance(simplify_tolerance, bool):
             raise ValueError(
@@ -203,6 +332,8 @@ class ConceptualMesh:
 
         if quad_buffer_thickness not in (1, 2):
             raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+        if quad_buffer and not embed:
+            raise ValueError("quad_buffer=True requires embed=True: a quad buffer is meshed geometry.")
 
         growth_factor = _validate_growth_factor(growth_factor)
 
@@ -224,6 +355,8 @@ class ConceptualMesh:
                 'quad_buffer': bool(quad_buffer),
                 'quad_buffer_thickness': int(quad_buffer_thickness),
                 'growth_factor': growth_factor,
+                'border_lc': border_lc,
+                'dist_max_in': dist_max_in if border_lc is not None else None,
             }
         )
 
@@ -301,6 +434,8 @@ class ConceptualMesh:
 
         if quad_buffer_thickness not in (1, 2):
             raise ValueError("quad_buffer_thickness must be either 1 or 2.")
+        if quad_buffer and not embed:
+            raise ValueError("quad_buffer=True requires embed=True: a quad buffer is meshed geometry.")
 
         growth_factor = _validate_growth_factor(growth_factor)
 
@@ -341,8 +476,9 @@ class ConceptualMesh:
             dist_max (float, optional): DEPRECATED. Distance from the point over which the mesh
                 transitions to the background resolution. See dist_min.
             simplify_tolerance (float|int|None, optional): If a number > 0, merges points that are closer
-                than this tolerance. If None or 0, no merging is applied. Raises ValueError if negative.
-                Boolean values are not supported.
+                than this tolerance, keeping the one with the finest resolution. Two points merge
+                when either one's tolerance covers their separation. If None or 0, this point does
+                not trigger merging. Raises ValueError if negative. Boolean values are not supported.
             growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
                 GeometricGrowthField size transition away from the point. Defaults to 1.2.
                 Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
@@ -380,7 +516,9 @@ class ConceptualMesh:
         a specified tolerance of each other are merged, and only the point with the
         finest (smallest) resolution is kept.
         """
-        # Simplify Polygons
+        # Simplify Polygons. Neighbours are compared in their original form so
+        # both sides of a shared edge keep it intact.
+        original_polygons = [poly_data['geometry'] for poly_data in self.raw_polygons]
         for i, poly_data in enumerate(self.raw_polygons):
             tol = poly_data.get('simplify_tolerance')
             if isinstance(tol, bool):
@@ -391,7 +529,8 @@ class ConceptualMesh:
 
             if tol is not None and tol > 0:
                 org_area = poly_data['geometry'].area
-                simplified_geom = poly_data['geometry'].simplify(tol, preserve_topology=True)
+                neighbours = original_polygons[:i] + original_polygons[i + 1:]
+                simplified_geom = _simplify_keeping_shared_edges(poly_data['geometry'], tol, neighbours)
                 self.raw_polygons[i]['geometry'] = simplified_geom
                 new_area = simplified_geom.area
                 if new_area < org_area and org_area > 0:
@@ -426,49 +565,13 @@ class ConceptualMesh:
 
         # Merge points that are very close to each other (deduplication)
         if self.raw_points:
-            # Let's sort by resolution first
-            sorted_points = sorted(
-                self.raw_points,
-                key=lambda x: x['lc'] if x['lc'] is not None else float('inf')
-            )
-            final_points = []
-            geoms = [p['geometry'] for p in sorted_points]
-            tree = STRtree(geoms)
-            kept_indices = set()
-
-            for i, point_data in enumerate(sorted_points):
-                current_geom = point_data['geometry']
-                tol = point_data.get('simplify_tolerance')
-
-                if isinstance(tol, bool):
+            for point_data in self.raw_points:
+                if isinstance(point_data.get('simplify_tolerance'), bool):
                     raise ValueError(
                         "simplify_tolerance must be a non-negative number (or None/0 to disable). "
                         "Boolean values are not supported."
                     )
-
-                # None or <=0 => no merging for this point (keep as-is)
-                if tol is None or tol <= 0:
-                    final_points.append(point_data)
-                    kept_indices.add(i)
-                    continue
-
-                is_merged = False
-
-                # Query tree for potential neighbors
-                # tree.query returns indices of geometries that intersect the buffer
-                search_area = current_geom.buffer(tol)
-                candidate_indices = tree.query(search_area)
-
-                for candidate_idx in candidate_indices:
-                    if candidate_idx in kept_indices:
-                        if geoms[candidate_idx].distance(current_geom) < tol:
-                            is_merged = True
-                            break
-
-                if not is_merged:
-                    final_points.append(point_data)
-                    kept_indices.add(i)
-
+            final_points = _deduplicate_points(self.raw_points)
             if len(self.raw_points) != len(final_points):
                 logger.info(
                           f"Simplification merged {len(self.raw_points) - len(final_points)} "
@@ -500,6 +603,8 @@ class ConceptualMesh:
                     "quad_buffer",
                     "quad_buffer_thickness",
                     "growth_factor",
+                    "border_lc",
+                    "dist_max_in",
                 ],
                 crs=self.crs,
             )

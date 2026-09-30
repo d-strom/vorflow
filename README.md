@@ -28,30 +28,47 @@ The typical workflow follows these steps:
 
 ## Installation
 
-Install the latest published release:
+`vorflow` requires Python 3.10 or newer. It is not yet published on PyPI, so
+install it from GitHub:
 
 ```bash
-pip install vorflow
+pip install "git+https://github.com/rhugman/vorflow.git"
 ```
 
-`vorflow` requires Python 3.10 or newer.
+On Linux, the `gmsh` wheel from PyPI needs the system GLU library (for example
+`sudo apt-get install libglu1-mesa` on Debian/Ubuntu).
+
+Release candidates are rehearsed on TestPyPI first. Once one is published
+there, it can be installed with (dependencies still come from PyPI):
+
+```bash
+pip install --pre --index-url https://test.pypi.org/simple/ \
+    --extra-index-url https://pypi.org/simple/ vorflow
+```
 
 ### Development installation
 
 Clone the repository and install it in editable mode:
 
 ```bash
-pip install -e .[dev]
+git clone https://github.com/rhugman/vorflow.git
+cd vorflow
+pip install -e ".[dev]"
 ```
 
 For plotting examples and notebooks without all development tools:
 
 ```bash
-pip install -e .[examples]
+pip install -e ".[examples]"
 ```
 
 Alternatively, create the Conda development environment from
-[`etc/environment.yml`](https://github.com/rhugman/vorflow/blob/main/etc/environment.yml).
+[`etc/environment.yml`](https://github.com/rhugman/vorflow/blob/main/etc/environment.yml),
+which installs the package in editable mode with the `dev` extra:
+
+```bash
+micromamba env create -f etc/environment.yml
+```
 
 ## Basic Usage
 

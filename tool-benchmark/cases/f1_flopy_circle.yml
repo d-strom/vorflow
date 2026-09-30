@@ -1,0 +1,25 @@
+id: f1_flopy_circle
+tier: 1
+description: >
+  FloPy autotest voronoi_circle: a circle of radius 100 (32 vertices) with one
+  uniform size (maximum area 50). Sizes are the edges of equilateral triangles
+  of FloPy's Triangle maximum areas; the target is FloPy's own cell count in
+  that test.
+source: https://github.com/modflowpy/flopy/blob/develop/autotest/test_grid_cases.py (voronoi_circle)
+crs: EPSG:32610
+h_max: 10.746
+growth: 1.2
+target_ncpl: 538
+domain: >
+  POLYGON ((100.000000 0.000000, 98.006658 19.866933, 92.106099 38.941834,
+  82.533561 56.464247, 69.670671 71.735609, 54.030231 84.147098,
+  36.235775 93.203909, 16.996714 98.544973, -2.919952 99.957360,
+  -22.720209 97.384763, -41.614684 90.929743, -58.850112 80.849640,
+  -73.739372 67.546318, -85.688875 51.550137, -94.222234 33.498815,
+  -98.999250 14.112001, -99.829478 -5.837414, -96.679819 -25.554110,
+  -89.675842 -44.252044, -79.096771 -61.185789, -65.364362 -75.680250,
+  -49.026082 -87.157577, -30.733287 -95.160207, -11.215253 -99.369100,
+  8.749898 -99.616461, 28.366219 -95.892427, 46.851667 -88.345466,
+  63.469288 -77.276449, 77.556588 -63.126664, 88.551952 -46.460218,
+  96.017029 -27.941550, 99.654210 -8.308940, 100.000000 0.000000))
+mf6_problems: [linear]

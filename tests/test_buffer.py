@@ -3,11 +3,25 @@ import warnings
 import gmsh
 import pytest
 from shapely.geometry import LineString, Polygon, box
+from shapely.ops import split
 
 from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
+
+
+def _capture_crossings(mesher, monkeypatch):
+    """Record the crossings generate() hands to _setup_fields."""
+    captured = []
+    setup_fields = mesher._setup_fields
+
+    def spy(*args, crossings=(), **kwargs):
+        captured.extend(crossings)
+        return setup_fields(*args, crossings=crossings, **kwargs)
+
+    monkeypatch.setattr(mesher, "_setup_fields", spy)
+    return captured
 
 
 def _generate_line_buffer_mesh(*, thickness=1, add_crossing_line=False, return_context=False):
@@ -222,13 +236,48 @@ def test_transfinite_survives_fragmentation():
     assert round(line.length) - 2 <= len(quads) <= round(line.length) + 4
 
 
-def test_structured_quad_buffer_barrier_is_not_cut_again_by_tessellator():
+def _straddling_cell_count(grid, line, sliver_fraction=1e-6):
+    """Count cells the line splits into at least two non-sliver pieces."""
+    count = 0
+    for cell in grid.geometry[grid.geometry.intersects(line)]:
+        pieces = [p for p in split(cell, line).geoms if p.area > sliver_fraction * cell.area]
+        count += len(pieces) > 1
+    return count
+
+
+def test_structured_quad_buffer_barrier_is_only_cut_where_cells_straddle_it():
     mesher, cm = _generate_line_buffer_mesh(thickness=1, return_context=True)
+    line = cm.clean_lines.iloc[0].geometry
 
     tessellator = VoronoiTessellator(mesher, cm, clip_to_boundary=True)
     grid = tessellator.generate()
 
-    assert len(grid) == len(mesher.node_tags)
+    # Buffer cells already have faces on the line and are not re-cut. Only
+    # the end caps, where the strip meets the domain boundary and nodes land
+    # on the line, straddle it and are split.
+    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
+    assert set(mesher.node_tags).issubset(set(grid["node_id"]))
+    assert grid["node_id"].is_unique
+    assert len(fragments) <= 4
+    assert (fragments.geometry.distance(line.boundary) < 1.0).all()
+    assert _straddling_cell_count(grid, line) == 0
+
+
+def test_structured_quad_buffer_thickness2_barrier_is_enforced():
+    """Catches quad-buffered barriers being skipped when a node row sits on the line."""
+    mesher, cm = _generate_line_buffer_mesh(thickness=2, return_context=True)
+    line = cm.clean_lines.iloc[0].geometry
+
+    grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
+
+    # The node row on the line gives ~one straddling cell per lc of line;
+    # each is split in two along the barrier.
+    fragments = grid[~grid["node_id"].isin(mesher.node_tags)]
+    assert len(fragments) >= 0.5 * line.length
+    assert (fragments.geometry.distance(line) < 1e-9).all()
+    assert _straddling_cell_count(grid, line) == 0
+    assert grid["node_id"].is_unique
+    assert grid.geometry.area.sum() == pytest.approx(40.0)
 
 
 def test_polygon_structured_quad_buffer_produces_quads():
@@ -610,7 +659,7 @@ def test_winner_strip_stays_transfinite_through_crossing():
     assert not winner_row[winner_row["centroid_x"].sub(6).abs() < 0.6].empty
 
 
-def test_partial_crossing_t_junction_records_refinement():
+def test_partial_crossing_t_junction_records_refinement(monkeypatch):
     # A vertical buffer that terminates ON a horizontal buffer (a T-junction)
     # must mesh cleanly, conserve area, and register a crossing refinement disk.
     cm = ConceptualMesh(crs=None)
@@ -631,9 +680,10 @@ def test_partial_crossing_t_junction_records_refinement():
     )
     clean_polys, clean_lines, clean_points = cm.generate()
     mesher = MeshGenerator(background_lc=1.5, verbosity=0, smoothing_steps=0, optimization_cycles=0)
+    crossings = _capture_crossings(mesher, monkeypatch)
     assert mesher.generate(clean_polys, clean_lines, clean_points)
     assert abs(mesher.get_element_grid().geometry.area.sum() - 96.0) < 0.01
-    assert len(mesher._quad_buffer_crossings) >= 1
+    assert len(crossings) >= 1
 
 
 def test_tangential_overlap_drops_sliver():
@@ -661,7 +711,7 @@ def test_tangential_overlap_drops_sliver():
         assert mesher.generate(clean_polys, clean_lines, clean_points)
 
 
-def test_crossing_refinement_limits_size_jump():
+def test_crossing_refinement_limits_size_jump(monkeypatch):
     # With a coarse background, the trimmed gap would fill with large triangles
     # next to the dense strip rows. The Ball refinement field pins it to the
     # feature size, so elements near the crossing stay close to lc, not
@@ -687,8 +737,9 @@ def test_crossing_refinement_limits_size_jump():
     )
     clean_polys, clean_lines, clean_points = cm.generate()
     mesher = MeshGenerator(background_lc=3.0, verbosity=0, smoothing_steps=0, optimization_cycles=0)
+    crossings = _capture_crossings(mesher, monkeypatch)
     assert mesher.generate(clean_polys, clean_lines, clean_points)
-    assert len(mesher._quad_buffer_crossings) >= 1
+    assert len(crossings) >= 1
 
     grid = mesher.get_element_grid()
     centroids = grid.geometry.centroid

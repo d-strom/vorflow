@@ -1,0 +1,20 @@
+id: r3_mf6voronoi_trench_excavation
+tier: 2
+description: >
+  mf6Voronoi test case c7_trenchExcavation: a 2.2 x 1.35 km area with two GHB
+  polygons, four pumping wells and four drain lines along a trench. Sizes are
+  the case's layerRef values (GHB 20, wells 5, drains 2, maxRef 50).
+  mf6Voronoi's own settings grade with multiplier 1.5; the spec keeps the
+  benchmark's growth of 1.2. The target is mf6Voronoi's own cell count with its
+  native settings.
+source: mf6Voronoi tests/data/c7_trenchExcavation and tests/json/meshCasesNormal.json at commit 38a29849, via fetch.py
+crs: EPSG:32617
+h_max: 50.0
+growth: 1.2
+target_ncpl: 3264
+domain: {file: data/mf6voronoi/c7_trenchExcavation/modelAoi.shp}
+features:
+  - {id: ghb, kind: polygon, h: 20.0, file: data/mf6voronoi/c7_trenchExcavation/compoundGhb.shp}
+  - {id: well, kind: point, h: 5.0, file: data/mf6voronoi/c7_trenchExcavation/pumpingWells.shp}
+  - {id: drain, kind: line, h: 2.0, file: data/mf6voronoi/c7_trenchExcavation/trenchExcavationDissolved.shp}
+mf6_problems: [linear]

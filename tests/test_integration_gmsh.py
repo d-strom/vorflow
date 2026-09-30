@@ -1,13 +1,14 @@
 import warnings
 
 import pytest
-from shapely.geometry import Polygon, LineString
+from shapely.geometry import Point, Polygon, LineString, box
 import gmsh
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.engine import MeshGenerator
 from vorflow.fields import GeometricGrowthField
 from vorflow.tessellator import VoronoiTessellator
+from vorflow.utils import boundary_connectivity_report
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
@@ -384,3 +385,36 @@ def test_engine_rejects_invalid_background_size(background_lc):
 
     with pytest.raises(ValueError, match="background_lc"):
         mg.generate(*clean)
+
+
+@pytest.mark.parametrize(
+    "domain, well",
+    [
+        (box(0, 0, 200, 200), False),
+        (box(0, 0, 200, 200), True),
+        (Polygon([(0, 0), (200, 0), (230, 120), (100, 200), (-30, 120)]), False),
+    ],
+    ids=["box", "box_with_well", "pentagon"],
+)
+def test_inset_mirror_improves_boundary_orthogonality_on_gmsh_mesh(domain, well):
+    """Catches an inset that overshoots the first interior row of a Gmsh mesh.
+
+    With boundary_inset_fraction=0.5 the median boundary ortho_error was
+    worse than clip on all three meshes (box 12.0 vs 6.4 degrees); the
+    default 0.25 gives about 1.4.
+    """
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1)
+    if well:
+        cm.add_point(Point(25, 25), point_id="well", resolution=1.0)
+    mg = MeshGenerator(background_lc=20.0)
+    assert mg.generate(*cm.generate())
+
+    medians = {}
+    for mode in ("clip", "inset_mirror"):
+        grid = VoronoiTessellator(mg, cm, boundary_centering=mode).generate()
+        report = boundary_connectivity_report(grid, domain, center="centroid")
+        medians[mode] = report["ortho_error"].median()
+
+    assert medians["clip"] > 4.0
+    assert medians["inset_mirror"] < 0.5 * medians["clip"]

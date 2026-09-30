@@ -1,0 +1,25 @@
+id: f2_flopy_polygons
+tier: 1
+description: >
+  FloPy autotest voronoi_polygons: a 100 x 100 square with two refinement
+  squares (maximum areas 100, 10 and 3). Sizes are the edges of equilateral
+  triangles of FloPy's Triangle maximum areas; the target is FloPy's own cell
+  count in that test.
+source: https://github.com/modflowpy/flopy/blob/develop/autotest/test_grid_cases.py (voronoi_polygons)
+crs: EPSG:32610
+h_max: 15.197
+growth: 1.2
+target_ncpl: 410
+domain: >
+  POLYGON ((0.000000 0.000000, 100.000000 0.000000, 100.000000 100.000000,
+  0.000000 100.000000, 0.000000 0.000000))
+features:
+  - id: area1
+    kind: polygon
+    h: 4.806
+    wkt: POLYGON ((10.000000 10.000000, 40.000000 10.000000, 40.000000 40.000000, 10.000000 40.000000, 10.000000 10.000000))
+  - id: area2
+    kind: polygon
+    h: 2.632
+    wkt: POLYGON ((60.000000 60.000000, 80.000000 60.000000, 80.000000 80.000000, 60.000000 80.000000, 60.000000 60.000000))
+mf6_problems: [linear]

@@ -1,0 +1,24 @@
+id: f6_vorogridgen_example
+tier: 1
+description: >
+  The example shipped with VOROGRIDGEN: a 58 x 48 km model with two holes, two
+  lines, three points and two refinement polygons. Sizes are the example's
+  spacings (outer boundary 1500 on most vertices, holes 200 and 500, lines 600
+  and 1000, points 200, polygons 800, maximum 2000). The example grades at 1.1;
+  the spec keeps the benchmark's 1.2. The target is the example's own cell
+  count. Geometry is fetched by fetch.py (the example must not be
+  redistributed).
+source: VOROGRIDGEN freeware example (hydrosymple.com), via fetch.py
+crs: EPSG:32610
+h_max: 2000.0
+growth: 1.2
+target_ncpl: 6440
+domain: {file: data/vorogridgen_example/example.gpkg, layer: domain}
+features:
+  - {id: boundary, kind: line, boundary: true, file: data/vorogridgen_example/example.gpkg, layer: boundary_fine}
+  - {id: line1, kind: line, file: data/vorogridgen_example/example.gpkg, layer: line1}
+  - {id: line2, kind: line, file: data/vorogridgen_example/example.gpkg, layer: line2}
+  - {id: point, kind: point, file: data/vorogridgen_example/example.gpkg, layer: points}
+  - {id: poly1, kind: polygon, h: 800.0, file: data/vorogridgen_example/example.gpkg, layer: poly1}
+  - {id: poly2, kind: polygon, h: 800.0, file: data/vorogridgen_example/example.gpkg, layer: poly2}
+mf6_problems: [linear]

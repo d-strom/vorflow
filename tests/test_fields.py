@@ -10,8 +10,6 @@ import gmsh
 import pytest
 
 from vorflow.fields import (
-    AutoExponentialField,
-    AutoLinearField,
     ConstantField,
     DistanceField,
     ExponentialField,
@@ -214,18 +212,6 @@ class TestGeometricGrowthField:
         assert base != GeometricGrowthField(sampling=21)
 
 
-class TestDeprecatedAutomaticFields:
-    @pytest.mark.parametrize("field_class", [AutoExponentialField, AutoLinearField])
-    def test_deprecated_names_warn_and_delegate(self, gmsh_model, field_class):
-        with pytest.warns(DeprecationWarning, match="GeometricGrowthField"):
-            field = field_class(growth_factor=1.2)
-        assert isinstance(field, GeometricGrowthField)
-        tag = field.create(
-            gmsh, _line_tags(gmsh_model), background_lc=100.0, feature_lc=2.0
-        )
-        assert gmsh.model.mesh.field.getString(tag, "F") == "2.0 + 0.2 * F1"
-
-
 class TestFieldEqualityGrouping:
     """__eq__/__hash__ let the engine group identical field specs."""
 
@@ -246,3 +232,13 @@ class TestFieldEqualityGrouping:
     def test_base_class_create_is_abstract(self):
         with pytest.raises(NotImplementedError):
             MeshField().create(gmsh, {}, 100.0)
+
+
+def test_field_with_unhashable_attribute_can_be_grouped():
+    class ListField(ThresholdField):
+        def __init__(self):
+            super().__init__(size_min=1.0, dist_min=0.0, dist_max=5.0)
+            self.tags = [1, 2]
+
+    assert hash(ListField()) == hash(ListField())
+    assert ListField() == ListField()

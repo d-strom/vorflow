@@ -1,11 +1,14 @@
+import warnings
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import MultiPolygon, Polygon, box
+import shapely
+from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box
 
 import vorflow.engine as engine_module
-from vorflow import ConceptualMesh, MeshGenerator
+from vorflow import ConceptualMesh, MeshGenerator, VoronoiTessellator
 from vorflow.utils import build_connectivity, calculate_mesh_quality, calculate_orthogonality
 
 
@@ -70,7 +73,7 @@ def test_build_connectivity_reports_generator_based_pair_metrics(paired_polygons
     assert row["connector"].length == pytest.approx(1.0)
     assert row["angle"] == pytest.approx(90.0, abs=1e-6)
     assert row["ortho_error"] == pytest.approx(0.0, abs=1e-6)
-    assert row["skewness"] == pytest.approx(0.5, abs=1e-6)
+    assert row["skewness"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_build_connectivity_centroid_mode_works_without_generator_columns(paired_polygons):
@@ -83,7 +86,7 @@ def test_build_connectivity_centroid_mode_works_without_generator_columns(paired
     assert row["center_mode"] == "centroid"
     assert row["angle"] == pytest.approx(90.0, abs=1e-6)
     assert row["ortho_error"] == pytest.approx(0.0, abs=1e-6)
-    assert row["skewness"] == pytest.approx(0.5, abs=1e-6)
+    assert row["skewness"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_build_connectivity_generator_mode_still_requires_generator_columns(paired_polygons):
@@ -115,11 +118,14 @@ def test_centroid_mode_exposes_asymmetric_cell_center_error():
     )
 
     assert generator_report.iloc[0]["ortho_error"] == pytest.approx(0.0, abs=1e-6)
+    assert generator_report.iloc[0]["skewness"] == pytest.approx(0.0, abs=1e-12)
     assert centroid_report.iloc[0]["center_mode"] == "centroid"
     assert centroid_report.iloc[0]["ortho_error"] > 0.0
-    assert centroid_report.iloc[0]["skewness"] != pytest.approx(0.5, abs=1e-6)
+    # Centroids (0.5, 1) and (2, 0.5) meet the face x=1 at y=5/6; the face
+    # midpoint is y=0.5 and the face length is 1.
+    assert centroid_report.iloc[0]["skewness"] == pytest.approx(1.0 / 3.0)
+    assert centroid_quality["skewness"].tolist() == pytest.approx([1.0 / 3.0, 1.0 / 3.0])
     assert "ortho_error" in centroid_quality.columns
-    assert "skewness" in centroid_quality.columns
 
 
 def test_build_connectivity_uses_unique_row_ids_when_index_is_duplicated(paired_polygons):
@@ -180,7 +186,7 @@ def test_build_connectivity_uses_longest_multilinestring_shared_boundary():
     assert connectivity.iloc[0]["shared_edge"].length == pytest.approx(2.0)
 
 
-def test_build_connectivity_projects_shared_face_midpoint_when_connector_does_not_cross():
+def test_build_connectivity_skewness_uses_face_line_when_connector_misses_face():
     gdf = gpd.GeoDataFrame(
         {
             "x": [0.5, 1.5],
@@ -191,8 +197,9 @@ def test_build_connectivity_projects_shared_face_midpoint_when_connector_does_no
 
     connectivity = build_connectivity(gdf)
 
+    # Connector y=2 meets the face line x=1 at (1, 2); midpoint (1, 0.5).
     assert len(connectivity) == 1
-    assert connectivity.iloc[0]["skewness"] == pytest.approx(0.5, abs=1e-6)
+    assert connectivity.iloc[0]["skewness"] == pytest.approx(1.5)
 
 
 def test_calculate_orthogonality_regression_value_unchanged(paired_polygons):
@@ -200,6 +207,177 @@ def test_calculate_orthogonality_regression_value_unchanged(paired_polygons):
     expected = pd.Series([0.0, 0.0], index=paired_polygons.index)
 
     pd.testing.assert_series_equal(result, expected)
+
+
+def _reference_orthogonality_02c82b6(gdf):
+    """Return per-cell orthogonality error as computed by utils.py at commit 02c82b6."""
+    df = gdf.copy()
+    if not df.index.is_unique:
+        df = df.reset_index(drop=True)
+    neighbors = gpd.sjoin(df, df, how="inner", predicate="touches")
+    pairs = neighbors[neighbors.index < neighbors.index_right].copy()
+    if pairs.empty:
+        return pd.Series(0.0, index=gdf.index)
+    gx = df.loc[pairs.index_right, "x"].values - df.loc[pairs.index, "x"].values
+    gy = df.loc[pairs.index_right, "y"].values - df.loc[pairs.index, "y"].values
+    geoms1 = df.loc[pairs.index, "geometry"].values
+    geoms2 = df.loc[pairs.index_right, "geometry"].values
+    errors = []
+    for i in range(len(pairs)):
+        inter = geoms1[i].intersection(geoms2[i])
+        if inter.is_empty or inter.geom_type not in ["LineString", "MultiLineString"]:
+            errors.append(np.nan)
+            continue
+        if inter.geom_type == "MultiLineString":
+            if not inter.geoms:
+                errors.append(np.nan)
+                continue
+            edge = max(inter.geoms, key=lambda x: x.length)
+        else:
+            edge = inter
+        coords = list(edge.coords)
+        if len(coords) < 2:
+            errors.append(np.nan)
+            continue
+        nx = -(coords[-1][1] - coords[0][1])
+        ny = coords[-1][0] - coords[0][0]
+        mag_g = np.sqrt(gx[i] ** 2 + gy[i] ** 2)
+        mag_n = np.sqrt(nx**2 + ny**2)
+        if mag_g == 0 or mag_n == 0:
+            errors.append(np.nan)
+            continue
+        cos_theta = min(1.0, max(0.0, abs(gx[i] * nx + gy[i] * ny) / (mag_g * mag_n)))
+        errors.append(np.degrees(np.arccos(cos_theta)))
+    pairs["ortho_error"] = errors
+    s1 = pairs["ortho_error"].groupby(pairs.index).max()
+    s2 = pairs["ortho_error"].groupby(pairs.index_right).max()
+    combined = pd.concat([s1, s2], axis=1).max(axis=1)
+    return combined.reindex(gdf.index).fillna(0.0)
+
+
+def _generated_voronoi_grid():
+    """Return a refined vorflow Voronoi grid with a line and a point feature."""
+    cm = ConceptualMesh(crs=None)
+    cm.add_polygon(box(0, 0, 20, 12), zone_id=1, resolution=2.0)
+    cm.add_line(LineString([(3, 3), (16, 9)]), "river", resolution=0.6)
+    cm.add_point(Point(15, 3), "well", resolution=0.4)
+    clean_polys, clean_lines, clean_points = cm.generate()
+    mesher = MeshGenerator(background_lc=2.0, verbosity=0)
+    assert mesher.generate(clean_polys, clean_lines, clean_points)
+    return VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
+
+
+def _square_lattice_voronoi(n=4):
+    """Return the clipped Voronoi grid of an n x n unit square lattice."""
+    centers = np.arange(n) + 0.5
+    points = np.array([(x, y) for y in centers for x in centers])
+    domain = box(0, 0, n, n)
+    cells = shapely.voronoi_polygons(MultiPoint(points), extend_to=domain, ordered=True)
+    return gpd.GeoDataFrame(
+        {"x": points[:, 0], "y": points[:, 1]},
+        geometry=[cell.intersection(domain) for cell in cells.geoms],
+    )
+
+
+@pytest.mark.parametrize("center", ["generator", "centroid"])
+def test_square_lattice_voronoi_has_zero_face_skewness(center):
+    grid = _square_lattice_voronoi()
+
+    connectivity = build_connectivity(grid, center=center)
+    quality = calculate_mesh_quality(
+        grid, calc_skewness=True, connectivity=connectivity
+    )
+
+    assert len(connectivity) == 2 * 4 * 3
+    assert connectivity["skewness"].to_numpy() == pytest.approx(0.0, abs=1e-9)
+    assert quality["skewness"].to_numpy() == pytest.approx(0.0, abs=1e-9)
+
+
+def test_generator_skewness_detects_off_center_voronoi_face():
+    # The shared face x=0.5 is the exact perpendicular bisector of the two
+    # generators, but spans y in [-0.2, 0.8]: the connector (y=0) meets it
+    # 0.3 below the face midpoint (y=0.3), and the face length is 1.
+    gdf = gpd.GeoDataFrame(
+        {
+            "x": [0.0, 1.0],
+            "y": [0.0, 0.0],
+            "geometry": [box(-0.5, -0.2, 0.5, 0.8), box(0.5, -0.2, 1.5, 0.8)],
+        }
+    )
+
+    connectivity = build_connectivity(gdf)
+    quality = calculate_mesh_quality(gdf, calc_ortho=True, calc_skewness=True)
+
+    assert connectivity.iloc[0]["ortho_error"] == pytest.approx(0.0, abs=1e-6)
+    assert connectivity.iloc[0]["skewness"] == pytest.approx(0.3)
+    assert quality["skewness"].tolist() == pytest.approx([0.3, 0.3])
+
+
+def test_skewness_of_oblique_connector_matches_analytic_value():
+    # Generators (0, 0) and (2, 1): connector y = x / 2 meets the face line
+    # x = 1 at y = 0.5; the face runs from y = -1 to y = 1 (midpoint y = 0).
+    gdf = gpd.GeoDataFrame(
+        {
+            "x": [0.0, 2.0],
+            "y": [0.0, 1.0],
+            "geometry": [box(-1, -1, 1, 1), box(1, -1, 3, 1)],
+        }
+    )
+
+    connectivity = build_connectivity(gdf)
+
+    assert connectivity.iloc[0]["skewness"] == pytest.approx(0.5 / 2.0)
+
+
+def test_skewness_is_nan_without_warning_when_connector_parallels_face():
+    gdf = gpd.GeoDataFrame(
+        {
+            "x": [1.0, 1.0],
+            "y": [0.2, 0.8],
+            "geometry": [box(0, 0, 1, 1), box(1, 0, 2, 1)],
+        }
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        connectivity = build_connectivity(gdf)
+        quality = calculate_mesh_quality(
+            gdf, calc_skewness=True, connectivity=connectivity
+        )
+
+    assert np.isnan(connectivity.iloc[0]["skewness"])
+    assert quality["skewness"].isna().all()
+
+
+def test_generated_grid_generator_skewness_is_not_constant():
+    grid = _generated_voronoi_grid()
+
+    connectivity = build_connectivity(grid, center="generator")
+    quality = calculate_mesh_quality(grid, calc_skewness=True)
+    skewness = connectivity["skewness"].to_numpy()
+
+    assert np.isfinite(skewness).all()
+    assert (skewness >= 0.0).all()
+    assert skewness.std() > 0.01
+    assert np.median(skewness) > 0.01
+    assert quality["skewness"].max() > 0.1
+    assert quality["skewness"].nunique() > len(quality) // 2
+
+
+def test_calculate_orthogonality_matches_02c82b6_on_generated_grid():
+    grid = _generated_voronoi_grid()
+    # Replacing generators by centroids makes the orthogonality non-trivial.
+    centroid_grid = grid.assign(x=grid.geometry.centroid.x, y=grid.geometry.centroid.y)
+
+    for gdf in (grid, centroid_grid):
+        reference = _reference_orthogonality_02c82b6(gdf)
+        via_connectivity = calculate_mesh_quality(gdf, calc_ortho=True, calc_skewness=True)
+
+        pd.testing.assert_series_equal(calculate_orthogonality(gdf), reference)
+        assert via_connectivity["ortho_error"].to_numpy() == pytest.approx(
+            reference.to_numpy(), abs=1e-5
+        )
+    assert reference.max() > 1.0
 
 
 def test_calculate_mesh_quality_skewness_is_opt_in(paired_polygons):

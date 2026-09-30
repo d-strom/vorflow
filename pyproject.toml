@@ -15,7 +15,7 @@ authors = [
 ]
 maintainers = [
     {name = "Oscar Sanchez", email = "oscarfasanchez@gmail.com"},
-    {name = "rhugman", email = "rthugman@gmail.com"},
+    {name = "rhugman"},
 ]
 requires-python = ">=3.10"
 keywords = ["modflow", "groundwater", "voronoi", "mesh", "gmsh"]
@@ -54,6 +54,7 @@ dev = [
     "jupyter",
     "matplotlib",
     "build>=1.2",
+    "packaging",          # scripts/check_dist.py
     "twine>=6",
     "tomli>=2; python_version < '3.11'",
 ]

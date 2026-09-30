@@ -1,0 +1,5 @@
+.venv/
+.bin/
+work/
+results/
+data/

@@ -191,7 +191,7 @@ plot_metrics = [
     ("compactness", "Compactness"),
     ("drift_ratio", "Generator drift ratio"),
     ("ortho_error", "Centroid orthogonality error"),
-    ("skewness", "Centroid skewness error"),
+    ("skewness", "Centroid face skewness"),
 ]
 
 for ax, (metric, title) in zip(axes.ravel(), plot_metrics):

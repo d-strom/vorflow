@@ -1,0 +1,19 @@
+id: r1_mf6voronoi_river_aquifer
+tier: 2
+description: >
+  mf6Voronoi test case c2_riverAquifer: a 3.1 x 1.7 km aquifer with four GHB
+  lines, a river polygon and three wells. Sizes are the case's layerRef values
+  (GHB 20, river 10, wells 2, maxRef 100). mf6Voronoi's own settings grade with
+  multiplier 1.5; the spec keeps the benchmark's growth of 1.2. The target is
+  mf6Voronoi's own cell count with its native settings.
+source: mf6Voronoi tests/data/c2_riverAquifer and tests/json/meshCasesNormal.json at commit 38a29849, via fetch.py
+crs: EPSG:32718
+h_max: 100.0
+growth: 1.2
+target_ncpl: 4391
+domain: {file: data/mf6voronoi/c2_riverAquifer/ModelLimit1.shp}
+features:
+  - {id: ghb, kind: line, h: 20.0, file: data/mf6voronoi/c2_riverAquifer/ModelGHB1.shp}
+  - {id: river, kind: polygon, h: 10.0, file: data/mf6voronoi/c2_riverAquifer/ModelRiver2.shp}
+  - {id: well, kind: point, h: 2.0, file: data/mf6voronoi/c2_riverAquifer/ModelWell2.shp}
+mf6_problems: [linear]

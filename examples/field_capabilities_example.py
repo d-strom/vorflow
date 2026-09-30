@@ -390,7 +390,7 @@ fig, ax = plt.subplots(figsize=(10, 8))
 ax.set_aspect("equal")
 quality_gdf.plot(column="skewness", ax=ax, legend=True, cmap="Purples", vmin=0, vmax=0.5)
 ax.plot(*domain.exterior.xy, color="black", lw=1)
-ax.set_title("Per-cell skewness error |s - 0.5|")
+ax.set_title("Per-cell face skewness (0 = connector through face midpoint)")
 fig.tight_layout()
 plt.show()
 
@@ -399,7 +399,7 @@ dashboard_metrics = [
     ("area", "Cell area", "viridis", None, None),
     ("drift_ratio", "Generator drift ratio", "magma", None, None),
     ("ortho_error", "Orthogonality error (degrees)", "Reds", 0, None),
-    ("skewness", "Skewness error |s - 0.5|", "Purples", 0, 0.5),
+    ("skewness", "Face skewness", "Purples", 0, 0.5),
 ]
 for ax, (column, title, cmap, vmin, vmax) in zip(axes.ravel(), dashboard_metrics):
     ax.set_aspect("equal")
