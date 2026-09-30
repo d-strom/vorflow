@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Polygon
+from shapely.validation import make_valid
 
 
 def is_embedded(row) -> bool:
@@ -63,6 +66,50 @@ def polygon_parts(geom) -> list:
             parts.extend(polygon_parts(part))
         return parts
     return []
+
+
+def _merge_close_vertices(ring, tolerance):
+    """A ring's coordinates with vertex pairs closer than ``tolerance`` made exact; None if none are non-adjacent."""
+    coords = np.asarray(ring.coords, dtype=float)[:-1].copy()
+    n = len(coords)
+    pairs = sorted(cKDTree(coords).query_pairs(tolerance))
+    if not any(1 < j - i < n - 1 for i, j in pairs):
+        return None
+    # Sorted pairs visit (k, i) before (i, j), so c[i] is already final.
+    for i, j in pairs:
+        coords[j] = coords[i]
+    return np.vstack([coords, coords[:1]])
+
+
+def unpinch_polygons(geom, tolerance):
+    """Rebuild polygons whose rings pass within ``tolerance`` of themselves as valid polygons.
+
+    Overlay output can visit a touch point twice with the two copies a few ulp
+    apart -- e.g. a zone minus a buffer footprint whose corner lies on the
+    zone outline. GEOS treats that ring as simple, but OCC merges the copies
+    within its tolerance and cannot close the wire, so the surface is lost.
+    Making the copies exact turns the ring into a plain self-touch, which
+    ``make_valid`` resolves into a shell with a touching hole or into
+    separate polygons. Other geometries are returned unchanged.
+    """
+    parts = polygon_parts(geom)
+    rebuilt = []
+    changed = False
+    for poly in parts:
+        rings = [poly.exterior, *poly.interiors]
+        merged = [_merge_close_vertices(ring, tolerance) for ring in rings]
+        if all(coords is None for coords in merged):
+            rebuilt.append(poly)
+            continue
+        changed = True
+        coords = [
+            np.asarray(ring.coords) if m is None else m
+            for ring, m in zip(rings, merged)
+        ]
+        rebuilt.extend(polygon_parts(make_valid(Polygon(coords[0], coords[1:]))))
+    if not changed:
+        return geom
+    return MultiPolygon(rebuilt)
 
 
 def line_parts(geom) -> list:
