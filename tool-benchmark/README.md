@@ -66,11 +66,11 @@ grids that `workflow.py` saved in `work/` and writes only under
 or the workflow, on pull requests that also touch `src/vorflow/`, and on
 demand (`workflow_dispatch`, once the workflow is on the default branch):
 
-- **vorogridgen** (Windows) downloads the freeware from Hydrosymple at run
-  time, checks it reproduces its shipped example (6 440 cells), then runs
-  `python ci.py windows`.
+- **vorogridgen** (Windows, on demand only, since it takes over an hour)
+  downloads the freeware from Hydrosymple at run time, checks it reproduces
+  its shipped example (6 440 cells), then runs `python ci.py windows`.
 - **others** (Linux) builds `environment.yml` and runs `python ci.py others`.
-- **report** merges both jobs' `results/rows` and `work/**/grid.pkl` and runs
+- **report** merges the jobs' `results/rows` and `work/**/grid.pkl` and runs
   `python ci.py report`. Tables and figures are in the `benchmark-results`
   artifact.
 
