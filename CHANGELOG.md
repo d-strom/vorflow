@@ -7,7 +7,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0rc1]
+## [0.1.0] - 2026-09-30
+
+First release on PyPI. There are no changes since 0.1.0rc1.
+
+## [0.1.0rc1] - 2026-09-30
 
 ### Fixed
 
@@ -192,5 +196,6 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `dist_max_in`.
 - `dist_min`/`dist_max` on features; use `growth_factor` or explicit `fields`.
 
-[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...HEAD
+[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...v0.1.0
 [0.1.0rc1]: https://github.com/rhugman/vorflow/tree/v0.1.0rc1
