@@ -1,5 +1,6 @@
 prune .conda
 prune benchmarks
+prune tool-benchmark
 prune docs
 prune tests
 global-exclude *.code-workspace

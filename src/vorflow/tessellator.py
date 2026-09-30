@@ -330,6 +330,19 @@ def _fragment_merge(piece, geometries, tree, barriers):
     return best
 
 
+def _clip_to_domain(gdf, domain_geom):
+    """Return the rows of ``gdf`` that intersect ``domain_geom``, clipped to it, in their original order.
+
+    Replaces ``gpd.clip``, which with pandas 1.5 / GeoPandas 0.13 writes the
+    clipped geometries back onto the wrong rows (its spatial-index query
+    reorders them), so cells lose their generator's x/y and node_id.
+    """
+    hits = np.sort(gdf.sindex.query(domain_geom, predicate='intersects'))
+    clipped = gdf.iloc[hits].copy()
+    clipped[clipped.geometry.name] = clipped.geometry.intersection(domain_geom)
+    return clipped
+
+
 def _merge_barrier_fragments(geometries, fragments, barriers):
     """Merge small barrier-split fragments into neighbouring cells; return the fragments left over.
 
@@ -342,7 +355,8 @@ def _merge_barrier_fragments(geometries, fragments, barriers):
     pending = [f for f in fragments if f[0].area < BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     leftover = [f for f in fragments if f[0].area >= BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     while pending:
-        tree = shapely.STRtree(geometries)
+        # Shapely 2.0's STRtree makes the array it is given read-only.
+        tree = shapely.STRtree(geometries.copy())
         unmerged = []
         for fragment in pending:
             merge = _fragment_merge(fragment[0], geometries, tree, barriers)
@@ -978,12 +992,7 @@ class VoronoiTessellator:
                 )
                 return gpd.GeoDataFrame()
 
-            domain_gdf = gpd.GeoDataFrame(
-                geometry=[domain_geom], 
-                crs=self.cm.crs
-            )
-            
-            bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
+            bounded_voronoi = _clip_to_domain(raw_gdf, domain_geom)
             logger.info(f"  -> After Domain Clip: {len(bounded_voronoi)}")
         
             if len(bounded_voronoi) == 0:
