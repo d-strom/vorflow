@@ -179,6 +179,28 @@ def test_straddled_pieces_merge_cut_point_into_nearby_cell_vertex():
         assert tuple(vertex) in {tuple(c) for c in coords}
 
 
+def test_merge_close_vertices_keeps_cell_whose_hole_collapses(caplog):
+    """Catches GEOS raising for the whole grid when merging collapses one cell's hole to a point."""
+    # Coordinate scale 20, so vertices within 2e-11 merge.
+    holed = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [[(5, 5), (5 + 1e-12, 5), (5, 5 + 1e-12)]])
+    # A near-duplicate vertex that should still be merged away.
+    plain = Polygon([(10, 0), (20, 0), (20, 5), (20, 5 + 1e-12), (20, 10), (10, 10)])
+    grid = gpd.GeoDataFrame({"node_id": [0, 1]}, geometry=[holed, plain])
+
+    vorflow_logger = logging.getLogger("vorflow")
+    old_propagate = vorflow_logger.propagate
+    vorflow_logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="vorflow.tessellator"):
+            result = tessellator_module._merge_close_vertices(grid)
+    finally:
+        vorflow_logger.propagate = old_propagate
+
+    assert result.geometry.iloc[0].equals_exact(holed, 0)
+    assert len(result.geometry.iloc[1].exterior.coords) == len(plain.exterior.coords) - 1
+    assert "  -> Kept 1 cells unmerged: merging close vertices made them invalid" in caplog.messages
+
+
 @pytest.mark.parametrize('piece', [
     # A sliver at a cell vertex, narrower than the snap tolerance (4e-8 here).
     Polygon([(10, 10), (10 - 1e-8, 10), (10, 10 - 1e-8)]),

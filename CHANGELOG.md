@@ -9,6 +9,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Merging close cell vertices no longer aborts the whole grid with a GEOS
+  `Invalid number of points in LinearRing` error when every vertex of one
+  ring (a tiny cell, or a tiny hole in one) falls within the merge
+  tolerance. That cell now keeps its unmerged geometry and is counted in the
+  "Kept N cells unmerged" warning, as a cell that merging would make invalid
+  already was.
 - Enforcing a barrier no longer crashes with a GEOS `Invalid number of points
   in LinearRing` error when a piece split off a cell, or a hole in it, is
   smaller than the vertex-snapping tolerance. Such a piece now keeps its
