@@ -124,13 +124,12 @@ def test_real_pyproject_is_readable():
     assert real.requirements
 
 
-def test_version_from_tag():
-    assert check_dist.version_from_tag("v0.1.0rc1") == "0.1.0rc1"
-
-
-def test_version_from_tag_rejects_production_tag():
-    with pytest.raises(ValueError, match="release-candidate"):
-        check_dist.version_from_tag("v0.1.0")
+@pytest.mark.parametrize(
+    ("tag", "version"),
+    [("v0.1.0rc1", "0.1.0rc1"), ("v0.1.0", "0.1.0"), ("v1.2.3", "1.2.3")],
+)
+def test_version_from_tag_accepts_candidate_and_final_tags(tag, version):
+    assert check_dist.version_from_tag(tag) == version
 
 
 @pytest.mark.parametrize(
@@ -140,10 +139,16 @@ def test_version_from_tag_rejects_production_tag():
         "vnot-rc-tag",
         "v0.1.0rc",
         "v0.1.0rc1junk",
+        "v0.1.0a1",
+        "v0.1.0b1",
+        "v0.1.0.dev1",
+        "v0.1.0.post1",
+        "v0.1.0+local",
+        "v0.1.0-rc1",
     ],
 )
-def test_version_from_tag_rejects_malformed_candidate_tags(tag):
-    with pytest.raises(ValueError, match="release-candidate"):
+def test_version_from_tag_rejects_other_tags(tag):
+    with pytest.raises(ValueError, match="expected a release tag"):
         check_dist.version_from_tag(tag)
 
 
