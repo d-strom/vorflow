@@ -189,7 +189,8 @@ def test_snap_to_cell_vertices_keeps_piece_whose_ring_collapses(piece):
     """Catches GEOS raising when snapping collapses a ring of a split piece to two points."""
     cell = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
 
-    assert tessellator_module._snap_to_cell_vertices(piece, cell) is piece
+    # GEOS 3.13 raises on the collapsed ring; GEOS 3.11 leaves the ring as is.
+    assert tessellator_module._snap_to_cell_vertices(piece, cell).equals(piece)
 
 
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
