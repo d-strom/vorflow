@@ -7,6 +7,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Enforcing a barrier no longer crashes with a GEOS `Invalid number of points
+  in LinearRing` error when a piece split off a cell, or a hole in it, is
+  smaller than the vertex-snapping tolerance. Such a piece now keeps its
+  unsnapped geometry, as a piece that snapping would make invalid already
+  did.
+
 ## [0.1.0rc1]
 
 ### Fixed
