@@ -179,6 +179,19 @@ def test_straddled_pieces_merge_cut_point_into_nearby_cell_vertex():
         assert tuple(vertex) in {tuple(c) for c in coords}
 
 
+@pytest.mark.parametrize('piece', [
+    # A sliver at a cell vertex, narrower than the snap tolerance (4e-8 here).
+    Polygon([(10, 10), (10 - 1e-8, 10), (10, 10 - 1e-8)]),
+    # A piece with a hole narrower than the snap tolerance.
+    Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [[(5, 5), (5 + 1e-8, 5), (5, 5 + 1e-8)]]),
+])
+def test_snap_to_cell_vertices_keeps_piece_whose_ring_collapses(piece):
+    """Catches GEOS raising when snapping collapses a ring of a split piece to two points."""
+    cell = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+    assert tessellator_module._snap_to_cell_vertices(piece, cell) is piece
+
+
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
     """Catches removing a cell when Shapely raises while splitting it."""
     tessellator, _ = _plain_barrier_tessellator()

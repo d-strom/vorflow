@@ -20,6 +20,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Enforcing a barrier no longer crashes with a GEOS `Invalid number of points
+  in LinearRing` error when a piece split off a cell, or a hole in it, is
+  smaller than the vertex-snapping tolerance. Such a piece now keeps its
+  unsnapped geometry, as a piece that snapping would make invalid already
+  did.
 - A standard line crossing a barrier (or straddle) line now ends exactly on a
   straddle pair placed at the crossing, instead of being trimmed back by the
   barrier corridor with its end nodes at an arbitrary offset from the nearest

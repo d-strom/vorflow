@@ -240,10 +240,15 @@ def _snap_to_cell_vertices(piece, cell_poly):
 
     A barrier through (or within roundoff of) a cell vertex makes split()
     insert its own copy of the vertex next to the original, i.e. a
-    zero-length edge the neighbouring cell does not share.
+    zero-length edge the neighbouring cell does not share. A piece (or hole)
+    smaller than the tolerance would collapse to a ring of fewer than three
+    points, which GEOS rejects, so it keeps its unsnapped geometry.
     """
     tolerance = 1e-9 * cell_poly.length
-    snapped = shapely.remove_repeated_points(shapely.snap(piece, cell_poly, tolerance), tolerance)
+    try:
+        snapped = shapely.remove_repeated_points(shapely.snap(piece, cell_poly, tolerance), tolerance)
+    except shapely.errors.GEOSException:
+        return piece
     if not snapped.is_valid or abs(snapped.area - piece.area) > 1e-9 * cell_poly.area:
         return piece
     return snapped
