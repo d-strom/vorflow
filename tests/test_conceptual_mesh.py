@@ -49,3 +49,112 @@ def test_lines_and_points_snap_to_polygons():
     tolerance = 1e-3
     assert snapped_line.distance(boundary) <= tolerance
     assert snapped_point.distance(boundary) <= tolerance
+
+def test_polygon_simplification():
+    """Test that polygons are simplified when tolerance is provided."""
+    cm = ConceptualMesh()
+    
+    # Create a "noisy" square with a tiny bump on the top edge
+    # (0,1) -> (0.5, 1.001) -> (1,1)
+    poly = Polygon([(0, 0), (1, 0), (1, 1), (0.5, 1.001), (0, 1)])
+    
+    # Add with a tolerance larger than the noise (0.001)
+    cm.add_polygon(poly, zone_id=1, simplify_tolerance=0.01)
+    
+    clean_polys, _, _ = cm.generate()
+    
+    simplified_geom = clean_polys.iloc[0].geometry
+    
+    # The original polygon has 5 vertices + closing = 6 points in exterior ring
+    # The simplified one should remove the bump, leaving 4 corners + closing = 5 points
+    assert len(simplified_geom.exterior.coords) == 5
+    assert len(simplified_geom.exterior.coords) < len(poly.exterior.coords)
+
+def test_line_simplification():
+    """Test that lines are simplified when tolerance is provided."""
+    cm = ConceptualMesh()
+    # Noisy line: straight but with a midpoint slightly off
+    line = LineString([(0, 0), (0.5, 0.001), (1, 0)])
+    
+    cm.add_line(line, line_id="noisy_line", resolution=0.1, simplify_tolerance=0.01, densify=False)
+    
+    _, clean_lines, _ = cm.generate()
+    
+    simplified_line = clean_lines.iloc[0].geometry
+    # Should be simplified to just start and end points
+    assert len(simplified_line.coords) == 2
+
+def test_point_deduplication():
+    """Test that close points are merged and the finest resolution is kept."""
+    cm = ConceptualMesh()
+    p1 = Point(0, 0)
+    p2 = Point(0.0001, 0) # Very close to p1
+    
+    # Case 1: No simplification (default) -> Should keep both
+    cm.add_point(p1, "p1", resolution=1.0)
+    cm.add_point(p2, "p2", resolution=0.5) 
+    
+    _, _, clean_points = cm.generate()
+    assert len(clean_points) == 2
+    
+    # Case 2: With simplification -> Should merge
+    cm2 = ConceptualMesh()
+    # p2 has finer resolution (0.5), so it should be the one kept
+    cm2.add_point(p1, "p1", resolution=1.0, simplify_tolerance=0.01)
+    cm2.add_point(p2, "p2", resolution=0.5, simplify_tolerance=0.01)
+    
+    _, _, clean_points_merged = cm2.generate()
+    
+    assert len(clean_points_merged) == 1
+    
+    # Verify we kept the point with the finer resolution (0.5)
+    kept_point = clean_points_merged.iloc[0]
+    assert kept_point['lc'] == 0.5
+    assert kept_point['point_id'] == "p2"
+
+def test_line_densification_options():
+    """Test the three modes of line densification: False, True, and float."""
+    cm = ConceptualMesh()
+    # A line of length 10
+    line = LineString([(0, 0), (10, 0)])
+    
+    # 1. densify=False: Should NOT add vertices
+    cm.add_line(line, "no_densify", resolution=1.0, densify=False)
+    
+    # 2. densify=True (default): Should use resolution (1.0) -> ~10 segments
+    cm.add_line(line, "default_densify", resolution=1.0, densify=True)
+    
+    # 3. densify=5.0: Should use custom spacing (5.0) -> ~2 segments
+    cm.add_line(line, "custom_densify", resolution=1.0, densify=5.0)
+    
+    _, clean_lines, _ = cm.generate()
+    
+    # Check 1: No densification
+    l1 = clean_lines[clean_lines['line_id'] == "no_densify"].iloc[0].geometry
+    assert len(l1.coords) == 2 # Just start and end
+    
+    # Check 2: Default densification (lc=1.0)
+    l2 = clean_lines[clean_lines['line_id'] == "default_densify"].iloc[0].geometry
+    # Should have 11 points (10 segments)
+    assert len(l2.coords) == 11 
+    
+    # Check 3: Custom densification (val=5.0)
+    l3 = clean_lines[clean_lines['line_id'] == "custom_densify"].iloc[0].geometry
+    # Should have roughly 3 points (2 segments)
+    assert len(l3.coords) == 3
+
+@pytest.mark.parametrize("bool_tol", [True, False])
+def test_simplify_tolerance_bool_is_rejected(bool_tol):
+    cm = ConceptualMesh()
+
+    poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+    with pytest.raises(ValueError):
+        cm.add_polygon(poly, zone_id=1, simplify_tolerance=bool_tol)
+
+    line = LineString([(0, 0), (1, 0)])
+    with pytest.raises(ValueError):
+        cm.add_line(line, line_id="l1", resolution=0.1, simplify_tolerance=bool_tol, densify=False)
+
+    pt = Point(0, 0)
+    with pytest.raises(ValueError):
+        cm.add_point(pt, point_id="p1", resolution=0.1, simplify_tolerance=bool_tol)

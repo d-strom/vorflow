@@ -55,7 +55,7 @@ class EmptyMeshGenerator:
 def _build_simple_conceptual_mesh():
     cm = ConceptualMesh(crs="EPSG:3857")
     square = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
-    cm.add_polygon(square, zone_id=99, border_density=0.5)
+    cm.add_polygon(square, zone_id=99, densify=0.5)
     return cm
 
 

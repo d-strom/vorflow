@@ -494,10 +494,14 @@ class MeshGenerator:
         for idx, row in polygons_gdf.iterrows():
             if idx in gmsh_map['surfaces']:
                 tags = extract_tags(gmsh_map['surfaces'][idx])
-                
+
                 target_lc = get_row_param(row, 'lc', global_max_lc)
-                border_dens = get_row_param(row, 'border_density', target_lc)
-                boundary_lc = min(target_lc, border_dens)
+
+                densify_val = row.get("densify", None)
+                if isinstance(densify_val, (int, float)) and not isinstance(densify_val, bool) and densify_val > 0:
+                    boundary_lc = min(target_lc, float(densify_val))
+                else:
+                    boundary_lc = target_lc
 
                 if self.verbosity > 1:
                     print(f"Poly {idx}: Target={target_lc}, Border={boundary_lc}, Global={global_max_lc}")
