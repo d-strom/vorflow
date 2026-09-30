@@ -1,6 +1,7 @@
 import warnings
 
 import gmsh
+import numpy as np
 import pytest
 from shapely.geometry import LineString, Polygon, box
 from shapely.ops import split
@@ -748,3 +749,34 @@ def test_crossing_refinement_limits_size_jump(monkeypatch):
     near = grid[(centroids.x.sub(4).abs() < 1.5) & (centroids.y.sub(5).abs() < 1.5)]
     assert not near.empty
     assert near.geometry.area.max() < (1.6 * lc) ** 2
+
+
+def _blob(rx, ry, harmonics, n=160):
+    """Ellipse with sinusoidal radius perturbations (the README splash domain)."""
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    r = np.ones_like(t)
+    for k, amp, phase in harmonics:
+        r += amp * np.sin(k * t + phase)
+    return Polygon(np.c_[rx * r * np.cos(t), ry * r * np.sin(t)])
+
+
+# half_span 1300: the clipped river's strip ends with a corner on the domain
+# outline, so domain minus footprint is a ring pinched at that corner. 1700:
+# the strip crosses the whole domain and splits it in two.
+@pytest.mark.parametrize("half_span", [1300, 1700])
+def test_quad_buffer_touching_the_domain_outline_keeps_the_domain_surface(half_span):
+    domain = _blob(1500, 480, [(2, 0.06, 0.4), (3, 0.05, 1.3), (5, 0.03, 2.1), (7, 0.015, 0.2)])
+    x = np.linspace(-half_span, half_span, 300)
+    river = LineString(np.c_[x, 120 * np.sin(x / 330) - 0.12 * x - 60])
+    cm = ConceptualMesh()
+    cm.add_polygon(domain, zone_id=1, resolution=110)
+    cm.add_line(river, line_id="river", resolution=16, quad_buffer=True, quad_buffer_thickness=2)
+    clean_polys, clean_lines, clean_points = cm.generate()
+    mesher = MeshGenerator(background_lc=110, verbosity=0)
+    assert mesher.generate(clean_polys, clean_lines, clean_points)
+
+    assert not mesher.get_element_grid("quads").empty
+    grid = VoronoiTessellator(mesher, cm, clip_to_boundary=True).generate()
+    # A dropped domain surface left ~500 cells around the river alone.
+    assert len(grid) > 2000
+    assert grid.geometry.area.sum() == pytest.approx(domain.area, rel=1e-6)

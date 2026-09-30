@@ -82,7 +82,22 @@ def test_release_script_imports_are_declared():
     }
     for script in (ROOT / "scripts").glob("*.py"):
         tree = ast.parse(script.read_text(encoding="utf-8"))
+        # An import in a try body with an ImportError handler is optional; its
+        # fallback in the handler (e.g. tomli for tomllib) is still checked.
+        optional = {
+            id(statement)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Try)
+            and any(
+                isinstance(h.type, ast.Name)
+                and h.type.id in {"ImportError", "ModuleNotFoundError"}
+                for h in node.handlers
+            )
+            for statement in node.body
+        }
         for node in ast.walk(tree):
+            if id(node) in optional:
+                continue
             if isinstance(node, ast.Import):
                 modules = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0:

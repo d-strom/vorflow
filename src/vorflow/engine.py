@@ -61,6 +61,7 @@ from ._features import (
     positive_number,
     row_bool,
     sanitize_coords,
+    unpinch_polygons,
 )
 
 
@@ -80,6 +81,8 @@ def _to_key(dim, tag):
 _DEDUP_MATCH_TOL = 1e-6
 _HEAL_MATCH_TOL = 1e-4
 _HEAL_MATCH_REL_TOL = 0.5
+# Vertices closer than this are one point when building OCC curve loops.
+_VERTEX_MERGE_TOL = 1e-5
 
 
 def _entity_signature(dim, tag):
@@ -1601,6 +1604,8 @@ class MeshGenerator:
             and geom.intersects(footprints_union)
         ):
             geom = make_valid(geom.difference(footprints_union))
+        # A footprint touching the outline pinches the ring (see unpinch_polygons).
+        geom = unpinch_polygons(geom, _VERTEX_MERGE_TOL)
         for poly in polygon_parts(geom):
             if poly.is_empty:
                 continue
@@ -1611,18 +1616,32 @@ class MeshGenerator:
                 # domain surfaces, which violates embed=False semantics.
                 inventory.pending_nonembedded_polys.append((int(idx), poly))
                 continue
-            s_tag, _ = self._create_polygon_surface(poly)
+            s_tag = self._create_required_surface(poly, f"polygon {idx}")
             if s_tag is None:
                 logger.warning(f"Warning: Skipping degenerate polygon {idx}")
                 continue
             inventory.record_embedded(_to_key(2, s_tag), 'surface', idx)
+
+    def _create_required_surface(self, poly, label):
+        """Create a surface for an embedded part; None for a sliver OCC rejects, raises for anything wider.
+
+        The part's footprint is already cut out of its neighbours, so losing
+        it leaves a hole in the domain: the points and lines inside are then
+        not embedded and the Voronoi grid is silently wrong.
+        """
+        s_tag, _ = self._create_polygon_surface(poly)
+        if s_tag is None and poly.area > _VERTEX_MERGE_TOL * poly.length:
+            raise RuntimeError(
+                f"Could not create an OCC surface for {label} (area {poly.area:.6g}); "
+                f"meshing without it would leave a hole in the domain.")
+        return s_tag
 
     def _add_buffer_surfaces(self, buffer_geom, feature_key, domain, inventory,
                              corners=None, side_lines=None):
         """Create OCC surfaces for a buffer footprint clipped to the domain; returns [(key, strip_info)]."""
         if domain is not None and not domain.is_empty:
             buffer_geom = buffer_geom.intersection(domain)
-        buffer_geom = make_valid(buffer_geom)
+        buffer_geom = unpinch_polygons(make_valid(buffer_geom), _VERTEX_MERGE_TOL)
         parts = [
             poly for poly in polygon_parts(buffer_geom)
             if not poly.is_empty and poly.area > 0
@@ -1633,7 +1652,7 @@ class MeshGenerator:
             corners = None
         created = []
         for poly in parts:
-            s_tag, _ = self._create_polygon_surface(poly)
+            s_tag = self._create_required_surface(poly, f"the quad buffer of {feature_key[0]} {feature_key[1]}")
             if s_tag is None:
                 continue
             key = _to_key(2, s_tag)
@@ -1715,7 +1734,8 @@ class MeshGenerator:
     @staticmethod
     def _create_curve_loop(coords):
         """Create an OCC curve loop through a ring's coordinates; returns (loop tag, curve tags) or (None, [])."""
-        clean_coords = sanitize_coords(coords, min_spacing=1e-5, require_closed=True, min_points=3)
+        clean_coords = sanitize_coords(
+            coords, min_spacing=_VERTEX_MERGE_TOL, require_closed=True, min_points=3)
         if len(clean_coords) < 3:
             return None, []
         p_tags = [gmsh.model.occ.addPoint(x, y, 0) for x, y in clean_coords]

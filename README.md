@@ -1,4 +1,15 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rhugman/vorflow/main/docs/images/vorflow-banner-network.png"
+       alt="vorflow Voronoi grid: cells refine along a stream network, around wells and inside a circular zone, with a hole cut into the zone"
+       width="100%">
+</p>
+
 # vorflow
+
+[![PyPI](https://img.shields.io/pypi/v/vorflow)](https://pypi.org/project/vorflow/)
+[![Python](https://img.shields.io/pypi/pyversions/vorflow)](https://pypi.org/project/vorflow/)
+[![Tests](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml/badge.svg)](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rhugman/vorflow/blob/main/LICENSE)
 
 Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas.
 
@@ -28,18 +39,32 @@ The typical workflow follows these steps:
 
 ## Installation
 
-`vorflow` requires Python 3.10 or newer. It is not yet published on PyPI, so
-install it from GitHub:
+`vorflow` requires Python 3.10 or newer. Install it from PyPI:
+
+```bash
+pip install vorflow
+```
+
+The examples and notebooks also need Matplotlib, which the `examples` extra
+installs:
+
+```bash
+pip install "vorflow[examples]"
+```
+
+On Linux, the `gmsh` wheel from PyPI needs the system GLU library (for example
+`sudo apt-get install libglu1-mesa` on Debian/Ubuntu). Alternatively, install
+the geospatial stack and Gmsh from conda-forge first, then `pip install vorflow`
+into that environment.
+
+To try the latest unreleased changes, install from GitHub:
 
 ```bash
 pip install "git+https://github.com/rhugman/vorflow.git"
 ```
 
-On Linux, the `gmsh` wheel from PyPI needs the system GLU library (for example
-`sudo apt-get install libglu1-mesa` on Debian/Ubuntu).
-
-Release candidates are rehearsed on TestPyPI first. Once one is published
-there, it can be installed with (dependencies still come from PyPI):
+Release candidates are published to TestPyPI before each release. To test one
+(dependencies still come from PyPI):
 
 ```bash
 pip install --pre --index-url https://test.pypi.org/simple/ \

@@ -29,7 +29,15 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN_DIRECTORIES = {".conda", ".github", "benchmarks", "docs", "tests", "__pycache__"}
+FORBIDDEN_DIRECTORIES = {
+    ".conda",
+    ".github",
+    "benchmarks",
+    "docs",
+    "tests",
+    "tool-benchmark",
+    "__pycache__",
+}
 
 
 @dataclass(frozen=True)
@@ -88,17 +96,28 @@ def expected_from_pyproject(pyproject: Path) -> ExpectedMetadata:
 
 
 def version_from_tag(tag: str) -> str:
+    """Return the version of a ``vX.Y.Z`` or ``vX.Y.ZrcN`` release tag.
+
+    Release candidates go to TestPyPI and final releases to PyPI, so any other
+    pre-, post-, dev- or local-release tag is rejected.
+    """
+    message = f"expected a release tag like v0.1.0 or v0.1.0rc1, received {tag!r}"
     if not tag.startswith("v"):
-        raise ValueError(f"expected a release-candidate tag, received {tag!r}")
-    value = tag[1:]
+        raise ValueError(message)
     try:
-        version = Version(value)
+        version = Version(tag[1:])
     except InvalidVersion as error:
-        raise ValueError(
-            f"expected a release-candidate tag, received {tag!r}"
-        ) from error
-    if version.pre is None or version.pre[0] != "rc" or tag != f"v{version}":
-        raise ValueError(f"expected a release-candidate tag, received {tag!r}")
+        raise ValueError(message) from error
+    candidate = version.pre is not None and version.pre[0] == "rc"
+    final = version.pre is None
+    if (
+        not (candidate or final)
+        or version.is_postrelease
+        or version.is_devrelease
+        or version.local is not None
+        or tag != f"v{version}"
+    ):
+        raise ValueError(message)
     return str(version)
 
 
@@ -304,7 +323,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--expected-tag",
-        help="release-candidate tag (e.g. v0.1.0rc1) that must match the project version",
+        help="release tag (e.g. v0.1.0 or v0.1.0rc1) that must match the project version",
     )
     args = parser.parse_args()
     validate_dist(args.directory, args.pyproject, args.expected_tag)

@@ -179,6 +179,42 @@ def test_straddled_pieces_merge_cut_point_into_nearby_cell_vertex():
         assert tuple(vertex) in {tuple(c) for c in coords}
 
 
+def test_merge_close_vertices_keeps_cell_whose_hole_collapses(caplog):
+    """Catches GEOS raising for the whole grid when merging collapses one cell's hole to a point."""
+    # Coordinate scale 20, so vertices within 2e-11 merge.
+    holed = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [[(5, 5), (5 + 1e-12, 5), (5, 5 + 1e-12)]])
+    # A near-duplicate vertex that should still be merged away.
+    plain = Polygon([(10, 0), (20, 0), (20, 5), (20, 5 + 1e-12), (20, 10), (10, 10)])
+    grid = gpd.GeoDataFrame({"node_id": [0, 1]}, geometry=[holed, plain])
+
+    vorflow_logger = logging.getLogger("vorflow")
+    old_propagate = vorflow_logger.propagate
+    vorflow_logger.propagate = True
+    try:
+        with caplog.at_level("WARNING", logger="vorflow.tessellator"):
+            result = tessellator_module._merge_close_vertices(grid)
+    finally:
+        vorflow_logger.propagate = old_propagate
+
+    assert result.geometry.iloc[0].equals_exact(holed, 0)
+    assert len(result.geometry.iloc[1].exterior.coords) == len(plain.exterior.coords) - 1
+    assert "  -> Kept 1 cells unmerged: merging close vertices made them invalid" in caplog.messages
+
+
+@pytest.mark.parametrize('piece', [
+    # A sliver at a cell vertex, narrower than the snap tolerance (4e-8 here).
+    Polygon([(10, 10), (10 - 1e-8, 10), (10, 10 - 1e-8)]),
+    # A piece with a hole narrower than the snap tolerance.
+    Polygon([(0, 0), (10, 0), (10, 10), (0, 10)], [[(5, 5), (5 + 1e-8, 5), (5, 5 + 1e-8)]]),
+])
+def test_snap_to_cell_vertices_keeps_piece_whose_ring_collapses(piece):
+    """Catches GEOS raising when snapping collapses a ring of a split piece to two points."""
+    cell = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+
+    # GEOS 3.13 raises on the collapsed ring; GEOS 3.11 leaves the ring as is.
+    assert tessellator_module._snap_to_cell_vertices(piece, cell).equals(piece)
+
+
 def test_enforce_barriers_retains_cell_and_logs_warning_when_split_fails(monkeypatch, caplog):
     """Catches removing a cell when Shapely raises while splitting it."""
     tessellator, _ = _plain_barrier_tessellator()

@@ -65,7 +65,8 @@ def _merge_close_vertices(grid_gdf: gpd.GeoDataFrame, rel_tol: float = VERTEX_ME
     keep identical shared vertices; consecutive repeats are then dropped.
     The scale includes the coordinate magnitude because roundoff grows with
     it (e.g. UTM northings). A cell the merge would make invalid keeps its
-    geometry.
+    geometry, including one with a ring (e.g. a tiny hole) that collapses to
+    fewer than three points, which GEOS rejects.
     """
     if grid_gdf.empty:
         return grid_gdf
@@ -80,8 +81,17 @@ def _merge_close_vertices(grid_gdf: gpd.GeoDataFrame, rel_tol: float = VERTEX_ME
 
     merged = shapely.set_coordinates(geoms.copy(), coords[index])
     changed = np.unique(owner[moved])
-    merged[changed] = shapely.remove_repeated_points(merged[changed])
-    invalid = changed[~shapely.is_valid(merged[changed])]
+    collapsed = np.zeros(len(changed), dtype=bool)
+    try:
+        merged[changed] = shapely.remove_repeated_points(merged[changed])
+    except shapely.errors.GEOSException:
+        # One collapsed ring aborts the vectorised call; retry cell by cell.
+        for k, i in enumerate(changed):
+            try:
+                merged[i] = shapely.remove_repeated_points(merged[i])
+            except shapely.errors.GEOSException:
+                collapsed[k] = True
+    invalid = changed[collapsed | ~shapely.is_valid(merged[changed])]
     merged[invalid] = geoms[invalid]
     if len(invalid):
         logger.warning(f"  -> Kept {len(invalid)} cells unmerged: merging close vertices made them invalid")
@@ -240,10 +250,15 @@ def _snap_to_cell_vertices(piece, cell_poly):
 
     A barrier through (or within roundoff of) a cell vertex makes split()
     insert its own copy of the vertex next to the original, i.e. a
-    zero-length edge the neighbouring cell does not share.
+    zero-length edge the neighbouring cell does not share. A piece (or hole)
+    smaller than the tolerance would collapse to a ring of fewer than three
+    points, which GEOS rejects, so it keeps its unsnapped geometry.
     """
     tolerance = 1e-9 * cell_poly.length
-    snapped = shapely.remove_repeated_points(shapely.snap(piece, cell_poly, tolerance), tolerance)
+    try:
+        snapped = shapely.remove_repeated_points(shapely.snap(piece, cell_poly, tolerance), tolerance)
+    except shapely.errors.GEOSException:
+        return piece
     if not snapped.is_valid or abs(snapped.area - piece.area) > 1e-9 * cell_poly.area:
         return piece
     return snapped
@@ -320,6 +335,19 @@ def _fragment_merge(piece, geometries, tree, barriers):
     return best
 
 
+def _clip_to_domain(gdf, domain_geom):
+    """Return the rows of ``gdf`` that intersect ``domain_geom``, clipped to it, in their original order.
+
+    Replaces ``gpd.clip``, which with pandas 1.5 / GeoPandas 0.13 writes the
+    clipped geometries back onto the wrong rows (its spatial-index query
+    reorders them), so cells lose their generator's x/y and node_id.
+    """
+    hits = np.sort(gdf.sindex.query(domain_geom, predicate='intersects'))
+    clipped = gdf.iloc[hits].copy()
+    clipped[clipped.geometry.name] = clipped.geometry.intersection(domain_geom)
+    return clipped
+
+
 def _merge_barrier_fragments(geometries, fragments, barriers):
     """Merge small barrier-split fragments into neighbouring cells; return the fragments left over.
 
@@ -332,7 +360,8 @@ def _merge_barrier_fragments(geometries, fragments, barriers):
     pending = [f for f in fragments if f[0].area < BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     leftover = [f for f in fragments if f[0].area >= BARRIER_FRAGMENT_MERGE_FRACTION * f[1]]
     while pending:
-        tree = shapely.STRtree(geometries)
+        # Shapely 2.0's STRtree makes the array it is given read-only.
+        tree = shapely.STRtree(geometries.copy())
         unmerged = []
         for fragment in pending:
             merge = _fragment_merge(fragment[0], geometries, tree, barriers)
@@ -968,12 +997,7 @@ class VoronoiTessellator:
                 )
                 return gpd.GeoDataFrame()
 
-            domain_gdf = gpd.GeoDataFrame(
-                geometry=[domain_geom], 
-                crs=self.cm.crs
-            )
-            
-            bounded_voronoi = gpd.clip(raw_gdf, domain_gdf)
+            bounded_voronoi = _clip_to_domain(raw_gdf, domain_geom)
             logger.info(f"  -> After Domain Clip: {len(bounded_voronoi)}")
         
             if len(bounded_voronoi) == 0:
