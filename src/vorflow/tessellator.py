@@ -65,7 +65,8 @@ def _merge_close_vertices(grid_gdf: gpd.GeoDataFrame, rel_tol: float = VERTEX_ME
     keep identical shared vertices; consecutive repeats are then dropped.
     The scale includes the coordinate magnitude because roundoff grows with
     it (e.g. UTM northings). A cell the merge would make invalid keeps its
-    geometry.
+    geometry, including one with a ring (e.g. a tiny hole) that collapses to
+    fewer than three points, which GEOS rejects.
     """
     if grid_gdf.empty:
         return grid_gdf
@@ -80,8 +81,17 @@ def _merge_close_vertices(grid_gdf: gpd.GeoDataFrame, rel_tol: float = VERTEX_ME
 
     merged = shapely.set_coordinates(geoms.copy(), coords[index])
     changed = np.unique(owner[moved])
-    merged[changed] = shapely.remove_repeated_points(merged[changed])
-    invalid = changed[~shapely.is_valid(merged[changed])]
+    collapsed = np.zeros(len(changed), dtype=bool)
+    try:
+        merged[changed] = shapely.remove_repeated_points(merged[changed])
+    except shapely.errors.GEOSException:
+        # One collapsed ring aborts the vectorised call; retry cell by cell.
+        for k, i in enumerate(changed):
+            try:
+                merged[i] = shapely.remove_repeated_points(merged[i])
+            except shapely.errors.GEOSException:
+                collapsed[k] = True
+    invalid = changed[collapsed | ~shapely.is_valid(merged[changed])]
     merged[invalid] = geoms[invalid]
     if len(invalid):
         logger.warning(f"  -> Kept {len(invalid)} cells unmerged: merging close vertices made them invalid")
