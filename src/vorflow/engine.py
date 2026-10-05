@@ -694,10 +694,14 @@ class MeshGenerator:
                 with ``vorflow.set_verbosity()``.
             mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
                 5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
-            smoothing_steps (int): Number of internal Lloyd smoothing iterations
-                performed by Gmsh during mesh generation.
-            optimization_cycles (int): Number of explicit optimization passes
-                (e.g., Relocate2D, Laplace2D) to run after the initial mesh is generated.
+            smoothing_steps (int): Gmsh ``Mesh.Smoothing``: the number of Laplacian
+                smoothing passes over the triangle-mesh nodes during mesh generation.
+            optimization_cycles (int): Number of extra gmsh ``Relocate2D`` +
+                ``Laplace2D`` passes over the triangles after the initial mesh is
+                generated. Both options improve triangle shape; neither centres the
+                Voronoi generators within their cells. For Lloyd (centroidal
+                Voronoi) relaxation of the generators, use
+                ``VoronoiTessellator(lloyd_iterations=...)``.
             tolerance_initial_delaunay (float): Tolerance for the initial Delaunay
                 point insertion. Increase this (e.g. 1e-4, 1e-2) to handle
                 "Could not insert point" errors caused by near-degenerate geometry
@@ -2663,7 +2667,7 @@ class MeshGenerator:
     def _mesh_2d(self):
         """Set the meshing options, generate the 2D mesh and run the optimization cycles."""
         gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm)
-        # Number of internal smoothing steps.
+        # Laplacian smoothing passes over the triangle-mesh nodes.
         gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
         # Tolerance for the initial Delaunay insertion - helps with
         # "Could not insert point" from near-degenerate geometry.
@@ -2680,7 +2684,7 @@ class MeshGenerator:
                     logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
                 # Moves nodes to improve element shape (compactness).
                 gmsh.model.mesh.optimize("Relocate2D", niter=1)
-                # Smooths the mesh to relax gradients (reduces drift).
+                # Laplacian smoothing: moves each free node towards the mean of its neighbours.
                 gmsh.model.mesh.optimize("Laplace2D", niter=1)
 
     @staticmethod
