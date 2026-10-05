@@ -7,6 +7,92 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
+Centred point cells (`hex_ring`) and size-weighted Lloyd relaxation
+(`lloyd_iterations`), both opt-in. Field-only polygons now refine their
+whole interior, and the minimum Shapely version is 2.1.
+
+### Added
+
+- `ConceptualMesh.add_point(..., hex_ring=True)` adds six fixed mesh nodes at
+  radius `resolution` around the point (at 30 + k x 60 degrees), so the
+  point's Voronoi cell is a regular hexagon centred on it with apothem
+  `resolution / 2` ([#31](https://github.com/rhugman/vorflow/issues/31)). On
+  a 2 km model with four wells (resolution 5-10 m, `growth_factor=1.2`) the
+  well cells' `drift_ratio` goes from 0.04-0.10 to 0 and the neighbour-area
+  coefficient of variation from 0.17 to 0.04, for 42 extra cells per well.
+  The ring is built after snapping and clipping, and dropped with a
+  `UserWarning` when a polygon boundary, an embedded line (including its
+  straddle or quad-buffer band) or another embedded point is closer than
+  `HEX_RING_CLEARANCE` (2) x `resolution`; when a polygon (embedded or
+  field-only, held at its resolution throughout its interior), line or point
+  is estimated to set a mesh size below
+  `HEX_RING_MIN_SIZE_RATIO` (0.9) x `resolution` at the ring, e.g. a well
+  inside a zone with a finer resolution; or when `simplify_tolerance` merges
+  the point into another. After meshing, `MeshGenerator.generate()` checks
+  that each ring's centre node has exactly six triangles onto its six seeds,
+  warns when a size field the estimate does not model (e.g. a
+  `background_lc` below the ring radius) split it, and records the outcome
+  in `diagnostics['hex_rings']` (`{point_id: bool}`). Requires `embed=True`
+  and a positive `resolution`. The point's size field also targets the six
+  seeds, so its refined patch is about one radius larger.
+- `VoronoiTessellator(..., lloyd_iterations=0, lloyd_damping=1.0,
+  lloyd_tolerance=1e-3)` runs a density-weighted Lloyd relaxation of the
+  generators before the grid is built
+  ([#31](https://github.com/rhugman/vorflow/issues/31),
+  [#2](https://github.com/rhugman/vorflow/issues/2)). Centroids are weighted
+  by h^-4, with h the local mesh size, so the mesh grading is kept; only
+  interior nodes of the embedded polygon surfaces move, and moves that would
+  leave the node's zone or cross an embedded line are rejected.
+  `lloyd_tolerance` stops the run once the largest remaining distance from
+  an accepted node to its centroid, relative to the local mesh size, is
+  below it, independent of `lloyd_damping`. The mesh generator must have run
+  before the tessellator is constructed. On the same
+  model 20 passes lower the interior p95 `drift_ratio` from 0.118 to 0.099
+  and the p95 centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees, and
+  take 0.70 s against 0.33 s without. Unweighted Lloyd would grow the
+  refined well cells 2-4 times in area. With Lloyd on, the Voronoi grid is
+  no longer the exact dual of `MeshGenerator.get_element_grid()`.
+- `MeshGenerator.node_is_free`, `node_sizes` (mean incident mesh-edge length
+  per node) and `buffer_footprints` (union of the quad-buffer footprints),
+  set by `generate()` as inputs to the Lloyd relaxation.
+- A `lloyd_shift` grid column (distance each generator moved; 0 for fixed
+  nodes, NaN for barrier mirrors, barrier fragments and detached cell parts)
+  and `VoronoiTessellator.lloyd_report` when `lloyd_iterations > 0`: passes
+  run (`iterations`), the last pass's largest residual |centroid - node| /
+  local size over accepted nodes (`max_rel_shift`), moves rejected
+  (`rejected`) and free generators (`n_free`).
+- `examples/point_centring_demo.ipynb` compares Gmsh smoothing, `hex_ring`
+  and `lloyd_iterations` on the model above.
+
+### Changed
+
+- Requires `shapely>=2.1` (was `>=2.0`) for
+  `shapely.constrained_delaunay_triangles`, used by the field-only polygon
+  interior field below.
+
+### Fixed
+
+- Field-only polygons (`add_polygon(..., embed=False)`) now refine their
+  whole interior to `resolution`, as embedded polygons do. Before, their
+  interior size was a Gmsh `Constant` field scoped (`SurfacesList`) to the
+  polygon's own surface, which is not fragmented into the domain and so
+  holds no domain mesh nodes; only the growth from the boundary took effect.
+  The interior is now a `PostView` field over a triangulation of the polygon
+  (holes excluded) and the rest of the model's bounding box, which applies by
+  position. On a 200 x 200 domain (`background_lc=20`) with a 40 x 40 polygon
+  at resolution 1, the 10 x 10 core gets 115 nodes, against 116 when embedded
+  and 8 before. The `hex_ring` size check now measures field-only polygons as
+  areas instead of from their boundary, so a ring inside a finer field-only
+  polygon is dropped.
+- The `MeshGenerator` docstring described `smoothing_steps` as Lloyd
+  smoothing. It sets Gmsh `Mesh.Smoothing` (Laplacian smoothing of the
+  triangle mesh), and `optimization_cycles` runs `Relocate2D` + `Laplace2D`
+  passes; neither centres Voronoi generators in their cells. Raising them from
+  the default 10/2 to 100/10 leaves the p95 centroid `ortho_error` at 4.1-4.2
+  degrees.
+
 ## [0.1.0] - 2026-09-30
 
 First release on PyPI. There are no changes since 0.1.0rc1.
@@ -196,6 +282,7 @@ First release on PyPI. There are no changes since 0.1.0rc1.
   and `dist_max_in`.
 - `dist_min`/`dist_max` on features; use `growth_factor` or explicit `fields`.
 
-[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rhugman/vorflow/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...v0.1.0
 [0.1.0rc1]: https://github.com/rhugman/vorflow/tree/v0.1.0rc1
