@@ -270,6 +270,43 @@ def test_relax_stops_early_on_centroidal_lattice():
     np.testing.assert_allclose(out, nodes, atol=1e-9)
 
 
+def _max_residual(nodes, idx, domain):
+    """Largest |plain centroid - generator| over ``nodes[idx]`` (unit sizes)."""
+    centroids = _lloyd.weighted_centroids(nodes, idx, _constant(1.0), domain)
+    return float(np.max(np.linalg.norm(centroids - nodes[idx], axis=1)))
+
+
+@pytest.mark.parametrize("damping", [1.0, 0.1])
+def test_relax_stopping_test_is_damping_independent(damping):
+    # A test on the damped step would stop damping 0.1 at a residual up to
+    # 10x the tolerance (~0.09 here).
+    nodes, free = _jittered_lattice(10, 0.3, seed=7)
+    domain = box(0.0, 0.0, 9.0, 9.0)
+    idx = np.flatnonzero(free)
+    tolerance = 1e-2
+    assert _max_residual(nodes, idx, domain) > 10 * tolerance
+    out, report = _lloyd.relax(nodes, free, _constant(1.0), domain, [domain] * len(nodes), None,
+                               iterations=1000, damping=damping, tolerance=tolerance)
+    assert report["iterations"] < 1000
+    assert report["max_rel_shift"] < tolerance
+    assert _max_residual(out, idx, domain) < tolerance
+
+
+def test_relax_rejected_nodes_do_not_block_convergence():
+    # One free node owns a tiny polygon around itself, so every move it
+    # proposes is rejected; the rest of the lattice must still converge.
+    nodes, free = _jittered_lattice(10, 0.3, seed=8)
+    domain = box(0.0, 0.0, 9.0, 9.0)
+    stuck = int(np.flatnonzero(free)[0])
+    owners = [domain] * len(nodes)
+    owners[stuck] = Point(nodes[stuck]).buffer(1e-9)
+    out, report = _lloyd.relax(nodes, free, _constant(1.0), domain, owners, None,
+                               iterations=200, tolerance=1e-2)
+    assert report["iterations"] < 200
+    assert report["rejected"] >= report["iterations"]
+    assert out[stuck].tobytes() == nodes[stuck].tobytes()
+
+
 def test_relax_rejects_moves_across_constraint_line():
     nodes, free = _jittered_lattice(12, 0.3, seed=5)
     domain = box(0.0, 0.0, 11.0, 11.0)
@@ -304,6 +341,38 @@ def test_relax_rejects_invalid_arguments(kwargs):
     args = {"iterations": 3, **kwargs}
     with pytest.raises(ValueError):
         _lloyd.relax(nodes, free, _constant(1.0), domain, [domain] * len(nodes), None, **args)
+
+
+@pytest.mark.parametrize("iterations, damping, tolerance", [
+    (0, 1.0, 0.0),
+    (5, 0.5, 1e-3),
+    (np.int64(3), np.float32(0.2), np.float64(1e-4)),
+    (2, 1, 0),
+])
+def test_validate_settings_accepts(iterations, damping, tolerance):
+    _lloyd.validate_settings(iterations, damping, tolerance)
+
+
+@pytest.mark.parametrize("iterations, damping, tolerance", [
+    (-1, 1.0, 1e-3),
+    (2.0, 1.0, 1e-3),
+    (True, 1.0, 1e-3),
+    ("3", 1.0, 1e-3),
+    (3, 0.0, 1e-3),
+    (3, 1.5, 1e-3),
+    (3, True, 1e-3),
+    (3, float("nan"), 1e-3),
+    (3, "0.5", 1e-3),
+    (3, None, 1e-3),
+    (3, 1.0, -1e-3),
+    (3, 1.0, float("nan")),
+    (3, 1.0, False),
+    (3, 1.0, "0"),
+    (3, 1.0, None),
+])
+def test_validate_settings_rejects(iterations, damping, tolerance):
+    with pytest.raises(ValueError):
+        _lloyd.validate_settings(iterations, damping, tolerance)
 
 
 def test_relax_rejects_mismatched_owner_polys():
@@ -369,6 +438,26 @@ def test_lloyd_needs_mesh_generator_node_classification():
     fake.node_sizes = np.ones(3)
     with pytest.raises(ValueError, match="aligned"):
         VoronoiTessellator(fake, cm, lloyd_iterations=3).generate()
+
+
+def test_lloyd_uses_inputs_captured_with_the_nodes():
+    cm = _unit_square_mesh()
+    fake = _FakeMeshGenerator(cm.clean_polygons)
+    on_border = (fake.nodes == 0.0).any(axis=1) | (fake.nodes == 1.0).any(axis=1)
+    fake.node_is_free = ~on_border
+    fake.node_sizes = np.full(len(fake.nodes), 0.2)
+    reference = VoronoiTessellator(fake, cm, lloyd_iterations=3)
+    expected = reference.generate()
+
+    tess = VoronoiTessellator(fake, cm, lloyd_iterations=3)
+    # A re-run mesh generator replaces these; the tessellator keeps the
+    # arrays that belong to the nodes it captured.
+    fake.node_is_free = None
+    fake.node_sizes = np.ones(3)
+    grid = tess.generate()
+    assert tess.lloyd_report == reference.lloyd_report
+    assert tess.lloyd_report["n_free"] == 16
+    np.testing.assert_array_equal(grid[["x", "y", "lloyd_shift"]], expected[["x", "y", "lloyd_shift"]])
 
 
 def test_lloyd_off_ignores_missing_node_classification():

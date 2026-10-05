@@ -29,6 +29,10 @@ to the domain; these are few and next to fixed boundary nodes.
 the node's owner polygon (its original zone) and the segment from the old to
 the new point does not cross a constraint line (embedded or barrier lines).
 A rejected node stays where it is for that iteration.
+
+*Convergence.* Each step is damped (x + damping * (c - x)), but the stopping
+test uses the undamped residual |c - x| / h(x) of the accepted nodes, so a
+given tolerance means the same distance from the centroids for any damping.
 """
 from __future__ import annotations
 
@@ -250,6 +254,28 @@ def accept_moves(old, new, owner_polys, constraint_lines):
     return ok
 
 
+def _is_real_number(value) -> bool:
+    """True for an int, float or NumPy number that is not a bool and not NaN."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    return not np.isnan(value)
+
+
+def validate_settings(iterations, damping, tolerance, prefix=""):
+    """Raise ValueError unless iterations is an int >= 0, damping a number in (0, 1] and tolerance a number >= 0.
+
+    Bools and NaN are rejected; iterations must be an integer type (2.0 is
+    rejected), damping and tolerance may be any int or float. ``prefix`` is
+    prepended to the setting names in the messages (e.g. ``"lloyd_"``).
+    """
+    if isinstance(iterations, (bool, np.bool_)) or not isinstance(iterations, (int, np.integer)) or iterations < 0:
+        raise ValueError(f"{prefix}iterations must be a non-negative integer. Got {iterations!r}.")
+    if not _is_real_number(damping) or not (0.0 < damping <= 1.0):
+        raise ValueError(f"{prefix}damping must be a number in (0, 1]. Got {damping!r}.")
+    if not _is_real_number(tolerance) or not (tolerance >= 0.0):
+        raise ValueError(f"{prefix}tolerance must be a non-negative number. Got {tolerance!r}.")
+
+
 def _validate_relax_args(nodes, free, owner_polys, iterations, damping, tolerance):
     """Raise ValueError for inconsistent relax() arguments."""
     if nodes.ndim != 2 or nodes.shape[1] != 2:
@@ -258,12 +284,7 @@ def _validate_relax_args(nodes, free, owner_polys, iterations, damping, toleranc
         raise ValueError(f"free must be a bool mask of shape ({len(nodes)},). Got {free.shape}.")
     if len(owner_polys) != len(nodes):
         raise ValueError(f"owner_polys must have one entry per node ({len(nodes)}). Got {len(owner_polys)}.")
-    if isinstance(iterations, bool) or not isinstance(iterations, (int, np.integer)) or iterations < 0:
-        raise ValueError(f"iterations must be a non-negative integer. Got {iterations!r}.")
-    if not (0.0 < damping <= 1.0):
-        raise ValueError(f"damping must be in (0, 1]. Got {damping!r}.")
-    if not (tolerance >= 0.0):
-        raise ValueError(f"tolerance must be non-negative. Got {tolerance!r}.")
+    validate_settings(iterations, damping, tolerance)
 
 
 def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
@@ -272,12 +293,21 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
 
     Each iteration moves every free node ``x`` towards its weighted centroid
     ``c`` (``x + damping * (c - x)``), keeping only moves ``accept_moves``
-    allows. Stops early once the largest accepted shift relative to the local
-    size is below ``tolerance``. ``owner_polys`` has one entry per node
-    (len(nodes)); only the entries of free nodes are read, so fixed ones may
-    be None. Returns (new_nodes, report) with report keys ``iterations`` (run),
-    ``max_rel_shift`` (of the last iteration) and ``rejected`` (total moves
-    rejected over all iterations).
+    allows. ``owner_polys`` has one entry per node (len(nodes)); only the
+    entries of free nodes are read, so fixed ones may be None.
+
+    The stopping test uses the residual |c - x| / h(x) at the start of an
+    iteration, not the damped step, so it does not depend on ``damping``.
+    Only nodes whose move was accepted count: a rejected node does not move,
+    and would otherwise keep its residual and block convergence. Relaxation
+    stops after the iteration in which the largest such residual drops below
+    ``tolerance`` (if every move is rejected the residual is 0 and it stops,
+    since the next iteration would be identical).
+
+    Returns (new_nodes, report) with report keys ``iterations`` (run),
+    ``max_rel_shift`` (largest residual |c - x| / h(x) over the accepted
+    nodes of the last iteration; with damping 1 this is the largest step) and
+    ``rejected`` (total moves rejected over all iterations).
     """
     nodes = np.asarray(nodes, dtype=float)
     free = np.asarray(free)
@@ -296,8 +326,8 @@ def relax(nodes, free, size_fn, domain, owner_polys, constraint_lines,
         proposal = before + damping * (centroids - before)
         ok = accept_moves(before, proposal, owners, constraint_lines)
         current[free_idx[ok]] = proposal[ok]
-        shift = np.where(ok, np.hypot(*(proposal - before).T), 0.0)
-        max_rel_shift = float(np.max(shift / size_fn(before)))
+        residual = np.where(ok, np.hypot(*(centroids - before).T), 0.0)
+        max_rel_shift = float(np.max(residual / size_fn(before)))
         report = {
             "iterations": step + 1,
             "max_rel_shift": max_rel_shift,

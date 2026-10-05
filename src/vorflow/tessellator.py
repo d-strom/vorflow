@@ -439,16 +439,6 @@ def _explode_with_unique_ids(grid_gdf):
     return exploded
 
 
-def _validate_lloyd_args(iterations, damping, tolerance):
-    """Raise ValueError for invalid lloyd_iterations, lloyd_damping or lloyd_tolerance."""
-    if isinstance(iterations, bool) or not isinstance(iterations, (int, np.integer)) or iterations < 0:
-        raise ValueError(f"lloyd_iterations must be a non-negative integer. Got {iterations!r}.")
-    if isinstance(damping, bool) or not isinstance(damping, (int, float, np.number)) or not (0.0 < damping <= 1.0):
-        raise ValueError(f"lloyd_damping must be a number in (0, 1]. Got {damping!r}.")
-    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float, np.number)) or not (tolerance >= 0.0):
-        raise ValueError(f"lloyd_tolerance must be a non-negative number. Got {tolerance!r}.")
-
-
 def _zone_pieces(polygons, footprints):
     """Polygon parts of ``polygons`` (zones) with the quad-buffer ``footprints`` (or None) cut out."""
     pieces = []
@@ -552,14 +542,20 @@ class VoronoiTessellator:
                 line. With Lloyd on, the cells are no longer the exact dual of
                 the triangle mesh (``MeshGenerator.get_element_grid()``) and
                 the grid gets a ``lloyd_shift`` column; ``lloyd_report`` holds
-                the run summary. Each pass costs about one Voronoi diagram of
+                the run summary: passes run (``iterations``), the last pass's
+                largest relative residual (``max_rel_shift``, as for
+                ``lloyd_tolerance``), moves rejected (``rejected``) and the
+                number of free generators (``n_free``). Each pass costs about one Voronoi diagram of
                 all nodes plus the weighted centroids of the free cells; 20
                 passes take about as long as meshing and tessellating once.
-                Requires a mesh generator that ran ``MeshGenerator.generate()``.
+                Requires a mesh generator that ran ``MeshGenerator.generate()``
+                before this tessellator was constructed.
             lloyd_damping (float): Fraction of the way each free generator
                 moves towards its centroid per pass, in (0, 1]. Default 1.0.
-            lloyd_tolerance (float): Stop early once the largest move in a pass,
-                relative to the local mesh size, is below this. Default 1e-3.
+            lloyd_tolerance (float): Stop early after a pass in which the
+                largest distance from an accepted free generator to its
+                weighted centroid, relative to the local mesh size, is below
+                this (independent of ``lloyd_damping``). Default 1e-3.
                 Graded meshes usually run all ``lloyd_iterations`` passes.
         """
         if boundary_centering not in {"clip", "inset_mirror"}:
@@ -570,7 +566,7 @@ class VoronoiTessellator:
             raise ValueError("boundary_corner_angle must be between 0 and 180 degrees.")
         if boundary_tolerance is not None and boundary_tolerance < 0:
             raise ValueError("boundary_tolerance must be non-negative when provided.")
-        _validate_lloyd_args(lloyd_iterations, lloyd_damping, lloyd_tolerance)
+        _lloyd.validate_settings(lloyd_iterations, lloyd_damping, lloyd_tolerance, prefix="lloyd_")
 
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -579,6 +575,11 @@ class VoronoiTessellator:
         self.n_barrier_mirrors = 0
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
+        # Lloyd inputs, captured with the nodes so they stay paired with them;
+        # None on mesh generators that do not provide them.
+        self.node_is_free = getattr(mesh_generator, 'node_is_free', None)
+        self.node_sizes = getattr(mesh_generator, 'node_sizes', None)
+        self.buffer_footprints = getattr(mesh_generator, 'buffer_footprints', None)
         self.zones_gdf = mesh_generator.zones_gdf
         self.clip_to_boundary = clip_to_boundary
         self.boundary_centering = boundary_centering
@@ -588,13 +589,14 @@ class VoronoiTessellator:
         self.lloyd_iterations = int(lloyd_iterations)
         self.lloyd_damping = float(lloyd_damping)
         self.lloyd_tolerance = float(lloyd_tolerance)
-        # {"iterations", "max_rel_shift", "rejected", "n_free"} after a Lloyd run.
+        # {"iterations", "max_rel_shift", "rejected", "n_free"} after a Lloyd
+        # run; max_rel_shift is the largest residual |centroid - node| / local
+        # size over the accepted moves of the last pass (see _lloyd.relax).
         self.lloyd_report = None
 
     def _lloyd_mesh_inputs(self, n_nodes):
-        """(node_is_free, node_sizes, buffer_footprints) from the mesh generator, checked against ``n_nodes``."""
-        node_is_free = getattr(self.mg, 'node_is_free', None)
-        node_sizes = getattr(self.mg, 'node_sizes', None)
+        """(node_is_free, node_sizes, buffer_footprints) captured from the mesh generator, checked against ``n_nodes``."""
+        node_is_free, node_sizes = self.node_is_free, self.node_sizes
         if node_is_free is None or node_sizes is None:
             raise ValueError(
                 "lloyd_iterations > 0 needs MeshGenerator.node_is_free and node_sizes; "
@@ -608,7 +610,7 @@ class VoronoiTessellator:
                 f"({n_nodes}); got {node_is_free.shape} and {node_sizes.shape}. "
                 "Re-run MeshGenerator.generate() before tessellating."
             )
-        return node_is_free, node_sizes, getattr(self.mg, 'buffer_footprints', None)
+        return node_is_free, node_sizes, self.buffer_footprints
 
     def _lloyd_constraint_lines(self):
         """Union of the embedded clean lines (barriers and straddle lines included), or None."""
@@ -642,7 +644,7 @@ class VoronoiTessellator:
                 tolerance=self.lloyd_tolerance,
             )
             logger.info(
-                f"  -> {report['iterations']} passes, last max shift "
+                f"  -> {report['iterations']} passes, last max residual |centroid - node| "
                 f"{report['max_rel_shift']:.2e} x local size, {report['rejected']} moves rejected"
             )
         self.lloyd_report = {**report, "n_free": int(free.sum())}
