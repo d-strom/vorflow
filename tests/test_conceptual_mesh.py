@@ -8,7 +8,7 @@ from shapely.ops import unary_union
 
 import vorflow.blueprint as blueprint_module
 from vorflow.blueprint import ConceptualMesh
-from vorflow.fields import GeometricGrowthField
+from vorflow.fields import ExponentialField, GeometricGrowthField, ThresholdField
 
 
 def test_resolve_overlaps_respects_z_order():
@@ -488,3 +488,195 @@ def test_quad_buffer_requires_embedded_feature(method):
     identifier = {"zone_id": 1} if method == "add_polygon" else {"line_id": "l"}
     with pytest.raises(ValueError, match="quad_buffer=True requires embed=True"):
         getattr(cm, method)(geometry, resolution=1.0, quad_buffer=True, embed=False, **identifier)
+
+
+# --- hex_ring ---------------------------------------------------------------
+
+def _hex_ring_mesh():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]), zone_id="domain")
+    return cm
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_hex_ring_rejects_non_bool(value):
+    cm = _hex_ring_mesh()
+    with pytest.raises(ValueError, match="hex_ring"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=value)
+
+
+def test_hex_ring_requires_embed_and_resolution():
+    cm = _hex_ring_mesh()
+    with pytest.raises(ValueError, match="embed=True"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=2, embed=False, hex_ring=True)
+    with pytest.raises(ValueError, match="positive resolution"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=None, hex_ring=True)
+
+
+def test_hex_ring_seeds_form_regular_hexagon():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50.3, 49.7), point_id="well", resolution=2, hex_ring=True)
+    _, _, clean_points = cm.generate()
+
+    seeds = clean_points.iloc[0]["ring_seeds"]
+    assert isinstance(seeds, list) and len(seeds) == 6
+    offsets = np.array(seeds) - np.array([50.3, 49.7])
+    np.testing.assert_allclose(np.hypot(offsets[:, 0], offsets[:, 1]), 2.0)
+    angles = np.degrees(np.arctan2(offsets[:, 1], offsets[:, 0])) % 360
+    np.testing.assert_allclose(angles, [30, 90, 150, 210, 270, 330])
+
+
+def test_hex_ring_false_has_no_seeds():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2)
+    _, _, clean_points = cm.generate()
+    assert not clean_points.iloc[0]["hex_ring"]
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+@pytest.mark.parametrize(
+    "add_obstacle",
+    [
+        lambda cm: cm.add_line(LineString([(53, 0), (53, 100)]), line_id="river", resolution=2),
+        lambda cm: cm.add_point(Point(52, 50), point_id="other", resolution=2),
+        lambda cm: cm.add_line(
+            LineString([(58, 0), (58, 100)]), line_id="strip", resolution=10, quad_buffer=True
+        ),
+    ],
+    ids=["line", "point", "quad-buffer band"],
+)
+def test_hex_ring_dropped_near_other_feature(add_obstacle):
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    add_obstacle(cm)
+    with pytest.warns(UserWarning, match="'well'.*hex_ring ignored"):
+        _, _, clean_points = cm.generate()
+    well = clean_points[clean_points["point_id"] == "well"].iloc[0]
+    assert well["ring_seeds"] is None
+
+
+def test_hex_ring_dropped_near_domain_boundary():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(3, 50), point_id="edge_well", resolution=2, hex_ring=True)
+    with pytest.warns(UserWarning, match="'edge_well'.*polygon 'domain' boundary"):
+        _, _, clean_points = cm.generate()
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+def test_hex_ring_ignores_field_only_line():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    cm.add_line(LineString([(51, 0), (51, 100)]), line_id="field", resolution=2, embed=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _, _, clean_points = cm.generate()
+    assert len(clean_points.iloc[0]["ring_seeds"]) == 6
+
+
+def test_empty_points_frame_has_hex_ring_columns():
+    _, _, clean_points = _hex_ring_mesh().generate()
+    assert clean_points.empty
+    assert {"hex_ring", "ring_seeds"} <= set(clean_points.columns)
+
+
+def test_hex_ring_seeds_do_not_leak_into_raw_points():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    cm.generate()
+    assert "ring_seeds" not in cm.raw_points[0]
+    assert cm.raw_points[0]["hex_ring"] is True
+
+
+def _ring_point_in(polygon_resolution=None):
+    """A 100 x 100 domain at ``polygon_resolution`` with an r=4 hex_ring well at (50, 50)."""
+    cm = ConceptualMesh()
+    cm.add_polygon(
+        Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]),
+        zone_id="domain",
+        resolution=polygon_resolution,
+    )
+    cm.add_point(Point(50, 50), point_id="well", resolution=4, hex_ring=True)
+    return cm
+
+
+@pytest.mark.parametrize(
+    "add_source, label",
+    [
+        (lambda cm: None, "polygon 'domain'"),
+        (
+            lambda cm: cm.add_polygon(
+                Polygon([(45, 0), (55, 0), (55, 100), (45, 100)]),
+                zone_id="field", resolution=1, embed=False,
+            ),
+            "polygon 'field'",
+        ),
+        (
+            lambda cm: cm.add_line(LineString([(60, 0), (60, 100)]), line_id="fine", resolution=0.5),
+            "line 'fine'",
+        ),
+        (
+            lambda cm: cm.add_line(
+                LineString([(60, 0), (60, 100)]), line_id="ramp", resolution=0.5,
+                fields=[ThresholdField(size_min=0.5, dist_min=0, dist_max=50, size_max=20)],
+            ),
+            "line 'ramp'",
+        ),
+    ],
+    ids=["finer enclosing zone", "finer field-only polygon", "fine line beyond clearance",
+         "explicit threshold field"],
+)
+def test_hex_ring_dropped_when_size_field_finer_than_ring(add_source, label):
+    cm = _ring_point_in(polygon_resolution=1.0 if "domain" in label else None)
+    add_source(cm)
+    with pytest.warns(UserWarning, match=f"'well': {label} sets a mesh size.*hex_ring ignored"):
+        _, _, clean_points = cm.generate()
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+def test_hex_ring_kept_when_size_fields_are_coarse_enough():
+    cm = _ring_point_in(polygon_resolution=10)
+    # A fine line 40 away grows to 0.5 + 0.2 * 36.5 ~ 7.8 >= 0.9 * 4 at the ring.
+    cm.add_line(LineString([(90, 0), (90, 100)]), line_id="far", resolution=0.5)
+    # Unmodelled explicit fields are left to the engine's post-mesh check.
+    cm.add_point(Point(50, 60), point_id="probe", resolution=1, embed=False,
+                 fields=[ExponentialField(size_min=0.5, decay_length=50)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _, _, clean_points = cm.generate()
+    well = clean_points[clean_points["point_id"] == "well"].iloc[0]
+    assert len(well["ring_seeds"]) == 6
+
+
+def test_hex_ring_point_merged_by_simplification_warns():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True, simplify_tolerance=1)
+    cm.add_point(Point(50.5, 50), point_id="finer", resolution=1)
+    with pytest.warns(UserWarning, match="'well' was merged into point 'finer'.*hex_ring is dropped"):
+        _, _, clean_points = cm.generate()
+    assert list(clean_points["point_id"]) == ["finer"]
+
+
+def test_hex_ring_dropped_inside_finer_field_only_polygon():
+    # The engine holds a field-only polygon at its resolution throughout its
+    # interior, so a ring 16 from the polygon edge still sees a size of 1.
+    cm = _ring_point_in()
+    cm.add_polygon(
+        Polygon([(30, 30), (70, 30), (70, 70), (30, 70)]),
+        zone_id="field", resolution=1, embed=False,
+    )
+    with pytest.warns(UserWarning, match="'well': polygon 'field' sets a mesh size of ~1 .*hex_ring ignored"):
+        _, _, clean_points = cm.generate()
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+def test_hex_ring_kept_inside_field_only_polygon_at_ring_resolution():
+    cm = _ring_point_in()
+    cm.add_polygon(
+        Polygon([(30, 30), (70, 30), (70, 70), (30, 70)]),
+        zone_id="field", resolution=4, embed=False,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _, _, clean_points = cm.generate()
+    well = clean_points[clean_points["point_id"] == "well"].iloc[0]
+    assert len(well["ring_seeds"]) == 6

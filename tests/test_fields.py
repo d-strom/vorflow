@@ -8,6 +8,8 @@ import math
 
 import gmsh
 import pytest
+from shapely import union_all
+from shapely.geometry import Polygon, box
 
 from vorflow.fields import (
     ConstantField,
@@ -81,6 +83,85 @@ class TestThresholdField:
         tag = ThresholdField(2.0, 4.0, 40.0).create(gmsh, tags, background_lc=100.0)
         # growth from boundary curves + spatial constant inside -> combined Min
         assert gmsh.model.mesh.field.getType(tag) == "Min"
+
+
+def _fields_of_type(field_type):
+    return [f for f in gmsh.model.mesh.field.list() if gmsh.model.mesh.field.getType(f) == field_type]
+
+
+def _view_triangles_by_value(view):
+    """{value: [triangle Polygon, ...]} from a list-based scalar triangle view."""
+    data_types, counts, data = gmsh.view.getListData(view)
+    assert list(data_types) == ["ST"]
+    entries = list(data[0])
+    by_value = {}
+    for i in range(int(counts[0])):
+        x0, x1, x2, y0, y1, y2, _, _, _, v0, v1, v2 = entries[12 * i:12 * i + 12]
+        assert v0 == v1 == v2
+        by_value.setdefault(v0, []).append(Polygon([(x0, y0), (x1, y1), (x2, y2)]))
+    return by_value
+
+
+class TestFieldOnlyPolygonInterior:
+    """Field-only polygon surfaces hold no domain nodes, so their interior is located by position."""
+
+    def _field_only_tags(self, model, polygon):
+        return {
+            "points": [], "lines": [], "surfaces": [model["surface"]],
+            "embedded_surfaces": [], "field_only_surfaces": [model["surface"]],
+            "field_only_polygons": [polygon],
+        }
+
+    def test_interior_is_a_postview_not_a_surface_scoped_constant(self, gmsh_model):
+        polygon = box(0, 0, 10, 10)
+        tag = GeometricGrowthField().create(
+            gmsh, self._field_only_tags(gmsh_model, polygon), background_lc=100.0, feature_lc=2.0
+        )
+        assert gmsh.model.mesh.field.getType(tag) == "Min"
+        # A Constant scoped to the unfragmented surface never reaches domain nodes.
+        assert _fields_of_type("Constant") == []
+        (post_view,) = _fields_of_type("PostView")
+        assert gmsh.model.mesh.field.getNumber(post_view, "UseClosest") == 0
+        assert gmsh.model.mesh.field.getNumber(post_view, "CropNegativeValues") == 1
+
+    def test_view_holds_size_inside_and_background_elsewhere(self, gmsh_model):
+        # A polygon with a hole: the hole must take the background value.
+        polygon = box(0, 0, 10, 10).difference(box(3, 3, 7, 7))
+        GeometricGrowthField().create(
+            gmsh, self._field_only_tags(gmsh_model, polygon), background_lc=100.0, feature_lc=2.0
+        )
+        (post_view,) = _fields_of_type("PostView")
+        view = int(gmsh.model.mesh.field.getNumber(post_view, "ViewTag"))
+        by_value = _view_triangles_by_value(view)
+        assert set(by_value) == {2.0, 100.0}
+        inside = union_all(by_value[2.0])
+        outside = union_all(by_value[100.0])
+        assert inside.symmetric_difference(polygon).area == pytest.approx(0.0, abs=1e-9)
+        assert outside.intersection(polygon).area == pytest.approx(0.0, abs=1e-9)
+        # Inside plus outside covers the model's bounding box, so gmsh never
+        # evaluates the view outside its elements within the model.
+        xmin, ymin, _, xmax, ymax, _ = gmsh.model.getBoundingBox(-1, -1)
+        assert box(xmin, ymin, xmax, ymax).difference(inside.union(outside)).area == pytest.approx(
+            0.0, abs=1e-9
+        )
+
+    def test_embedded_and_field_only_interiors_combine(self, gmsh_model):
+        tags = self._field_only_tags(gmsh_model, box(0, 0, 10, 10))
+        tags["embedded_surfaces"] = [gmsh_model["surface"]]
+        ThresholdField(2.0, 4.0, 40.0).create(gmsh, tags, background_lc=100.0)
+        (constant,) = _fields_of_type("Constant")
+        assert list(map(int, gmsh.model.mesh.field.getNumbers(constant, "SurfacesList"))) == [
+            gmsh_model["surface"]
+        ]
+        assert len(_fields_of_type("PostView")) == 1
+
+    def test_field_only_surfaces_without_geometry_grow_from_boundary_only(self, gmsh_model):
+        tags = self._field_only_tags(gmsh_model, None)
+        tags["field_only_polygons"] = []
+        tag = GeometricGrowthField().create(gmsh, tags, background_lc=100.0, feature_lc=2.0)
+        assert gmsh.model.mesh.field.getType(tag) == "MathEval"
+        assert _fields_of_type("Constant") == []
+        assert _fields_of_type("PostView") == []
 
 
 class TestExponentialField:

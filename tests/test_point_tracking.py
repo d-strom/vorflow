@@ -5,12 +5,17 @@ These tests verify that dim-0 (point) entities added to the Gmsh model survive
 each stage of the _add_geometry pipeline and are correctly reflected in the
 returned gmsh_map, so that _embed_features and _setup_fields can find them.
 """
-import pytest
+import math
+
 import gmsh
-from shapely.geometry import Point, Polygon, LineString
+import numpy as np
+import pytest
+from shapely.geometry import LineString, Point, Polygon, box
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.engine import MeshGenerator
+from vorflow.fields import ExponentialField
+from vorflow.tessellator import VoronoiTessellator
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
 
@@ -767,3 +772,76 @@ class TestRawGmshPointBehavior:
 
         assert occ_pts_before_sync == model_pts_after_sync, \
             f"synchronize lost points: occ={occ_pts_before_sync}, model={model_pts_after_sync}"
+
+
+# ---------------------------------------------------------------------------
+#  Test: hex_ring point features
+# ---------------------------------------------------------------------------
+
+def _hex_ring_conceptual_mesh(point, line=None):
+    """Domain box(0, 0, 200, 200) with a refinement zone and one hex_ring well."""
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 200), zone_id="domain")
+    cm.add_polygon(box(60, 60, 140, 140), zone_id="zone", resolution=10, z_order=1)
+    cm.add_point(point, point_id="well", resolution=2, growth_factor=1.2, hex_ring=True)
+    if line is not None:
+        cm.add_line(line, line_id="river", resolution=2)
+    return cm
+
+
+class TestHexRing:
+    """A hex_ring point sits at the centre of a regular hexagonal Voronoi cell."""
+
+    def test_ring_seeds_mapped_under_point_feature(self):
+        cm = _hex_ring_conceptual_mesh(Point(101.3, 98.7))
+        clean_polys, clean_lines, clean_points = cm.generate()
+        mg = MeshGenerator(background_lc=20, verbosity=0)
+        mg._initialize_gmsh()
+        gmsh_map = mg._add_geometry(clean_polys, clean_lines, clean_points)
+        assert _count_mapped_points(gmsh_map) == (1, 7)
+        assert _verify_tags_exist_in_model(gmsh_map) == []
+
+    def test_point_cell_is_regular_hexagon(self):
+        point = Point(101.3, 98.7)
+        r = 2.0
+        cm = _hex_ring_conceptual_mesh(point)
+        clean_polys, clean_lines, clean_points = cm.generate()
+        mg = MeshGenerator(background_lc=20, verbosity=0)
+        mg.generate(clean_polys, clean_lines, clean_points)
+        grid = VoronoiTessellator(mg, cm, clip_to_boundary=True).generate()
+
+        cell = grid[grid.contains(point)].iloc[0]
+        vertices = np.array(cell.geometry.exterior.coords)[:-1]
+        assert len(vertices) == 6
+        radii = np.hypot(vertices[:, 0] - point.x, vertices[:, 1] - point.y)
+        np.testing.assert_allclose(radii, r / math.sqrt(3), rtol=1e-6)
+        assert cell.geometry.area == pytest.approx(math.sqrt(3) / 2 * r**2, rel=1e-6)
+        assert (cell['x'], cell['y']) == pytest.approx((point.x, point.y))
+        assert mg.diagnostics['hex_rings'] == {'well': True}
+
+    def test_ring_split_by_unmodelled_field_warns_after_meshing(self):
+        point = Point(101.3, 98.7)
+        cm = _hex_ring_conceptual_mesh(point)
+        # The blueprint cannot model an ExponentialField, so it keeps the
+        # ring; the fine size it sets at the ring splits it during meshing.
+        cm.add_point(Point(101.3, 110), point_id="probe", resolution=1, embed=False,
+                     fields=[ExponentialField(size_min=0.2, decay_length=500)])
+        clean_polys, clean_lines, clean_points = cm.generate()
+        assert clean_points.iloc[0]['ring_seeds'] is not None
+
+        mg = MeshGenerator(background_lc=20, verbosity=0)
+        with pytest.warns(UserWarning, match="hex_ring of point 'well' was broken"):
+            assert mg.generate(clean_polys, clean_lines, clean_points)
+        assert mg.diagnostics['hex_rings'] == {'well': False}
+
+    def test_ring_dropped_near_line_still_meshes(self):
+        point = Point(101.3, 98.7)
+        cm = _hex_ring_conceptual_mesh(point, line=LineString([(104, 70), (104, 130)]))
+        with pytest.warns(UserWarning, match="'well'.*hex_ring ignored"):
+            clean_polys, clean_lines, clean_points = cm.generate()
+        assert clean_points.iloc[0]['ring_seeds'] is None
+
+        mg = MeshGenerator(background_lc=20, verbosity=0)
+        assert mg.generate(clean_polys, clean_lines, clean_points)
+        dists = np.hypot(mg.nodes[:, 0] - point.x, mg.nodes[:, 1] - point.y)
+        assert dists.min() < 1e-9

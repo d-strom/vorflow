@@ -162,11 +162,58 @@ For the continuous-metric convention, pass an explicit
 gradient `log(growth_factor)`. In normal `MeshGenerator` use, the global
 background field caps either result at `background_lc`.
 
+A polygon added with `embed=False` is a refinement region: the mesh is held
+at its `resolution` throughout its interior and grows away from its boundary
+as for an embedded polygon, but the polygon adds no mesh edges and is not a
+zone.
+
+```python
+blueprint.add_polygon(refine_area, zone_id="refine", resolution=2, embed=False)
+```
+
 > **Coordinate systems:** always work in a *projected* CRS (e.g. UTM or a
 > national grid) so mesh sizes are in real length units (meters/feet).
 > Geographic coordinates (lat/lon degrees, e.g. EPSG:4326) produce
 > physically meaningless MODFLOW grids — reproject your data first with
 > `GeoDataFrame.to_crs()`.
+
+### Centred point cells
+
+A point feature is always the generator of its own cell, but the cell is
+usually an irregular polygon and the point is not its centroid. With
+`hex_ring=True`, six fixed nodes are placed at radius `resolution` around the
+point, so its cell is a regular hexagon centred on it (apothem
+`resolution / 2`):
+
+```python
+blueprint.add_point(well_point, point_id="Well-A", resolution=2, hex_ring=True)
+```
+
+The ring adds about 40 cells per point (`growth_factor=1.2`). It is dropped,
+with a `UserWarning`, when a polygon boundary, line or other point lies closer
+than 2 x `resolution`, or when a finer size field reaches the ring (below
+0.9 x `resolution`, e.g. inside a zone with a finer resolution than the
+point's). After meshing, `MeshGenerator.diagnostics["hex_rings"]` records
+whether each ring came out intact.
+
+### Lloyd relaxation
+
+`lloyd_iterations` moves the free generators (interior nodes of the zones)
+towards the centroids of their cells before the grid is built. The centroids
+are weighted by the local mesh size (density h^-4), so the grading is kept;
+boundary, zone-edge, point and line nodes stay fixed.
+
+```python
+tessellator = VoronoiTessellator(mesher, blueprint, lloyd_iterations=20)
+grid_gdf = tessellator.generate()
+print(tessellator.lloyd_report)  # passes run, last residual, rejected moves
+```
+
+The mesh generator must have run before the tessellator is constructed. On a
+2 km model with four refined wells, 20 passes lower the p95
+centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees for about 0.4 s of
+extra runtime; the grid is then no longer the exact dual of
+`MeshGenerator.get_element_grid()`.
 
 ## Examples
 
@@ -174,6 +221,9 @@ The [examples/](https://github.com/rhugman/vorflow/tree/main/examples)
 folder contains runnable scripts and notebooks
 covering field-based refinement, mesh quality diagnostics, structured quad
 buffers, active-domain workflows, and triangular element-grid export.
+[examples/point_centring_demo.ipynb](https://github.com/rhugman/vorflow/blob/main/examples/point_centring_demo.ipynb)
+compares Gmsh smoothing, `hex_ring` and `lloyd_iterations` for centring cells
+around wells.
 
 ## Roadmap
 

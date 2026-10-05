@@ -62,16 +62,20 @@ milestone becomes **Done** once `0.1.0` is published to PyPI.
 | 3 | Boundary inset/mirror points | Done | [03-boundary-mirror-points.md](docs/roadmap/03-boundary-mirror-points.md) |
 | 4 | Structured-quad transfinite buffer | Done | [04-structured-quad-buffer.md](docs/roadmap/04-structured-quad-buffer.md) |
 | 5 | Triangular/mixed element-grid output | Done | [05-triangular-grid-output.md](docs/roadmap/05-triangular-grid-output.md) |
+| 7 | Centred point cells and Lloyd relaxation | Done | [07-point-centring-lloyd.md](docs/roadmap/07-point-centring-lloyd.md) |
 
-All five milestones are implemented: quality metrics and connectivity reports
-(`get_triangular_quality`, `utils.build_connectivity`), the active-domain
-workflow example (`examples/active_domain_quality_example.py`), opt-in boundary
-inset/mirror points (`VoronoiTessellator(boundary_centering="inset_mirror")`),
-opt-in structured quad buffers (`add_polygon`/`add_line` with
-`quad_buffer=True`), and the element-grid exporter
-(`MeshGenerator.get_element_grid()`, see
+Six milestones are implemented (1-5 and 7): quality metrics and connectivity
+reports (`get_triangular_quality`, `utils.build_connectivity`), the
+active-domain workflow example (`examples/active_domain_quality_example.py`),
+opt-in boundary inset/mirror points
+(`VoronoiTessellator(boundary_centering="inset_mirror")`), opt-in structured
+quad buffers (`add_polygon`/`add_line` with `quad_buffer=True`), the
+element-grid exporter (`MeshGenerator.get_element_grid()`, see
 `examples/triangular_grid_example.py` and
-`examples/structured_buffer_example.py`).
+`examples/structured_buffer_example.py`), and opt-in centred point cells
+(`add_point(hex_ring=True)`) and Lloyd relaxation
+(`VoronoiTessellator(lloyd_iterations=...)`, see
+`examples/point_centring_demo.ipynb`).
 
 ## Summary per Milestone
 
@@ -90,6 +94,15 @@ opt-in structured quad buffers (`add_polygon`/`add_line` with
 5. **Triangular/mixed element-grid output**: add a separate `MeshGenerator`
    exporter for gmsh element polygons, supporting triangles now and mixed tri/quad
    meshes for structured buffers.
+6. **First PyPI release**: publish `vorflow` to PyPI from a tag-triggered
+   workflow, rehearsed on TestPyPI with `0.1.0rc1` first.
+7. **Centred point cells and Lloyd relaxation**: `add_point(hex_ring=True)`
+   makes a point's cell a regular hexagon centred on it (drift 0, about 40
+   extra cells per point), and `VoronoiTessellator(lloyd_iterations=...)`
+   moves free generators towards their size-weighted cell centroids. On a
+   2 km model with four refined wells, 20 passes lower the p95 centroid
+   ortho_error from 4.1 to 2.7 degrees; Gmsh smoothing does not (4.2 at
+   100/10). See the milestone doc for measurements.
 
 ## Verification
 
