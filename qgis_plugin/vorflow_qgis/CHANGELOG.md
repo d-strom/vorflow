@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+- Preconfigured Geometric growth as the default refinement model.
+- Preconfigured `edge_ratio` as the robust default growth model.
+- Set the default growth factor to 1.2 and sampling to 25.
+- Applied the recommended profile to the domain and global point, line and
+  polygon settings.
+- Kept Standard, Threshold, Exponential, Continuous metric and all
+  layer-specific overrides available.
+- Added interface and documentation notes describing the recommended profile.
+
 ## 0.5.0
 
 - Changed plugin author/developer metadata to David Ström.

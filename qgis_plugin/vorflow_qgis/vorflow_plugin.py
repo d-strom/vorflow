@@ -189,7 +189,8 @@ PARAMETER_HELP = {
         "Refinement model",
         "Standard uses the object's resolution and growth factor. The other "
         "options create an explicit vorflow mesh field for distance-based "
-        "variation."
+        "variation. Version 0.6 defaults to Geometric growth with edge_ratio, "
+        "growth factor 1.2 and sampling 25 as a robust general starting point."
     ),
     "size_min": (
         "Minimum size",
@@ -220,7 +221,8 @@ PARAMETER_HELP = {
     "growth_model": (
         "Growth model",
         "edge_ratio gives stepwise geometric edge growth. continuous_metric "
-        "gives a more continuous size function."
+        "gives a more continuous size function. edge_ratio is the recommended "
+        "robust default."
     ),
 }
 
@@ -319,7 +321,7 @@ class ParameterEditorWidget(QWidget):
         self.field_model.addItem("Geometric growth", "geometric")
         self.field_model.addItem("Threshold", "threshold")
         self.field_model.addItem("Exponential", "exponential")
-        model = defaults.get("field_model", "standard")
+        model = defaults.get("field_model", "geometric")
         idx = self.field_model.findData(model)
         self.field_model.setCurrentIndex(max(0, idx))
 
@@ -357,7 +359,10 @@ class ParameterEditorWidget(QWidget):
         self.growth_model = QComboBox()
         self.growth_model.addItem("Edge ratio (edge_ratio)", "edge_ratio")
         self.growth_model.addItem("Continuous metric (continuous_metric)", "continuous_metric")
-        self.field_sampling_g = self._intspin(defaults.get("sampling", 20), 1, 100000)
+        growth_model = defaults.get("growth_model", "edge_ratio")
+        growth_idx = self.growth_model.findData(growth_model)
+        self.growth_model.setCurrentIndex(max(0, growth_idx))
+        self.field_sampling_g = self._intspin(defaults.get("sampling", 25), 1, 100000)
         gf.addRow("Growth factor:", self.field_growth_factor)
         gf.addRow("Growth model:", self.growth_model)
         gf.addRow("Sampling:", self.field_sampling_g)
@@ -369,7 +374,7 @@ class ParameterEditorWidget(QWidget):
         self.threshold_max = make_double(defaults.get("size_max", 100.0), 0.000001)
         self.dist_min = make_double(defaults.get("dist_min", 10.0), 0.0)
         self.dist_max = make_double(defaults.get("dist_max", 500.0), 0.0)
-        self.field_sampling_t = self._intspin(defaults.get("sampling", 20), 1, 100000)
+        self.field_sampling_t = self._intspin(defaults.get("sampling", 25), 1, 100000)
         tf.addRow("Minimum size:", self.threshold_min)
         tf.addRow("Maximum size:", self.threshold_max)
         tf.addRow("Minimum distance:", self.dist_min)
@@ -382,7 +387,7 @@ class ParameterEditorWidget(QWidget):
         self.exp_min = make_double(defaults.get("size_min", 5.0), 0.000001)
         self.exp_max = make_double(defaults.get("size_max", 100.0), 0.000001)
         self.decay_length = make_double(defaults.get("decay_length", 150.0), 0.000001)
-        self.field_sampling_e = self._intspin(defaults.get("sampling", 20), 1, 100000)
+        self.field_sampling_e = self._intspin(defaults.get("sampling", 25), 1, 100000)
         ef.addRow("Minimum size:", self.exp_min)
         ef.addRow("Maximum size:", self.exp_max)
         ef.addRow("Decay length:", self.decay_length)
@@ -942,7 +947,9 @@ class VorflowDialog(QDialog):
         top_layout.setContentsMargins(0, 0, 0, 0)
         information = QLabel(
             "Add any number of point, line and polygon layers. "
-            "Use global defaults and configure layer-specific overrides."
+            "Use global defaults and configure layer-specific overrides. "
+            "The initial refinement profile uses Geometric growth, edge_ratio, "
+            "growth factor 1.2 and sampling 25."
         )
         information.setWordWrap(True)
         help_button = QPushButton("Parameter help…")
@@ -966,7 +973,8 @@ class VorflowDialog(QDialog):
         self.domain_defaults = {
             "zone_id": "domain", "resolution": 100.0, "z_order": -1000,
             "densify": True, "embed": True, "growth_factor": 1.2,
-            "simplify_tolerance": 0.0, "field_model": "standard"
+            "simplify_tolerance": 0.0, "field_model": "geometric",
+            "growth_model": "edge_ratio", "sampling": 25
         }
         self.domain_source = LayerSourceWidget(
             QgsMapLayerProxyModel.PolygonLayer, "domain", None,
@@ -981,7 +989,8 @@ class VorflowDialog(QDialog):
             {
                 "resolution": 10.0, "growth_factor": 1.2,
                 "embed": True, "simplify_tolerance": 0.0,
-                "field_model": "standard"
+                "field_model": "geometric", "growth_model": "edge_ratio",
+                "sampling": 25
             }
         )
         self.lines = MultiLayerInputWidget(
@@ -992,7 +1001,8 @@ class VorflowDialog(QDialog):
                 "densify": True, "simplify_tolerance": 0.0,
                 "embed": True, "quad_buffer": False,
                 "quad_buffer_thickness": 1, "z_order": 0,
-                "field_model": "standard"
+                "field_model": "geometric", "growth_model": "edge_ratio",
+                "sampling": 25
             }
         )
         self.polygons = MultiLayerInputWidget(
@@ -1002,7 +1012,8 @@ class VorflowDialog(QDialog):
                 "z_order": 1, "densify": True,
                 "simplify_tolerance": 0.0, "embed": True,
                 "quad_buffer": False, "quad_buffer_thickness": 1,
-                "field_model": "standard"
+                "field_model": "geometric", "growth_model": "edge_ratio",
+                "sampling": 25
             }
         )
 

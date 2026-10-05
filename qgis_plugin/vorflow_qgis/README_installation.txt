@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.5.0
+VORFLOW FOR QGIS 0.6.0
 ======================
 
 AUTHOR
@@ -33,6 +33,19 @@ MAIN WORKFLOW
 5. Click "Generate mesh".
 6. If a Voronoi grid was generated, open "MODFLOW 6 / DISV" and click
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
+
+
+RECOMMENDED DEFAULT PROFILE IN VERSION 0.6
+- Refinement model: Geometric growth (GeometricGrowthField)
+- Growth model: edge_ratio
+- Growth factor: 1.2
+- Sampling: 25
+
+This profile is preselected for the model domain and global point, line and
+polygon settings. It is intended as a robust general starting point with a
+controlled transition between fine and coarse cells. All settings remain
+editable, and individual layers can still override or disable the global
+refinement model.
 
 REFINEMENT TERMINOLOGY
 - Standard: target size/resolution and growth factor.
