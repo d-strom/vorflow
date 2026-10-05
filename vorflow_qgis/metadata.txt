@@ -1,7 +1,7 @@
 [general]
 name=Vorflow for QGIS
 description=Generate Vorflow/Gmsh meshes in QGIS, inspect mesh quality, and export minimal MODFLOW 6 DISV datasets.
-version=0.11.0
+version=0.12.0
 qgisMinimumVersion=3.28
 author=David Ström
 email=
