@@ -180,9 +180,12 @@ point, so its cell is a regular hexagon centred on it (apothem
 blueprint.add_point(well_point, point_id="Well-A", resolution=2, hex_ring=True)
 ```
 
-The ring adds about 40 cells per point (`growth_factor=1.2`) and is dropped,
+The ring adds about 40 cells per point (`growth_factor=1.2`). It is dropped,
 with a `UserWarning`, when a polygon boundary, line or other point lies closer
-than 2 x `resolution`.
+than 2 x `resolution`, or when a finer size field reaches the ring (below
+0.9 x `resolution`, e.g. inside a zone with a finer resolution than the
+point's). After meshing, `MeshGenerator.diagnostics["hex_rings"]` records
+whether each ring came out intact.
 
 ### Lloyd relaxation
 
@@ -194,10 +197,11 @@ boundary, zone-edge, point and line nodes stay fixed.
 ```python
 tessellator = VoronoiTessellator(mesher, blueprint, lloyd_iterations=20)
 grid_gdf = tessellator.generate()
-print(tessellator.lloyd_report)  # passes run, last max shift, rejected moves
+print(tessellator.lloyd_report)  # passes run, last residual, rejected moves
 ```
 
-On a 2 km model with four refined wells, 20 passes lower the p95
+The mesh generator must have run before the tessellator is constructed. On a
+2 km model with four refined wells, 20 passes lower the p95
 centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees for about 0.4 s of
 extra runtime; the grid is then no longer the exact dual of
 `MeshGenerator.get_element_grid()`.

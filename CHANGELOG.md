@@ -19,9 +19,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The ring is built after snapping and clipping, and dropped with a
   `UserWarning` when a polygon boundary, an embedded line (including its
   straddle or quad-buffer band) or another embedded point is closer than
-  `HEX_RING_CLEARANCE` (2) x `resolution`. Requires `embed=True` and a
-  positive `resolution`. The point's size field also targets the six seeds,
-  so its refined patch is about one radius larger.
+  `HEX_RING_CLEARANCE` (2) x `resolution`; when a zone (held at its
+  resolution throughout its interior), line, point or field-only polygon
+  (measured from its boundary) is estimated to set a mesh size below
+  `HEX_RING_MIN_SIZE_RATIO` (0.9) x `resolution` at the ring, e.g. a well
+  inside a zone with a finer resolution; or when `simplify_tolerance` merges
+  the point into another. After meshing, `MeshGenerator.generate()` checks
+  that each ring's centre node has exactly six triangles onto its six seeds,
+  warns when a size field the estimate does not model (e.g. a
+  `background_lc` below the ring radius) split it, and records the outcome
+  in `diagnostics['hex_rings']` (`{point_id: bool}`). Requires `embed=True`
+  and a positive `resolution`. The point's size field also targets the six
+  seeds, so its refined patch is about one radius larger.
 - `VoronoiTessellator(..., lloyd_iterations=0, lloyd_damping=1.0,
   lloyd_tolerance=1e-3)` runs a density-weighted Lloyd relaxation of the
   generators before the grid is built
@@ -29,7 +38,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [#2](https://github.com/rhugman/vorflow/issues/2)). Centroids are weighted
   by h^-4, with h the local mesh size, so the mesh grading is kept; only
   interior nodes of the embedded polygon surfaces move, and moves that would
-  leave the node's zone or cross an embedded line are rejected. On the same
+  leave the node's zone or cross an embedded line are rejected.
+  `lloyd_tolerance` stops the run once the largest remaining distance from
+  an accepted node to its centroid, relative to the local mesh size, is
+  below it, independent of `lloyd_damping`. The mesh generator must have run
+  before the tessellator is constructed. On the same
   model 20 passes lower the interior p95 `drift_ratio` from 0.118 to 0.099
   and the p95 centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees, and
   take 0.70 s against 0.33 s without. Unweighted Lloyd would grow the
@@ -40,8 +53,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   set by `generate()` as inputs to the Lloyd relaxation.
 - A `lloyd_shift` grid column (distance each generator moved; 0 for fixed
   nodes, NaN for barrier mirrors, barrier fragments and detached cell parts)
-  and `VoronoiTessellator.lloyd_report` (`iterations`, `max_rel_shift`,
-  `rejected`, `n_free`) when `lloyd_iterations > 0`.
+  and `VoronoiTessellator.lloyd_report` when `lloyd_iterations > 0`: passes
+  run (`iterations`), the last pass's largest residual |centroid - node| /
+  local size over accepted nodes (`max_rel_shift`), moves rejected
+  (`rejected`) and free generators (`n_free`).
 - `examples/point_centring_demo.ipynb` compares Gmsh smoothing, `hex_ring`
   and `lloyd_iterations` on the model above.
 

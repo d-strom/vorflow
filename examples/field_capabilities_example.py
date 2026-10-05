@@ -438,7 +438,8 @@ hex_coords = np.array(hex_cell.geometry.exterior.coords)[:-1]
 hex_radii = np.hypot(*(hex_coords - [points["pt-hex-ring"].x, points["pt-hex-ring"].y]).T)
 print(
     f"\npt-hex-ring cell: {len(hex_coords)} vertices at {hex_radii.min():.4f}-{hex_radii.max():.4f} m "
-    f"(resolution / sqrt(3) = {feature_lc / 5 / np.sqrt(3):.4f} m)"
+    f"(resolution / sqrt(3) = {feature_lc / 5 / np.sqrt(3):.4f} m); "
+    f"rings intact after meshing: {mesher.diagnostics['hex_rings']}"
 )
 
 lloyd_tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True, lloyd_iterations=10)

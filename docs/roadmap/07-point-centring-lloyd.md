@@ -19,11 +19,26 @@ or symmetric around the point) and
   adjacent seeds form equilateral triangles, so the point's Voronoi cell is a
   regular hexagon centred on it with apothem `resolution / 2`. The ring is
   built about the point's final position (after snapping and clipping) and
-  dropped with a `UserWarning` when a polygon boundary, an embedded line
-  (plus its straddle or quad-buffer half-width) or another embedded point is
-  closer than `HEX_RING_CLEARANCE` (2.0) x `resolution`. The seeds are
-  recorded under the point's feature id, so embedding, node collection and
-  the size field treat them like the point.
+  dropped with a `UserWarning` when:
+  - a polygon boundary, an embedded line (plus its straddle or quad-buffer
+    half-width) or another embedded point is closer than
+    `HEX_RING_CLEARANCE` (2.0) x `resolution`;
+  - a zone (held at its resolution throughout its interior), line, point or
+    field-only polygon (measured from its boundary) is estimated to set a
+    mesh size below `HEX_RING_MIN_SIZE_RATIO` (0.9) x `resolution` at the
+    ring. With a uniform size, Gmsh kept the ring at 0.85 r and split it at
+    0.80 r; 0.9 leaves a margin for the linear size estimate, which models
+    the default growth fields and explicit `GeometricGrowthField` /
+    `ThresholdField` entries;
+  - `simplify_tolerance` merges the point into another.
+
+  After meshing, `MeshGenerator.generate()` checks that each ring's centre
+  node has exactly six triangles onto its six seeds. It warns when the ring
+  was split by a size field the estimate does not model (other explicit
+  fields, a `background_lc` below the ring radius) and records
+  `diagnostics['hex_rings'] = {point_id: bool}`. The seeds are recorded
+  under the point's feature id, so embedding, node collection and the size
+  field treat them like the point.
 - `VoronoiTessellator(..., lloyd_iterations=0, lloyd_damping=1.0,
   lloyd_tolerance=1e-3)` relaxes the free generators towards their
   density-weighted cell centroids before the grid is built
@@ -34,7 +49,13 @@ or symmetric around the point) and
   nodes of embedded polygon surfaces move (`MeshGenerator.node_is_free`); a
   move is rejected if it leaves the node's zone piece (zone minus
   `MeshGenerator.buffer_footprints`) or crosses an embedded line. The grid
-  gets a `lloyd_shift` column and the tessellator a `lloyd_report`.
+  gets a `lloyd_shift` column and the tessellator a `lloyd_report`. The stop
+  test compares `lloyd_tolerance` with the residual of the last pass, the
+  largest |centroid - node| / h over the accepted nodes
+  (`lloyd_report['max_rel_shift']`), so it does not depend on
+  `lloyd_damping`. The tessellator reads `node_is_free`, `node_sizes` and
+  `buffer_footprints` when it is constructed, so the mesh generator must
+  have run first.
 
 Unweighted Lloyd was tried first. On a 2 km square with points at
 `resolution` 5 and 10, 20 passes halved the interior p95 `drift_ratio`
@@ -70,10 +91,19 @@ Limits:
 - `hex_ring` adds about 40 cells per point at `growth_factor=1.2` (42 here),
   and the refined patch grows by about one ring radius because the size
   field also targets the seeds.
-- `hex_ring` is for point features only, its radius is tied to `resolution`,
-  and it is dropped near other features. A `hex_ring` point that
-  `simplify_tolerance` deduplication merges away loses its ring without a
-  warning.
+- `hex_ring` is for point features only and its radius is tied to
+  `resolution`. It is dropped near other features and where a finer size
+  field reaches the ring, e.g. for a well inside a zone whose resolution is
+  finer than 0.9 x the well's.
+- The size estimate is linear and covers only the default growth fields and
+  explicit `GeometricGrowthField` / `ThresholdField` entries; other fields
+  are caught only after meshing (warning plus `diagnostics['hex_rings']`),
+  when the ring has already been meshed through.
+- Field-only (`embed=False`) polygons refine only from their boundary: their
+  interior Constant field is scoped to a surface entity that holds no domain
+  mesh nodes, so it never reaches the domain mesh. The size estimate models
+  them that way. This is a separate, pre-existing limitation of the field
+  setup and out of scope here.
 - With Lloyd on, the Voronoi grid is no longer the exact dual of
   `MeshGenerator.get_element_grid()`.
 - Cells next to fixed nodes improve little. The p95 `ortho_error` tail above
@@ -81,9 +111,9 @@ Limits:
   connections at defaults); `boundary_centering="inset_mirror"` addresses
   those. The well's own cell is not centred by Lloyd, because the well node
   is fixed.
-- On graded meshes the largest relative move levels off at a few 1e-3
-  (0.006 after 20 passes, 0.002 after 40), so the default `lloyd_tolerance`
-  of 1e-3 is rarely reached and the run uses every pass.
+- On graded meshes the residual levels off at a few 1e-3 (0.006 after 20
+  passes, 0.002 after 40), so the default `lloyd_tolerance` of 1e-3 is
+  rarely reached and the run uses every pass.
 - Zone edges and embedded lines can reject moves; a rejected node stays put
   for that pass.
 
@@ -91,13 +121,16 @@ Tests:
 
 - `tests/test_conceptual_mesh.py` (`test_hex_ring_*`): argument validation,
   seed geometry, dropping near lines, other points and the domain boundary,
-  field-only lines ignored, empty-frame columns.
+  field-only lines ignored for clearance, the size rule, the deduplication
+  warning, empty-frame columns.
 - `tests/test_point_tracking.py::TestHexRing`: seeds mapped under the point's
   feature id, the point cell is a regular hexagon end to end, a dropped ring
-  still meshes.
+  still meshes, the post-mesh ring check and `diagnostics['hex_rings']`.
 - `tests/test_lloyd.py`: unit tests of `_lloyd` (lattice fixed points,
   density-weighted centroids, clipped boundary cells, move rejection, early
-  stop, argument checks, `node_sizes` from elements) and slow end-to-end
+  stop independent of damping, rejected nodes not blocking convergence,
+  shared settings validation, `node_sizes` from elements, inputs captured
+  with the nodes) and slow end-to-end
   tests (interior drift drops, fixed nodes bit-identical, zones kept, refined
   well cells kept, output unchanged with Lloyd off, `inset_mirror`, barrier
   sides, quad-buffer strips, hex ring kept regular).
