@@ -7,6 +7,53 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `ConceptualMesh.add_point(..., hex_ring=True)` adds six fixed mesh nodes at
+  radius `resolution` around the point (at 30 + k x 60 degrees), so the
+  point's Voronoi cell is a regular hexagon centred on it with apothem
+  `resolution / 2` ([#31](https://github.com/rhugman/vorflow/issues/31)). On
+  a 2 km model with four wells (resolution 5-10 m, `growth_factor=1.2`) the
+  well cells' `drift_ratio` goes from 0.04-0.10 to 0 and the neighbour-area
+  coefficient of variation from 0.17 to 0.04, for 42 extra cells per well.
+  The ring is built after snapping and clipping, and dropped with a
+  `UserWarning` when a polygon boundary, an embedded line (including its
+  straddle or quad-buffer band) or another embedded point is closer than
+  `HEX_RING_CLEARANCE` (2) x `resolution`. Requires `embed=True` and a
+  positive `resolution`. The point's size field also targets the six seeds,
+  so its refined patch is about one radius larger.
+- `VoronoiTessellator(..., lloyd_iterations=0, lloyd_damping=1.0,
+  lloyd_tolerance=1e-3)` runs a density-weighted Lloyd relaxation of the
+  generators before the grid is built
+  ([#31](https://github.com/rhugman/vorflow/issues/31),
+  [#2](https://github.com/rhugman/vorflow/issues/2)). Centroids are weighted
+  by h^-4, with h the local mesh size, so the mesh grading is kept; only
+  interior nodes of the embedded polygon surfaces move, and moves that would
+  leave the node's zone or cross an embedded line are rejected. On the same
+  model 20 passes lower the interior p95 `drift_ratio` from 0.118 to 0.099
+  and the p95 centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees, and
+  take 0.70 s against 0.33 s without. Unweighted Lloyd would grow the
+  refined well cells 2-4 times in area. With Lloyd on, the Voronoi grid is
+  no longer the exact dual of `MeshGenerator.get_element_grid()`.
+- `MeshGenerator.node_is_free`, `node_sizes` (mean incident mesh-edge length
+  per node) and `buffer_footprints` (union of the quad-buffer footprints),
+  set by `generate()` as inputs to the Lloyd relaxation.
+- A `lloyd_shift` grid column (distance each generator moved; 0 for fixed
+  nodes, NaN for barrier mirrors, barrier fragments and detached cell parts)
+  and `VoronoiTessellator.lloyd_report` (`iterations`, `max_rel_shift`,
+  `rejected`, `n_free`) when `lloyd_iterations > 0`.
+- `examples/point_centring_demo.ipynb` compares Gmsh smoothing, `hex_ring`
+  and `lloyd_iterations` on the model above.
+
+### Fixed
+
+- The `MeshGenerator` docstring described `smoothing_steps` as Lloyd
+  smoothing. It sets Gmsh `Mesh.Smoothing` (Laplacian smoothing of the
+  triangle mesh), and `optimization_cycles` runs `Relocate2D` + `Laplace2D`
+  passes; neither centres Voronoi generators in their cells. Raising them from
+  the default 10/2 to 100/10 leaves the p95 centroid `ortho_error` at 4.1-4.2
+  degrees.
+
 ## [0.1.0] - 2026-09-30
 
 First release on PyPI. There are no changes since 0.1.0rc1.

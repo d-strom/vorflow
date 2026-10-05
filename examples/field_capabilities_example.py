@@ -11,6 +11,8 @@ field types:
 - `GeometricGrowthField` with edge-ratio and continuous-metric conventions
 - Field-only polygon via `embed=False`
 - Barrier/straddle line to validate point-pair representation
+- `hex_ring=True` point, whose cell is a regular hexagon centred on it
+- Lloyd relaxation (`lloyd_iterations`) compared with the default grid
 """
 
 from __future__ import annotations
@@ -65,6 +67,8 @@ points = {
     "pt-lower-left": Point(25, 25),
     "pt-lower-center": Point(185, 25),
     "pt-lower-right": Point(325, 25),
+    # At least 2 x resolution from every other embedded feature, so the ring is kept.
+    "pt-hex-ring": Point(110, 30),
 }
 #%%
 # Fields used below
@@ -184,6 +188,14 @@ blueprint.add_point(
     resolution=feature_lc/5,
     fields=[metric_growth],
     embed=False,  # field-only point
+)
+
+blueprint.add_point(
+    points["pt-hex-ring"],
+    point_id="pt-hex-ring",
+    resolution=feature_lc/5,
+    growth_factor=1.2,
+    hex_ring=True,  # six fixed seeds at radius `resolution` -> regular hexagonal cell
 )
 
 clean_polys, clean_lines, clean_pts = blueprint.generate()
@@ -317,6 +329,7 @@ point_colors = {
     "pt-lower-left": "tab:red",
     "pt-lower-center": "tab:purple",
     "pt-lower-right": "tab:blue",
+    "pt-hex-ring": "tab:olive",
 }
 for name, pt in points.items():
     ax.scatter(pt.x, pt.y, s=25, marker="x", color=point_colors.get(name), label=name)
@@ -415,6 +428,41 @@ for ax, (column, title, cmap, vmin, vmax) in zip(axes.ravel(), dashboard_metrics
     ax.plot(*domain.exterior.xy, color="black", lw=0.8)
     ax.set_title(title)
     ax.set_axis_off()
+fig.tight_layout()
+plt.show()
+
+#%% 6) hex_ring cell and Lloyd relaxation
+
+hex_cell = grid_gdf[grid_gdf.contains(points["pt-hex-ring"])].iloc[0]
+hex_coords = np.array(hex_cell.geometry.exterior.coords)[:-1]
+hex_radii = np.hypot(*(hex_coords - [points["pt-hex-ring"].x, points["pt-hex-ring"].y]).T)
+print(
+    f"\npt-hex-ring cell: {len(hex_coords)} vertices at {hex_radii.min():.4f}-{hex_radii.max():.4f} m "
+    f"(resolution / sqrt(3) = {feature_lc / 5 / np.sqrt(3):.4f} m)"
+)
+
+lloyd_tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True, lloyd_iterations=10)
+lloyd_grid = lloyd_tessellator.generate()
+print(f"Lloyd report: {lloyd_tessellator.lloyd_report}")
+lloyd_connectivity = build_connectivity(lloyd_grid, center="centroid")
+print(
+    "p95 centroid ortho_error (degrees): "
+    f"default {modflow_connectivity_report['ortho_error'].quantile(0.95):.2f}, "
+    f"lloyd_iterations=10 {lloyd_connectivity['ortho_error'].quantile(0.95):.2f}"
+)
+
+fig, ax = plt.subplots(figsize=(14, 7))
+ax.set_aspect("equal")
+lloyd_grid.plot(
+    ax=ax,
+    column=lloyd_grid["lloyd_shift"] / np.sqrt(lloyd_grid.geometry.area),
+    cmap="viridis",
+    legend=True,
+    vmin=0,
+    linewidth=0.0,
+)
+ax.plot(*domain.exterior.xy, color="black", lw=1)
+ax.set_title("Lloyd relaxation: generator shift / sqrt(cell area) (0 for fixed nodes)")
 fig.tight_layout()
 plt.show()
 # %%
