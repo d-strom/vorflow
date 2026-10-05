@@ -19,9 +19,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The ring is built after snapping and clipping, and dropped with a
   `UserWarning` when a polygon boundary, an embedded line (including its
   straddle or quad-buffer band) or another embedded point is closer than
-  `HEX_RING_CLEARANCE` (2) x `resolution`; when a zone (held at its
-  resolution throughout its interior), line, point or field-only polygon
-  (measured from its boundary) is estimated to set a mesh size below
+  `HEX_RING_CLEARANCE` (2) x `resolution`; when a polygon (embedded or
+  field-only, held at its resolution throughout its interior), line or point
+  is estimated to set a mesh size below
   `HEX_RING_MIN_SIZE_RATIO` (0.9) x `resolution` at the ring, e.g. a well
   inside a zone with a finer resolution; or when `simplify_tolerance` merges
   the point into another. After meshing, `MeshGenerator.generate()` checks
@@ -60,8 +60,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `examples/point_centring_demo.ipynb` compares Gmsh smoothing, `hex_ring`
   and `lloyd_iterations` on the model above.
 
+### Changed
+
+- Requires `shapely>=2.1` (was `>=2.0`) for
+  `shapely.constrained_delaunay_triangles`, used by the field-only polygon
+  interior field below.
+
 ### Fixed
 
+- Field-only polygons (`add_polygon(..., embed=False)`) now refine their
+  whole interior to `resolution`, as embedded polygons do. Before, their
+  interior size was a Gmsh `Constant` field scoped (`SurfacesList`) to the
+  polygon's own surface, which is not fragmented into the domain and so
+  holds no domain mesh nodes; only the growth from the boundary took effect.
+  The interior is now a `PostView` field over a triangulation of the polygon
+  (holes excluded) and the rest of the model's bounding box, which applies by
+  position. On a 200 x 200 domain (`background_lc=20`) with a 40 x 40 polygon
+  at resolution 1, the 10 x 10 core gets 115 nodes, against 116 when embedded
+  and 8 before. The `hex_ring` size check now measures field-only polygons as
+  areas instead of from their boundary, so a ring inside a finer field-only
+  polygon is dropped.
 - The `MeshGenerator` docstring described `smoothing_steps` as Lloyd
   smoothing. It sets Gmsh `Mesh.Smoothing` (Laplacian smoothing of the
   triangle mesh), and `optimization_cycles` runs `Relocate2D` + `Laplace2D`

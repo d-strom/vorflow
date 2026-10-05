@@ -4,6 +4,8 @@ import logging
 import math
 import operator
 
+import shapely
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +77,9 @@ class MeshField:
         Args:
             gmsh_api: The gmsh module.
             tags_dict (dict): Dictionary of tags {'points': [], 'lines': [], 'surfaces': []}.
+                The engine also splits polygon surfaces into 'embedded_surfaces'
+                and 'field_only_surfaces', and passes the field-only polygons'
+                shapely geometries as 'field_only_polygons'.
             background_lc (float): Global background mesh size.
             feature_lc (float, optional): The target resolution of the specific feature group.
         """
@@ -152,20 +157,18 @@ def _surface_boundary_curves(gmsh_api, surface_tags):
     return curves
 
 
-def _polygon_surface_tags(tags_dict):
+def _embedded_surface_tags(tags_dict):
+    """Embedded polygon surface tags (domain partitions that hold mesh nodes)."""
     embedded_surfaces = tags_dict.get("embedded_surfaces", None)
     if embedded_surfaces is None:
         embedded_surfaces = tags_dict.get("surfaces", [])
+    return list(dict.fromkeys(int(t) for t in embedded_surfaces))
 
-    field_only_surfaces = tags_dict.get("field_only_surfaces", [])
-    seen = set()
-    surface_tags = []
-    for tag in list(embedded_surfaces) + list(field_only_surfaces):
-        tag = int(tag)
-        if tag not in seen:
-            seen.add(tag)
-            surface_tags.append(tag)
-    return surface_tags
+
+def _polygon_surface_tags(tags_dict):
+    """Embedded and field-only polygon surface tags, embedded first, deduplicated."""
+    field_only_surfaces = [int(t) for t in tags_dict.get("field_only_surfaces", [])]
+    return list(dict.fromkeys(_embedded_surface_tags(tags_dict) + field_only_surfaces))
 
 
 def _distance_tags_for_growth(gmsh_api, tags_dict, sampling):
@@ -194,34 +197,100 @@ def _distance_tags_for_growth(gmsh_api, tags_dict, sampling):
 
 
 def _polygon_surface_constant(gmsh_api, surface_tags, size, background_lc):
+    """Constant ``size`` on the given embedded surfaces, scoped by entity."""
     if not surface_tags:
         return None
 
     const = gmsh_api.model.mesh.field.add("Constant")
     gmsh_api.model.mesh.field.setNumber(const, "VIn", float(size))
     gmsh_api.model.mesh.field.setNumber(const, "VOut", float(background_lc))
-    # Field-only polygon surfaces are not domain partitions, but Gmsh can
-    # still evaluate a spatial constant field inside their geometry.
+    # SurfacesList matches the entity being meshed, so this only reaches
+    # surfaces that are domain partitions (embedded polygons).
     gmsh_api.model.mesh.field.setNumbers(
         const, "SurfacesList", [float(t) for t in surface_tags]
     )
     return const
 
 
-def _combine_with_polygon_surface_constant(
+def _view_triangles(geometry, value):
+    """List-data ("ST") entries for the constrained Delaunay triangles of ``geometry``."""
+    triangles = shapely.get_parts(shapely.constrained_delaunay_triangles(geometry))
+    data = []
+    for triangle in triangles:
+        (x0, y0), (x1, y1), (x2, y2) = list(triangle.exterior.coords)[:3]
+        data.extend([x0, x1, x2, y0, y1, y2, 0.0, 0.0, 0.0, value, value, value])
+    return len(triangles), data
+
+
+def _field_only_interior(gmsh_api, polygons, size, background_lc):
+    """Field holding field-only polygons at ``size``, located by position.
+
+    A field-only polygon's gmsh surface is not fragmented into the domain,
+    so domain nodes never lie on it and entity-scoped fields (Constant or
+    Restrict with SurfacesList) never apply to them. Instead, a list-based
+    view stores ``size`` on a triangulation of the polygons and
+    ``background_lc`` on a triangulation of the rest of the model's
+    bounding box, and a PostView field evaluates it. Covering the bounding
+    box keeps gmsh from warning about every point outside the polygons.
+    """
+    polygons = shapely.union_all([p for p in polygons if p is not None and not p.is_empty])
+    if polygons.is_empty or polygons.area <= 0.0:
+        return None
+
+    xmin, ymin, _, xmax, ymax, _ = gmsh_api.model.getBoundingBox(-1, -1)
+    pxmin, pymin, pxmax, pymax = polygons.bounds
+    xmin, ymin = min(xmin, pxmin), min(ymin, pymin)
+    xmax, ymax = max(xmax, pxmax), max(ymax, pymax)
+    margin = 0.01 * math.hypot(xmax - xmin, ymax - ymin) + float(background_lc)
+    outside = shapely.box(xmin - margin, ymin - margin, xmax + margin, ymax + margin).difference(polygons)
+
+    n_in, data_in = _view_triangles(polygons, float(size))
+    n_out, data_out = _view_triangles(outside, float(background_lc))
+    view = gmsh_api.view.add("vorflow field-only polygon interior")
+    gmsh_api.view.addListData(view, "ST", n_in + n_out, data_in + data_out)
+
+    field = gmsh_api.model.mesh.field
+    f_view = field.add("PostView")
+    field.setNumber(f_view, "ViewTag", view)
+    # Outside the view (beyond the margin), return 0 -> no constraint rather
+    # than the closest node's value.
+    field.setNumber(f_view, "CropNegativeValues", 1)
+    field.setNumber(f_view, "UseClosest", 0)
+    return f_view
+
+
+def _polygon_interior_size(gmsh_api, tags_dict, size, background_lc):
+    """Field holding polygon interiors at ``size``, or None if there are none."""
+    interiors = [
+        f for f in (
+            _polygon_surface_constant(
+                gmsh_api, _embedded_surface_tags(tags_dict), size, background_lc
+            ),
+            _field_only_interior(
+                gmsh_api, tags_dict.get("field_only_polygons", []), size, background_lc
+            ),
+        )
+        if f is not None
+    ]
+    if len(interiors) < 2:
+        return interiors[0] if interiors else None
+    f_min = gmsh_api.model.mesh.field.add("Min")
+    gmsh_api.model.mesh.field.setNumbers(f_min, "FieldsList", [float(f) for f in interiors])
+    return f_min
+
+
+def _combine_with_polygon_interior(
     gmsh_api, growth_field, tags_dict, size, background_lc
 ):
-    constant = _polygon_surface_constant(
-        gmsh_api, _polygon_surface_tags(tags_dict), size, background_lc
-    )
-    if constant is None:
+    interior = _polygon_interior_size(gmsh_api, tags_dict, size, background_lc)
+    if interior is None:
         return growth_field
     if growth_field is None:
-        return constant
+        return interior
 
     f_min = gmsh_api.model.mesh.field.add("Min")
     gmsh_api.model.mesh.field.setNumbers(
-        f_min, "FieldsList", [float(growth_field), float(constant)]
+        f_min, "FieldsList", [float(growth_field), float(interior)]
     )
     return f_min
 
@@ -233,9 +302,9 @@ class ConstantField(MeshField):
     Used by the engine to set the global background size (which users control
     through ``background_lc``). Not useful as a per-feature field: create()
     ignores ``tags_dict``, so it cannot scope a size to a feature. Polygon
-    interior constants are handled by the internal
-    _polygon_surface_constant() helper because they need SurfacesList scoping
-    and are combined with a growth field.
+    interiors are held at their size by the internal
+    _polygon_interior_size() helper, which scopes embedded surfaces with
+    SurfacesList and locates field-only polygons geometrically.
     """
 
     def __init__(self, size):
@@ -257,11 +326,11 @@ class ThresholdField(MeshField):
         self.sampling = int(sampling)
     def create(self, gmsh_api, tags_dict, background_lc, feature_lc=None):
         # 1. Distance field for growth away from features. For polygon
-        # surfaces, use boundary curves for growth and add a spatial constant
+        # surfaces, use boundary curves for growth and add an interior
         # field below so the polygon interior remains flat.
         f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, self.sampling)
         if f_dist is None:
-            return _combine_with_polygon_surface_constant(
+            return _combine_with_polygon_interior(
                 gmsh_api, None, tags_dict, self.size_min, background_lc
             )
 
@@ -273,7 +342,7 @@ class ThresholdField(MeshField):
         gmsh_api.model.mesh.field.setNumber(f_thresh, "DistMin", self.dist_min)
         gmsh_api.model.mesh.field.setNumber(f_thresh, "DistMax", self.dist_max)
 
-        return _combine_with_polygon_surface_constant(
+        return _combine_with_polygon_interior(
             gmsh_api, f_thresh, tags_dict, self.size_min, background_lc
         )
 
@@ -306,14 +375,14 @@ class ExponentialField(MeshField):
 
         f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, self.sampling)
         if f_dist is None:
-            return _combine_with_polygon_surface_constant(
+            return _combine_with_polygon_interior(
                 gmsh_api, None, tags_dict, self.size_min, background_lc
             )
 
         f_math = gmsh_api.model.mesh.field.add("MathEval")
         expr = f"{s_max} - ({s_max} - {self.size_min}) * Exp(-F{f_dist} / {self.decay_length})"
         gmsh_api.model.mesh.field.setString(f_math, "F", expr)
-        return _combine_with_polygon_surface_constant(
+        return _combine_with_polygon_interior(
             gmsh_api, f_math, tags_dict, self.size_min, background_lc
         )
 
@@ -370,7 +439,7 @@ class GeometricGrowthField(MeshField):
 
         f_dist = _distance_tags_for_growth(gmsh_api, tags_dict, distance_sampling)
         if f_dist is None:
-            return _combine_with_polygon_surface_constant(
+            return _combine_with_polygon_interior(
                 gmsh_api, None, tags_dict, cs, background_lc
             )
 
@@ -379,7 +448,7 @@ class GeometricGrowthField(MeshField):
         expr = f"{cs} + {gradient} * F{f_dist}"
 
         gmsh_api.model.mesh.field.setString(f_math, "F", expr)
-        return _combine_with_polygon_surface_constant(
+        return _combine_with_polygon_interior(
             gmsh_api, f_math, tags_dict, cs, background_lc
         )
 

@@ -410,7 +410,10 @@ class ConceptualMesh:
                 neighbouring zones never open gaps. Raises ValueError if negative.
                 Boolean values are not supported.
             fields (list, optional): List of MeshField objects.
-            embed (bool): If True, the polygon is embedded in the mesh. If False, it is used only for fields.
+            embed (bool): If True, the polygon is embedded in the mesh. If False, it is used only for
+                fields: it refines the mesh to ``resolution`` throughout its interior (holes excluded)
+                and grows from its boundary like an embedded polygon, but adds no mesh edges, does not
+                cut the domain and never becomes a zone.
             quad_buffer (bool): If True, replaces the meshed polygon outline
                 with a quad band straddling it (the annulus between the
                 ``+/- thickness * resolution / 2`` offsets, meshed as
@@ -981,17 +984,16 @@ class ConceptualMesh:
 
         Unlike the clearance obstacles, field-only features count: they
         create no nodes but their size fields still reach the ring. The
-        engine scopes a polygon's interior Constant field to its surface
-        entity, which holds mesh nodes only for embedded polygons, so an
-        embedded polygon is sized at its resolution throughout (measured as
-        an area) while a field-only polygon only grows from its boundary.
+        engine holds every polygon, embedded or field-only, at its
+        resolution throughout its interior, so polygons are measured as
+        areas.
         """
         sources = [
             (f"polygon {poly['zone_id']!r}", poly['geometry'], _meshed_half_width(poly), _size_ramps(poly))
             for _, poly in self.clean_polygons.iterrows()
         ]
         sources.extend(
-            (f"polygon {poly['zone_id']!r}", poly['geometry'].boundary, 0.0, _size_ramps(poly))
+            (f"polygon {poly['zone_id']!r}", poly['geometry'], 0.0, _size_ramps(poly))
             for poly in field_only_polys
         )
         sources.extend(

@@ -195,7 +195,7 @@ def test_embedded_polygon_field_has_constant_interior():
         gmsh.finalize()
 
 
-def test_field_only_polygon_field_has_constant_interior_without_partitioning():
+def test_field_only_polygon_field_has_interior_without_partitioning():
     """Field-only polygons should get flat interior sizing without becoming domain zones."""
     cm = ConceptualMesh(crs="EPSG:3857")
     domain = Polygon([(0, 0), (20, 0), (20, 20), (0, 20)])
@@ -227,8 +227,14 @@ def test_field_only_polygon_field_has_constant_interior_without_partitioning():
             float(tag) for dim, tag in field_surfaces if int(dim) == 2
         }
 
-        constant_fields = _constant_fields_for_surfaces(field_surface_tags, 2.0)
-        assert constant_fields, "Expected a constant field inside the field-only polygon surface"
+        # A Constant scoped to the unfragmented field-only surface would never
+        # reach domain nodes; the interior is a positional PostView field.
+        assert not _constant_fields_for_surfaces(field_surface_tags, 2.0)
+        post_views = [
+            f for f in gmsh.model.mesh.field.list()
+            if gmsh.model.mesh.field.getType(f) == "PostView"
+        ]
+        assert len(post_views) == 1
 
         embedded_domain_ids = [
             int(i)
@@ -241,6 +247,39 @@ def test_field_only_polygon_field_has_constant_interior_without_partitioning():
 
     assert mg.generate(clean_polys, clean_lines, clean_points)
     assert len(mg.nodes) > 0
+
+
+def _nodes_in_box(refinement, embed, xmin, ymin, xmax, ymax):
+    """Mesh nodes inside a box for a 200 x 200 domain (lc 20) with a lc 1 polygon."""
+    cm = ConceptualMesh()
+    cm.add_polygon(box(0, 0, 200, 200), zone_id="domain", resolution=20)
+    cm.add_polygon(refinement, zone_id="refine", resolution=1, z_order=5, embed=embed)
+    mg = MeshGenerator(background_lc=20, verbosity=0)
+    assert mg.generate(*cm.generate())
+    nodes = mg.nodes
+    return int(
+        ((nodes[:, 0] > xmin) & (nodes[:, 0] < xmax) & (nodes[:, 1] > ymin) & (nodes[:, 1] < ymax)).sum()
+    )
+
+
+def test_field_only_polygon_refines_its_whole_interior():
+    # The core is 15 from the polygon edge: boundary growth alone gives ~8
+    # nodes there, a size of 1 throughout gives ~116 as for an embedded one.
+    refinement = box(80, 80, 120, 120)
+    core = (95, 95, 105, 105)
+    embedded = _nodes_in_box(refinement, True, *core)
+    field_only = _nodes_in_box(refinement, False, *core)
+    assert embedded > 80
+    assert field_only > 0.8 * embedded
+
+
+def test_field_only_polygon_hole_is_not_refined():
+    # The hole of a field-only polygon only gets the growth from its edges.
+    ring = box(60, 60, 140, 140).difference(box(80, 80, 120, 120))
+    core = (95, 95, 105, 105)
+    filled = _nodes_in_box(box(60, 60, 140, 140), False, *core)
+    holed = _nodes_in_box(ring, False, *core)
+    assert holed < 0.5 * filled
 
 
 def test_gmsh_integration_overlapping_polygon_with_hole():

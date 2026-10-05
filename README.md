@@ -162,6 +162,15 @@ For the continuous-metric convention, pass an explicit
 gradient `log(growth_factor)`. In normal `MeshGenerator` use, the global
 background field caps either result at `background_lc`.
 
+A polygon added with `embed=False` is a refinement region: the mesh is held
+at its `resolution` throughout its interior and grows away from its boundary
+as for an embedded polygon, but the polygon adds no mesh edges and is not a
+zone.
+
+```python
+blueprint.add_polygon(refine_area, zone_id="refine", resolution=2, embed=False)
+```
+
 > **Coordinate systems:** always work in a *projected* CRS (e.g. UTM or a
 > national grid) so mesh sizes are in real length units (meters/feet).
 > Geographic coordinates (lat/lon degrees, e.g. EPSG:4326) produce

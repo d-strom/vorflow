@@ -521,10 +521,16 @@ def _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
     return list(groups.values())
 
 
-def _field_target_tags(gmsh_map, feature_ids, field_only_polygon_ids):
-    """Gmsh tags a field group targets, as the tags_dict MeshField.create expects."""
+def _field_target_tags(gmsh_map, feature_ids, field_only_polygons):
+    """Gmsh tags a field group targets, as the tags_dict MeshField.create expects.
+
+    ``field_only_polygons`` maps field-only polygon ids to their geometry.
+    Their surfaces are not part of the domain mesh, so fields locate their
+    interiors from these geometries ('field_only_polygons') instead.
+    """
     tags = {'points': [], 'lines': [], 'surfaces': [],
-            'embedded_surfaces': [], 'field_only_surfaces': []}
+            'embedded_surfaces': [], 'field_only_surfaces': [],
+            'field_only_polygons': []}
     buffer_surfs = gmsh_map.get('structured_buffer_surfs', {})
 
     for fid in feature_ids['points']:
@@ -553,8 +559,11 @@ def _field_target_tags(gmsh_map, feature_ids, field_only_polygon_ids):
             if ('poly', fid) in buffer_surfs:
                 surface_tags = surface_tags + _dimtag_tags(buffer_surfs[('poly', fid)])
             tags['surfaces'].extend(surface_tags)
-            kind = 'field_only_surfaces' if fid in field_only_polygon_ids else 'embedded_surfaces'
-            tags[kind].extend(surface_tags)
+            if fid in field_only_polygons:
+                tags['field_only_surfaces'].extend(surface_tags)
+                tags['field_only_polygons'].append(field_only_polygons[fid])
+            else:
+                tags['embedded_surfaces'].extend(surface_tags)
         elif fid in gmsh_map.get('poly_curves', {}):
             # Field-only polygons without a surface: size from their boundary curves.
             tags['lines'].extend(_dimtag_tags(gmsh_map['poly_curves'][fid]))
@@ -2453,13 +2462,13 @@ class MeshGenerator:
         self._log_field_setup_diagnostics(gmsh_map, polygons_gdf)
         self._validate_background_lc()
         background_lc = float(self.background_lc)
-        field_only_polygon_ids = {
-            int(idx) for idx, row in polygons_gdf.iterrows() if not is_embedded(row)
+        field_only_polygons = {
+            int(idx): row.geometry for idx, row in polygons_gdf.iterrows() if not is_embedded(row)
         }
 
         field_ids = []
         for group in _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
-            tags_dict = _field_target_tags(gmsh_map, group.feature_ids, field_only_polygon_ids)
+            tags_dict = _field_target_tags(gmsh_map, group.feature_ids, field_only_polygons)
             if not any(tags_dict.values()):
                 continue
             # Private metadata for built-in field helpers; custom MeshField

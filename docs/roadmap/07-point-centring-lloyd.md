@@ -23,8 +23,8 @@ or symmetric around the point) and
   - a polygon boundary, an embedded line (plus its straddle or quad-buffer
     half-width) or another embedded point is closer than
     `HEX_RING_CLEARANCE` (2.0) x `resolution`;
-  - a zone (held at its resolution throughout its interior), line, point or
-    field-only polygon (measured from its boundary) is estimated to set a
+  - a polygon (embedded or field-only, held at its resolution throughout
+    its interior), line or point is estimated to set a
     mesh size below `HEX_RING_MIN_SIZE_RATIO` (0.9) x `resolution` at the
     ring. With a uniform size, Gmsh kept the ring at 0.85 r and split it at
     0.80 r; 0.9 leaves a margin for the linear size estimate, which models
@@ -99,11 +99,10 @@ Limits:
   explicit `GeometricGrowthField` / `ThresholdField` entries; other fields
   are caught only after meshing (warning plus `diagnostics['hex_rings']`),
   when the ring has already been meshed through.
-- Field-only (`embed=False`) polygons refine only from their boundary: their
-  interior Constant field is scoped to a surface entity that holds no domain
-  mesh nodes, so it never reaches the domain mesh. The size estimate models
-  them that way. This is a separate, pre-existing limitation of the field
-  setup and out of scope here.
+- Field-only (`embed=False`) polygons originally refined only from their
+  boundary: their interior Constant field was scoped to a surface entity that
+  holds no domain mesh nodes. That was fixed separately (a positional
+  PostView interior field), and the size estimate now measures them as areas.
 - With Lloyd on, the Voronoi grid is no longer the exact dual of
   `MeshGenerator.get_element_grid()`.
 - Cells next to fixed nodes improve little. The p95 `ortho_error` tail above

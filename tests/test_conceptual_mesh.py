@@ -622,7 +622,7 @@ def _ring_point_in(polygon_resolution=None):
             "line 'ramp'",
         ),
     ],
-    ids=["finer enclosing zone", "finer field-only polygon edge", "fine line beyond clearance",
+    ids=["finer enclosing zone", "finer field-only polygon", "fine line beyond clearance",
          "explicit threshold field"],
 )
 def test_hex_ring_dropped_when_size_field_finer_than_ring(add_source, label):
@@ -656,14 +656,24 @@ def test_hex_ring_point_merged_by_simplification_warns():
     assert list(clean_points["point_id"]) == ["finer"]
 
 
-def test_hex_ring_kept_inside_large_field_only_polygon():
-    # A field-only polygon only grows its size from its boundary (the engine's
-    # interior constant never reaches the domain mesh), so a fine one whose
-    # edge is 16 from the ring leaves it intact: 1 + 0.2 * 16 >= 0.9 * 4.
+def test_hex_ring_dropped_inside_finer_field_only_polygon():
+    # The engine holds a field-only polygon at its resolution throughout its
+    # interior, so a ring 16 from the polygon edge still sees a size of 1.
     cm = _ring_point_in()
     cm.add_polygon(
         Polygon([(30, 30), (70, 30), (70, 70), (30, 70)]),
         zone_id="field", resolution=1, embed=False,
+    )
+    with pytest.warns(UserWarning, match="'well': polygon 'field' sets a mesh size of ~1 .*hex_ring ignored"):
+        _, _, clean_points = cm.generate()
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+def test_hex_ring_kept_inside_field_only_polygon_at_ring_resolution():
+    cm = _ring_point_in()
+    cm.add_polygon(
+        Polygon([(30, 30), (70, 30), (70, 70), (30, 70)]),
+        zone_id="field", resolution=4, embed=False,
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
