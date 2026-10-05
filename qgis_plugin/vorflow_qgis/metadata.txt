@@ -1,0 +1,15 @@
+[general]
+name=Vorflow for QGIS
+description=Generate Vorflow/Gmsh meshes in QGIS, inspect mesh quality, and export minimal MODFLOW 6 DISV datasets.
+version=0.5.0
+qgisMinimumVersion=3.28
+author=David Ström
+email=
+about=QGIS interface for Vorflow mesh generation with global and layer-specific refinement controls, quality layers, Voronoi tessellation, and minimal MODFLOW 6 DISV export. Vorflow is an independent upstream project; see ATTRIBUTION.md.
+category=Vector
+tags=vorflow,gmsh,mesh,voronoi,modflow,disv,groundwater
+icon=icon.png
+experimental=True
+
+[python]
+dependencies=vorflow, geopandas, shapely, gmsh, scipy, pyogrio
