@@ -12,6 +12,8 @@ from shapely.prepared import prep
 from shapely.validation import make_valid
 
 from ._features import line_parts as _line_parts
+from ._features import positive_number, row_bool
+from ._straddle import is_straddle_line, straddle_epsilon
 from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,11 @@ logger = logging.getLogger(__name__)
 # Constants for geometry simplification and reporting
 SIGNIFICANT_REDUCTION_PCT = 1.0
 DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
+# A hex_ring point's ring seeds sit at 1 x lc; every other node-bearing feature
+# must stay at least HEX_RING_CLEARANCE x lc away, so at least one cell width
+# separates the ring from foreign nodes (closer ones would cut the hexagon).
+HEX_RING_CLEARANCE = 2.0
+HEX_RING_ANGLES_DEG = tuple(30.0 + 60.0 * k for k in range(6))
 
 
 def _validate_growth_factor(value):
@@ -114,6 +121,47 @@ def _deduplicate_points(points):
         if not is_duplicate:
             kept.add(i)
     return [points[i] for i in sorted(kept)]
+
+
+def _hex_ring_seeds(point, lc: float) -> list[tuple[float, float]]:
+    """The six hex-ring seeds at radius ``lc`` around ``point``, at 30 + k * 60 degrees."""
+    return [
+        (point.x + lc * math.cos(math.radians(angle)), point.y + lc * math.sin(math.radians(angle)))
+        for angle in HEX_RING_ANGLES_DEG
+    ]
+
+
+def _meshed_half_width(feature) -> float:
+    """Half-width of the node band a line or polygon feature meshes about its geometry.
+
+    Quad buffers straddle the geometry by ``thickness * lc / 2`` and
+    barrier/straddle lines place their point pairs at ``straddle_epsilon``;
+    plain features put their nodes on the geometry itself. An unset ``lc``
+    (background resolution, unknown here) counts as zero width.
+    """
+    lc = positive_number(feature.get('lc'))
+    if row_bool(feature, 'quad_buffer', False):
+        thickness = positive_number(feature.get('quad_buffer_thickness')) or 1
+        return thickness * lc / 2.0 if lc is not None else 0.0
+    if is_straddle_line(feature):
+        straddle = positive_number(feature.get('straddle_width'))
+        return straddle_epsilon(lc, straddle) if (lc is not None or straddle) else 0.0
+    return 0.0
+
+
+def _hex_ring_conflict(point, lc: float, obstacles) -> str | None:
+    """Why a hex ring around ``point`` would collide with an obstacle, or None if it fits.
+
+    ``obstacles`` holds ``(label, geometry, half_width)``; each must keep
+    ``HEX_RING_CLEARANCE * lc`` between the point and its meshed band
+    (``half_width`` either side of the geometry).
+    """
+    clearance = HEX_RING_CLEARANCE * lc
+    for label, geometry, half_width in obstacles:
+        gap = geometry.distance(point) - half_width
+        if gap < clearance:
+            return f"{label} is {max(gap, 0.0):.6g} away (needs >= {clearance:.6g})"
+    return None
 
 
 def _warn_deprecated(message):
@@ -461,7 +509,8 @@ class ConceptualMesh:
             'growth_factor': growth_factor,
         })
 
-    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None, embed=True, simplify_tolerance=None, growth_factor=None):
+    def add_point(self, geometry, point_id, resolution, dist_min=None, dist_max=None, fields=None,
+                  embed=True, simplify_tolerance=None, growth_factor=None, hex_ring=False):
         """
         Adds a point feature, such as a well or an observation point.
 
@@ -475,6 +524,10 @@ class ConceptualMesh:
                 omit them to use the default GeometricGrowthField.
             dist_max (float, optional): DEPRECATED. Distance from the point over which the mesh
                 transitions to the background resolution. See dist_min.
+            fields (list, optional): List of MeshField objects. When given, they replace
+                the default size transition around the point.
+            embed (bool): If True (default), the point becomes a mesh node (and so a
+                Voronoi generator). If False, it is used only for size fields.
             simplify_tolerance (float|int|None, optional): If a number > 0, merges points that are closer
                 than this tolerance, keeping the one with the finest resolution. Two points merge
                 when either one's tolerance covers their separation. If None or 0, this point does
@@ -482,7 +535,25 @@ class ConceptualMesh:
             growth_factor (float, optional): Cell-to-cell growth ratio (>1.0) for the default
                 GeometricGrowthField size transition away from the point. Defaults to 1.2.
                 Ignored when an explicit ``fields`` list or the legacy dist_min/dist_max is given.
+            hex_ring (bool): If True, six fixed seed nodes are added around the point
+                at radius ``resolution`` (angles 30 + k * 60 degrees), so the point's
+                Voronoi cell is a regular hexagon centred on it with apothem
+                ``resolution / 2``. Requires ``embed=True`` and a positive
+                ``resolution``. The ring adds cells around the point (about 40 with
+                the default growth_factor). It is built about the point's final position
+                after snapping and clipping in ``generate()``, and dropped with a
+                warning when another embedded feature (polygon boundary, line or
+                its buffer band, other point) lies closer than
+                ``HEX_RING_CLEARANCE * resolution`` to the point.
         """
+        if not isinstance(hex_ring, (bool, np.bool_)):
+            raise ValueError(f"hex_ring must be True or False. Got {hex_ring!r}.")
+        if hex_ring and not embed:
+            raise ValueError("hex_ring=True requires embed=True: the ring seeds are mesh nodes.")
+        if hex_ring and positive_number(resolution) is None:
+            raise ValueError(
+                f"hex_ring=True requires a positive resolution (the ring radius). Got {resolution!r}."
+            )
         if isinstance(simplify_tolerance, bool):
             raise ValueError(
                 "simplify_tolerance must be a non-negative number (or None/0 to disable). "
@@ -505,7 +576,9 @@ class ConceptualMesh:
             'embed': embed,
             'simplify_tolerance': simplify_tolerance,
             'growth_factor': growth_factor,
+            'hex_ring': bool(hex_ring),
         })
+
     def _apply_simplification(self):
         """
         Applies geometry simplification to raw polygons, lines, and points
@@ -781,6 +854,66 @@ class ConceptualMesh:
         self.raw_points = kept_points
 
 
+    def _hex_ring_obstacles(self):
+        """Embedded polygon boundaries and lines as ``(label, geometry, half_width)`` hex-ring obstacles.
+
+        Run after overlap resolution, so ``clean_polygons`` holds only the
+        embedded (domain) polygons. Field-only lines create no nodes and are
+        skipped.
+        """
+        obstacles = []
+        for _, poly in self.clean_polygons.iterrows():
+            obstacles.append((
+                f"polygon {poly['zone_id']!r} boundary",
+                poly.geometry.boundary,
+                _meshed_half_width(poly),
+            ))
+        for line_data in self.raw_lines:
+            if not bool(line_data.get('embed', True)):
+                continue
+            obstacles.append((
+                f"line {line_data['line_id']!r}",
+                line_data['geometry'],
+                _meshed_half_width(line_data),
+            ))
+        return obstacles
+
+    def _assign_hex_ring_seeds(self):
+        """Set each working point's ``ring_seeds``: its six ring seeds, or None when off or conflicting.
+
+        Other embedded points are obstacles too; one with its own hex ring
+        also claims the ring radius around it.
+        """
+        requested = [i for i, p in enumerate(self.raw_points) if p.get('hex_ring', False)]
+        for point_data in self.raw_points:
+            point_data['ring_seeds'] = None
+        if not requested:
+            return
+
+        feature_obstacles = self._hex_ring_obstacles()
+        point_obstacles = [
+            (
+                f"point {p['point_id']!r}",
+                p['geometry'],
+                float(p['lc']) if p.get('hex_ring', False) else 0.0,
+            )
+            if bool(p.get('embed', True)) else None
+            for p in self.raw_points
+        ]
+        for i in requested:
+            point_data = self.raw_points[i]
+            lc = float(point_data['lc'])
+            others = [ob for j, ob in enumerate(point_obstacles) if j != i and ob is not None]
+            reason = _hex_ring_conflict(point_data['geometry'], lc, feature_obstacles + others)
+            if reason is not None:
+                warnings.warn(
+                    f"Point {point_data['point_id']!r}: {reason}; hex_ring ignored.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+                continue
+            point_data['ring_seeds'] = _hex_ring_seeds(point_data['geometry'], lc)
+
     def generate(self, connectivity_tolerance=None):
         """
         Runs the full preprocessing workflow: resolves polygon overlaps,
@@ -827,6 +960,9 @@ class ConceptualMesh:
 
         logger.info("Clipping features to domain...")
         self._clip_features_to_domain()
+
+        # After snapping and clipping, so each ring is built about the final point.
+        self._assign_hex_ring_seeds()
         
         # Promote the processed raw geometries to final "clean" GeoDataFrames.
         if self.raw_lines:
@@ -859,7 +995,19 @@ class ConceptualMesh:
             self.clean_points = gpd.GeoDataFrame(self.raw_points, crs=self.crs)
         else:
             self.clean_points = gpd.GeoDataFrame(
-                columns=['geometry', 'point_id', 'lc', 'dist_min', 'dist_max', 'fields', 'embed', 'simplify_tolerance', 'growth_factor'],
+                columns=[
+                    'geometry',
+                    'point_id',
+                    'lc',
+                    'dist_min',
+                    'dist_max',
+                    'fields',
+                    'embed',
+                    'simplify_tolerance',
+                    'growth_factor',
+                    'hex_ring',
+                    'ring_seeds',
+                ],
                 crs=self.crs,
             )
 

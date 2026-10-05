@@ -44,6 +44,14 @@ def positive_number(value) -> float | None:
     return value if value > 0 else None
 
 
+def ring_seed_coords(row) -> list:
+    """The row's hex-ring seed ``(x, y)`` list; empty when the column is missing, None or NaN."""
+    seeds = row.get('ring_seeds')
+    if isinstance(seeds, (list, tuple)):
+        return list(seeds)
+    return []
+
+
 def feature_lc(row, background_lc) -> float:
     """The row's ``lc``, falling back to ``background_lc`` then 10.0 (floored at 0.001)."""
     lc = positive_number(row.get('lc'))

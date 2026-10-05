@@ -59,6 +59,7 @@ from ._features import (
     is_embedded,
     polygon_parts,
     positive_number,
+    ring_seed_coords,
     row_bool,
     sanitize_coords,
     unpinch_polygons,
@@ -1340,12 +1341,19 @@ class MeshGenerator:
         return final_map, crossings
 
     def _add_point_features(self, points_gdf, inventory):
-        """Add one OCC point per point feature."""
+        """Add one OCC point per point feature, plus its hex-ring seeds when it has them.
+
+        Ring seeds are recorded under the point's own feature id, so
+        embedding, node collection and size fields treat them like the point.
+        """
         for idx, row in points_gdf.iterrows():
             tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
             key = _to_key(0, tag)
             if is_embedded(row):
                 inventory.record_embedded(key, 'point', idx)
+                for x, y in ring_seed_coords(row):
+                    seed_key = _to_key(0, gmsh.model.occ.addPoint(x, y, 0))
+                    inventory.record_embedded(seed_key, 'point', idx)
             else:
                 inventory.nonembedded_point_tags.setdefault(int(idx), []).append(key)
 

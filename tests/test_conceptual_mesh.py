@@ -488,3 +488,100 @@ def test_quad_buffer_requires_embedded_feature(method):
     identifier = {"zone_id": 1} if method == "add_polygon" else {"line_id": "l"}
     with pytest.raises(ValueError, match="quad_buffer=True requires embed=True"):
         getattr(cm, method)(geometry, resolution=1.0, quad_buffer=True, embed=False, **identifier)
+
+
+# --- hex_ring ---------------------------------------------------------------
+
+def _hex_ring_mesh():
+    cm = ConceptualMesh()
+    cm.add_polygon(Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]), zone_id="domain")
+    return cm
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_hex_ring_rejects_non_bool(value):
+    cm = _hex_ring_mesh()
+    with pytest.raises(ValueError, match="hex_ring"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=value)
+
+
+def test_hex_ring_requires_embed_and_resolution():
+    cm = _hex_ring_mesh()
+    with pytest.raises(ValueError, match="embed=True"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=2, embed=False, hex_ring=True)
+    with pytest.raises(ValueError, match="positive resolution"):
+        cm.add_point(Point(50, 50), point_id="well", resolution=None, hex_ring=True)
+
+
+def test_hex_ring_seeds_form_regular_hexagon():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50.3, 49.7), point_id="well", resolution=2, hex_ring=True)
+    _, _, clean_points = cm.generate()
+
+    seeds = clean_points.iloc[0]["ring_seeds"]
+    assert isinstance(seeds, list) and len(seeds) == 6
+    offsets = np.array(seeds) - np.array([50.3, 49.7])
+    np.testing.assert_allclose(np.hypot(offsets[:, 0], offsets[:, 1]), 2.0)
+    angles = np.degrees(np.arctan2(offsets[:, 1], offsets[:, 0])) % 360
+    np.testing.assert_allclose(angles, [30, 90, 150, 210, 270, 330])
+
+
+def test_hex_ring_false_has_no_seeds():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2)
+    _, _, clean_points = cm.generate()
+    assert not clean_points.iloc[0]["hex_ring"]
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+@pytest.mark.parametrize(
+    "add_obstacle",
+    [
+        lambda cm: cm.add_line(LineString([(53, 0), (53, 100)]), line_id="river", resolution=2),
+        lambda cm: cm.add_point(Point(52, 50), point_id="other", resolution=2),
+        lambda cm: cm.add_line(
+            LineString([(58, 0), (58, 100)]), line_id="strip", resolution=10, quad_buffer=True
+        ),
+    ],
+    ids=["line", "point", "quad-buffer band"],
+)
+def test_hex_ring_dropped_near_other_feature(add_obstacle):
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    add_obstacle(cm)
+    with pytest.warns(UserWarning, match="'well'.*hex_ring ignored"):
+        _, _, clean_points = cm.generate()
+    well = clean_points[clean_points["point_id"] == "well"].iloc[0]
+    assert well["ring_seeds"] is None
+
+
+def test_hex_ring_dropped_near_domain_boundary():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(3, 50), point_id="edge_well", resolution=2, hex_ring=True)
+    with pytest.warns(UserWarning, match="'edge_well'.*polygon 'domain' boundary"):
+        _, _, clean_points = cm.generate()
+    assert clean_points.iloc[0]["ring_seeds"] is None
+
+
+def test_hex_ring_ignores_field_only_line():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    cm.add_line(LineString([(51, 0), (51, 100)]), line_id="field", resolution=2, embed=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _, _, clean_points = cm.generate()
+    assert len(clean_points.iloc[0]["ring_seeds"]) == 6
+
+
+def test_empty_points_frame_has_hex_ring_columns():
+    _, _, clean_points = _hex_ring_mesh().generate()
+    assert clean_points.empty
+    assert {"hex_ring", "ring_seeds"} <= set(clean_points.columns)
+
+
+def test_hex_ring_seeds_do_not_leak_into_raw_points():
+    cm = _hex_ring_mesh()
+    cm.add_point(Point(50, 50), point_id="well", resolution=2, hex_ring=True)
+    cm.generate()
+    assert "ring_seeds" not in cm.raw_points[0]
+    assert cm.raw_points[0]["hex_ring"] is True
