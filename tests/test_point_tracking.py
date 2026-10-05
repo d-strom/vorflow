@@ -14,6 +14,7 @@ from shapely.geometry import LineString, Point, Polygon, box
 
 from vorflow.blueprint import ConceptualMesh
 from vorflow.engine import MeshGenerator
+from vorflow.fields import ExponentialField
 from vorflow.tessellator import VoronoiTessellator
 
 pytestmark = pytest.mark.slow  # gmsh-heavy end-to-end tests
@@ -816,6 +817,22 @@ class TestHexRing:
         np.testing.assert_allclose(radii, r / math.sqrt(3), rtol=1e-6)
         assert cell.geometry.area == pytest.approx(math.sqrt(3) / 2 * r**2, rel=1e-6)
         assert (cell['x'], cell['y']) == pytest.approx((point.x, point.y))
+        assert mg.diagnostics['hex_rings'] == {'well': True}
+
+    def test_ring_split_by_unmodelled_field_warns_after_meshing(self):
+        point = Point(101.3, 98.7)
+        cm = _hex_ring_conceptual_mesh(point)
+        # The blueprint cannot model an ExponentialField, so it keeps the
+        # ring; the fine size it sets at the ring splits it during meshing.
+        cm.add_point(Point(101.3, 110), point_id="probe", resolution=1, embed=False,
+                     fields=[ExponentialField(size_min=0.2, decay_length=500)])
+        clean_polys, clean_lines, clean_points = cm.generate()
+        assert clean_points.iloc[0]['ring_seeds'] is not None
+
+        mg = MeshGenerator(background_lc=20, verbosity=0)
+        with pytest.warns(UserWarning, match="hex_ring of point 'well' was broken"):
+            assert mg.generate(clean_polys, clean_lines, clean_points)
+        assert mg.diagnostics['hex_rings'] == {'well': False}
 
     def test_ring_dropped_near_line_still_meshes(self):
         point = Point(101.3, 98.7)

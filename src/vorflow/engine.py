@@ -715,6 +715,36 @@ def _endpoint_surfaces(curve_tag):
     return surfaces
 
 
+def _point_entity_nodes(dimtags):
+    """Mesh node tag -> (x, y) of the dim-0 entities in a point feature's map entry."""
+    nodes = {}
+    for dimtag in dimtags:
+        if int(dimtag[0]) != 0:
+            continue
+        node_tags, coords, _ = gmsh.model.mesh.getNodes(0, int(dimtag[1]))
+        for tag, xy in zip(node_tags, np.asarray(coords, dtype=float).reshape(-1, 3)):
+            nodes[int(tag)] = (float(xy[0]), float(xy[1]))
+    return nodes
+
+
+def _hex_ring_intact(dimtags, centre, element_nodes):
+    """True when the meshed ring around ``centre`` is the fan of 6 triangles onto its 6 seeds.
+
+    ``dimtags`` is the point feature's gmsh_map entry (centre plus seeds);
+    ``element_nodes`` holds one (n_elements, n_nodes) tag array per 2D element type.
+    """
+    nodes = _point_entity_nodes(dimtags)
+    if len(nodes) != 7:
+        return False
+    centre_tag = min(nodes, key=lambda t: math.dist(nodes[t], (centre.x, centre.y)))
+    incident = [block[(block == centre_tag).any(axis=1)] for block in element_nodes]
+    incident = [block for block in incident if len(block)]
+    if len(incident) != 1 or incident[0].shape != (6, 3):
+        return False
+    neighbours = {int(t) for t in incident[0].ravel()} - {centre_tag}
+    return neighbours == set(nodes) - {centre_tag}
+
+
 def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
     """(dim, tag) of every embedded point, line and barrier straddle point, in embedding order."""
     entities = []
@@ -2727,6 +2757,7 @@ class MeshGenerator:
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points, crossings=crossings)
 
             self._mesh_2d()
+            self._check_hex_rings(gmsh_map, clean_points)
 
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
             self.triangular_quality = self._collect_triangular_quality(meshed_surface_tags)
@@ -2756,6 +2787,40 @@ class MeshGenerator:
             logger.error(f"Mesh Generation Failed: {e}")
             self._finalize_gmsh()
             raise
+
+    def _check_hex_rings(self, gmsh_map, points_gdf):
+        """Warn for each hex_ring point whose ring the mesher split; record the outcome in diagnostics.
+
+        The blueprint drops rings it can see a conflict for, but explicit
+        size fields it cannot model (or a background_lc below the ring
+        radius) can still make Gmsh insert nodes inside a ring.
+        """
+        rings = [(idx, row) for idx, row in points_gdf.iterrows()
+                 if is_embedded(row) and ring_seed_coords(row)]
+        self.diagnostics['hex_rings'] = {}
+        if not rings:
+            return
+        element_types, _, element_node_tags = gmsh.model.mesh.getElements(2)
+        element_nodes = [
+            np.asarray(tags, dtype=np.int64).reshape(
+                -1, gmsh.model.mesh.getElementProperties(etype)[3]
+            )
+            for etype, tags in zip(element_types, element_node_tags)
+        ]
+        for idx, row in rings:
+            point_id = row.get('point_id', idx)
+            intact = _hex_ring_intact(
+                gmsh_map.get('points', {}).get(int(idx), []), row.geometry, element_nodes
+            )
+            self.diagnostics['hex_rings'][point_id] = intact
+            if not intact:
+                warnings.warn(
+                    f"hex_ring of point {point_id!r} was broken by a size field finer than "
+                    f"its ring radius ({row.get('lc')}); its cell will not be a regular "
+                    "hexagon.",
+                    UserWarning,
+                    stacklevel=4,
+                )
 
     def _mesh_2d(self):
         """Set the meshing options, generate the 2D mesh and run the optimization cycles."""

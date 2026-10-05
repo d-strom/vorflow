@@ -14,6 +14,7 @@ from shapely.validation import make_valid
 from ._features import line_parts as _line_parts
 from ._features import positive_number, row_bool
 from ._straddle import is_straddle_line, straddle_epsilon
+from .fields import DEFAULT_GROWTH_FACTOR, GeometricGrowthField, MeshField, ThresholdField
 from shapely.strtree import STRtree
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,10 @@ DEFAULT_CONNECTIVITY_TOLERANCE = 1e-3
 # separates the ring from foreign nodes (closer ones would cut the hexagon).
 HEX_RING_CLEARANCE = 2.0
 HEX_RING_ANGLES_DEG = tuple(30.0 + 60.0 * k for k in range(6))
+# Gmsh keeps the ring's radius-r edges intact only while the target size inside
+# the ring stays above ~0.85 r (measured with a uniform size: 0.85 r kept the
+# hexagon, 0.80 r split it). 0.9 leaves a margin for the linear size estimate.
+HEX_RING_MIN_SIZE_RATIO = 0.9
 
 
 def _validate_growth_factor(value):
@@ -114,12 +119,23 @@ def _deduplicate_points(points):
     for i in order:
         own_tol = tolerance(points[i])
         candidates = tree.query(geoms[i].buffer(max_tol))
-        is_duplicate = any(
-            j in kept and geoms[j].distance(geoms[i]) < max(own_tol, tolerance(points[j]))
-            for j in candidates
+        merged_into = next(
+            (
+                j for j in candidates
+                if j in kept and geoms[j].distance(geoms[i]) < max(own_tol, tolerance(points[j]))
+            ),
+            None,
         )
-        if not is_duplicate:
+        if merged_into is None:
             kept.add(i)
+        elif points[i].get("hex_ring", False):
+            warnings.warn(
+                f"Point {points[i]['point_id']!r} was merged into point "
+                f"{points[merged_into]['point_id']!r} by simplify_tolerance; "
+                "its hex_ring is dropped.",
+                UserWarning,
+                stacklevel=5,
+            )
     return [points[i] for i in sorted(kept)]
 
 
@@ -161,6 +177,80 @@ def _hex_ring_conflict(point, lc: float, obstacles) -> str | None:
         gap = geometry.distance(point) - half_width
         if gap < clearance:
             return f"{label} is {max(gap, 0.0):.6g} away (needs >= {clearance:.6g})"
+    return None
+
+
+def _optional_number(feature, key):
+    """``feature[key]`` as a float, or None when it is missing or NaN."""
+    value = feature.get(key)
+    if value is None or pd.isna(value):
+        return None
+    return float(value)
+
+
+def _size_ramps(feature) -> list[tuple[float, float, float | None]]:
+    """Linear models ``(size0, plateau, gradient)`` of the size fields a feature sets.
+
+    The size is ``size0`` up to ``plateau`` from the feature and grows at
+    ``gradient`` beyond it (None: unknown, as the growth needs
+    ``background_lc``). Mirrors the engine's ``_feature_fields``: the default
+    GeometricGrowthField, the legacy dist_min/dist_max ThresholdField, and
+    explicit GeometricGrowthField/ThresholdField entries. Other explicit fields
+    and the deprecated border grading are not modelled; the engine's
+    post-mesh ring check covers them.
+    """
+    lc = positive_number(feature.get('lc'))
+    fields = feature.get('fields')
+    explicit = [f for f in fields if isinstance(f, MeshField)] if isinstance(fields, (list, tuple)) else []
+    ramps = []
+    dist_min = _optional_number(feature, 'dist_min')
+    if lc is not None and (dist_min is not None or _optional_number(feature, 'dist_max') is not None):
+        plateau = max(dist_min if dist_min is not None else lc, 0.5 * lc)
+        ramps.append((lc, plateau, None))
+    elif lc is not None and not explicit:
+        growth_factor = _optional_number(feature, 'growth_factor') or DEFAULT_GROWTH_FACTOR
+        ramps.append((lc, 0.0, growth_factor - 1.0))
+    for field in explicit:
+        if isinstance(field, GeometricGrowthField) and lc is not None:
+            ramps.append((lc, 0.0, field.gradient))
+        elif isinstance(field, ThresholdField):
+            span = field.dist_max - field.dist_min
+            gradient = None
+            if field.size_max is not None and span > 0:
+                gradient = (field.size_max - field.size_min) / span
+            ramps.append((field.size_min, field.dist_min, gradient))
+    return ramps
+
+
+def _ramp_size(ramp, distance: float) -> float:
+    """Target size a ``(size0, plateau, gradient)`` ramp sets at ``distance``; inf if unknown."""
+    size0, plateau, gradient = ramp
+    if distance <= plateau:
+        return size0
+    if gradient is None:
+        return math.inf
+    return size0 + gradient * (distance - plateau)
+
+
+def _hex_ring_size_conflict(ring, lc: float, sources) -> str | None:
+    """Why the target mesh size inside a hex ring would be too fine to keep it, or None.
+
+    ``ring`` is the hexagon through the ring seeds; ``sources`` holds
+    ``(label, geometry, half_width, ramps)``. Each source's size is
+    estimated at its nearest approach to the hexagon and must stay at or
+    above ``HEX_RING_MIN_SIZE_RATIO * lc``, or Gmsh splits the ring edges.
+    """
+    min_size = HEX_RING_MIN_SIZE_RATIO * lc
+    for label, geometry, half_width, ramps in sources:
+        if not ramps:
+            continue
+        distance = max(geometry.distance(ring) - half_width, 0.0)
+        size = min(_ramp_size(ramp, distance) for ramp in ramps)
+        if size < min_size:
+            return (
+                f"{label} sets a mesh size of ~{size:.6g} at the ring "
+                f"(needs >= {min_size:.6g})"
+            )
     return None
 
 
@@ -544,7 +634,15 @@ class ConceptualMesh:
                 after snapping and clipping in ``generate()``, and dropped with a
                 warning when another embedded feature (polygon boundary, line or
                 its buffer band, other point) lies closer than
-                ``HEX_RING_CLEARANCE * resolution`` to the point.
+                ``HEX_RING_CLEARANCE * resolution`` to the point, when a size field
+                is estimated finer than ``HEX_RING_MIN_SIZE_RATIO * resolution``
+                inside the ring (e.g. an enclosing zone with a finer resolution, or
+                a nearby fine line), or when ``simplify_tolerance`` merges the point
+                into another. Size fields the estimate cannot model (explicit fields
+                other than GeometricGrowthField/ThresholdField, or a background_lc
+                below the ring radius) are caught after meshing: ``MeshGenerator``
+                warns when a ring was split and records the outcome per point in
+                ``diagnostics['hex_rings']``.
         """
         if not isinstance(hex_ring, (bool, np.bool_)):
             raise ValueError(f"hex_ring must be True or False. Got {hex_ring!r}.")
@@ -878,11 +976,38 @@ class ConceptualMesh:
             ))
         return obstacles
 
-    def _assign_hex_ring_seeds(self):
+    def _hex_ring_size_sources(self, field_only_polys):
+        """Polygons and lines as ``(label, geometry, half_width, ramps)`` size sources.
+
+        Unlike the clearance obstacles, field-only features count: they
+        create no nodes but their size fields still reach the ring. The
+        engine scopes a polygon's interior Constant field to its surface
+        entity, which holds mesh nodes only for embedded polygons, so an
+        embedded polygon is sized at its resolution throughout (measured as
+        an area) while a field-only polygon only grows from its boundary.
+        """
+        sources = [
+            (f"polygon {poly['zone_id']!r}", poly['geometry'], _meshed_half_width(poly), _size_ramps(poly))
+            for _, poly in self.clean_polygons.iterrows()
+        ]
+        sources.extend(
+            (f"polygon {poly['zone_id']!r}", poly['geometry'].boundary, 0.0, _size_ramps(poly))
+            for poly in field_only_polys
+        )
+        sources.extend(
+            (f"line {line['line_id']!r}", line['geometry'], _meshed_half_width(line), _size_ramps(line))
+            for line in self.raw_lines
+        )
+        return sources
+
+    def _assign_hex_ring_seeds(self, field_only_polys=()):
         """Set each working point's ``ring_seeds``: its six ring seeds, or None when off or conflicting.
 
-        Other embedded points are obstacles too; one with its own hex ring
-        also claims the ring radius around it.
+        A ring is dropped when another embedded feature is too close (see
+        ``_hex_ring_conflict``) or when any feature's size field is too fine
+        inside the ring (see ``_hex_ring_size_conflict``). Other embedded
+        points are obstacles too; one with its own hex ring also claims the
+        ring radius around it.
         """
         requested = [i for i, p in enumerate(self.raw_points) if p.get('hex_ring', False)]
         for point_data in self.raw_points:
@@ -891,6 +1016,7 @@ class ConceptualMesh:
             return
 
         feature_obstacles = self._hex_ring_obstacles()
+        feature_sources = self._hex_ring_size_sources(field_only_polys)
         point_obstacles = [
             (
                 f"point {p['point_id']!r}",
@@ -900,11 +1026,20 @@ class ConceptualMesh:
             if bool(p.get('embed', True)) else None
             for p in self.raw_points
         ]
+        point_sources = [
+            (f"point {p['point_id']!r}", p['geometry'], 0.0, _size_ramps(p)) for p in self.raw_points
+        ]
         for i in requested:
             point_data = self.raw_points[i]
             lc = float(point_data['lc'])
+            seeds = _hex_ring_seeds(point_data['geometry'], lc)
             others = [ob for j, ob in enumerate(point_obstacles) if j != i and ob is not None]
+            other_sources = [src for j, src in enumerate(point_sources) if j != i]
             reason = _hex_ring_conflict(point_data['geometry'], lc, feature_obstacles + others)
+            if reason is None:
+                reason = _hex_ring_size_conflict(
+                    Polygon(seeds), lc, feature_sources + other_sources
+                )
             if reason is not None:
                 warnings.warn(
                     f"Point {point_data['point_id']!r}: {reason}; hex_ring ignored.",
@@ -912,7 +1047,7 @@ class ConceptualMesh:
                     stacklevel=4,
                 )
                 continue
-            point_data['ring_seeds'] = _hex_ring_seeds(point_data['geometry'], lc)
+            point_data['ring_seeds'] = seeds
 
     def generate(self, connectivity_tolerance=None):
         """
@@ -962,7 +1097,7 @@ class ConceptualMesh:
         self._clip_features_to_domain()
 
         # After snapping and clipping, so each ring is built about the final point.
-        self._assign_hex_ring_seeds()
+        self._assign_hex_ring_seeds(field_only_polys)
         
         # Promote the processed raw geometries to final "clean" GeoDataFrames.
         if self.raw_lines:
