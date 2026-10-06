@@ -13,6 +13,9 @@ from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union, split
 from shapely.validation import make_valid
 
+from . import _lloyd
+from ._features import polygon_parts
+
 logger = logging.getLogger(__name__)
 
 # Split pieces smaller than this fraction of the cell area are treated as
@@ -436,6 +439,43 @@ def _explode_with_unique_ids(grid_gdf):
     return exploded
 
 
+def _zone_pieces(polygons, footprints):
+    """Polygon parts of ``polygons`` (zones) with the quad-buffer ``footprints`` (or None) cut out."""
+    pieces = []
+    for geom in polygons:
+        if geom is None or geom.is_empty:
+            continue
+        if footprints is not None and geom.intersects(footprints):
+            geom = make_valid(geom.difference(footprints))
+        pieces.extend(polygon_parts(geom))
+    return [piece for piece in pieces if piece.area > 0]
+
+
+def _owner_polygons(nodes, free, pieces):
+    """Owner polygon of each free node (the zone piece containing it) and the free mask of nodes that have one.
+
+    Returns (owners (len(nodes),) object array, None for fixed nodes; free).
+    A free node in no piece (or on a piece boundary) is made fixed.
+    """
+    owners = np.full(len(nodes), None, dtype=object)
+    free = np.asarray(free, dtype=bool).copy()
+    free_idx = np.flatnonzero(free)
+    if len(free_idx) == 0 or not pieces:
+        free[:] = False
+        return owners, free
+    piece_array = np.empty(len(pieces), dtype=object)
+    piece_array[:] = pieces
+    point_pos, piece_pos = shapely.STRtree(piece_array).query(
+        shapely.points(nodes[free_idx]), predicate='within'
+    )
+    # Clean polygons do not overlap; keep the first piece should two touch.
+    point_pos, first = np.unique(point_pos, return_index=True)
+    owners[free_idx[point_pos]] = piece_array[piece_pos[first]]
+    free[free_idx] = False
+    free[free_idx[point_pos]] = True
+    return owners, free
+
+
 class VoronoiTessellator:
     def __init__(
         self,
@@ -446,6 +486,9 @@ class VoronoiTessellator:
         boundary_inset_fraction=0.25,
         boundary_corner_angle=135.0,
         boundary_tolerance=None,
+        lloyd_iterations=0,
+        lloyd_damping=1.0,
+        lloyd_tolerance=1e-3,
     ):
         """
         Initializes the Voronoi tessellator.
@@ -481,6 +524,39 @@ class VoronoiTessellator:
                 below this value are treated as sharp corners and left unchanged.
             boundary_tolerance (float, optional): Distance tolerance used to
                 classify generator nodes as boundary nodes.
+            lloyd_iterations (int): Number of Lloyd relaxation passes over the
+                generators before the Voronoi grid is built (0, the default,
+                turns it off). Each pass moves every free generator towards
+                the centroid of its Voronoi cell, so generators end up near
+                their cell centroids (lower ``drift_ratio`` in
+                ``vorflow.utils.calculate_mesh_quality``). The centroids are
+                weighted by the density h**-4, where h is the local mesh size
+                interpolated from ``MeshGenerator.node_sizes``; this keeps the
+                mesh grading (the cell sizes around refined features) instead
+                of evening out the cell sizes. Only free nodes move: mesh
+                nodes inside the embedded polygon surfaces. Nodes on the domain
+                and zone boundaries, embedded points (and their hex-ring
+                seeds), embedded and barrier lines (including straddle pairs)
+                and the quad-buffer strips and bands stay fixed. A move is
+                rejected if it would leave the node's zone or cross an embedded
+                line. With Lloyd on, the cells are no longer the exact dual of
+                the triangle mesh (``MeshGenerator.get_element_grid()``) and
+                the grid gets a ``lloyd_shift`` column; ``lloyd_report`` holds
+                the run summary: passes run (``iterations``), the last pass's
+                largest relative residual (``max_rel_shift``, as for
+                ``lloyd_tolerance``), moves rejected (``rejected``) and the
+                number of free generators (``n_free``). Each pass costs about one Voronoi diagram of
+                all nodes plus the weighted centroids of the free cells; 20
+                passes take about as long as meshing and tessellating once.
+                Requires a mesh generator that ran ``MeshGenerator.generate()``
+                before this tessellator was constructed.
+            lloyd_damping (float): Fraction of the way each free generator
+                moves towards its centroid per pass, in (0, 1]. Default 1.0.
+            lloyd_tolerance (float): Stop early after a pass in which the
+                largest distance from an accepted free generator to its
+                weighted centroid, relative to the local mesh size, is below
+                this (independent of ``lloyd_damping``). Default 1e-3.
+                Graded meshes usually run all ``lloyd_iterations`` passes.
         """
         if boundary_centering not in {"clip", "inset_mirror"}:
             raise ValueError("boundary_centering must be either 'clip' or 'inset_mirror'.")
@@ -490,6 +566,7 @@ class VoronoiTessellator:
             raise ValueError("boundary_corner_angle must be between 0 and 180 degrees.")
         if boundary_tolerance is not None and boundary_tolerance < 0:
             raise ValueError("boundary_tolerance must be non-negative when provided.")
+        _lloyd.validate_settings(lloyd_iterations, lloyd_damping, lloyd_tolerance, prefix="lloyd_")
 
         self.mg = mesh_generator
         self.cm = conceptual_mesh
@@ -498,12 +575,80 @@ class VoronoiTessellator:
         self.n_barrier_mirrors = 0
         self.nodes = mesh_generator.nodes
         self.node_tags = mesh_generator.node_tags
+        # Lloyd inputs, captured with the nodes so they stay paired with them;
+        # None on mesh generators that do not provide them.
+        self.node_is_free = getattr(mesh_generator, 'node_is_free', None)
+        self.node_sizes = getattr(mesh_generator, 'node_sizes', None)
+        self.buffer_footprints = getattr(mesh_generator, 'buffer_footprints', None)
         self.zones_gdf = mesh_generator.zones_gdf
         self.clip_to_boundary = clip_to_boundary
         self.boundary_centering = boundary_centering
         self.boundary_inset_fraction = float(boundary_inset_fraction)
         self.boundary_corner_angle = float(boundary_corner_angle)
         self.boundary_tolerance = boundary_tolerance
+        self.lloyd_iterations = int(lloyd_iterations)
+        self.lloyd_damping = float(lloyd_damping)
+        self.lloyd_tolerance = float(lloyd_tolerance)
+        # {"iterations", "max_rel_shift", "rejected", "n_free"} after a Lloyd
+        # run; max_rel_shift is the largest residual |centroid - node| / local
+        # size over the accepted moves of the last pass (see _lloyd.relax).
+        self.lloyd_report = None
+
+    def _lloyd_mesh_inputs(self, n_nodes):
+        """(node_is_free, node_sizes, buffer_footprints) captured from the mesh generator, checked against ``n_nodes``."""
+        node_is_free, node_sizes = self.node_is_free, self.node_sizes
+        if node_is_free is None or node_sizes is None:
+            raise ValueError(
+                "lloyd_iterations > 0 needs MeshGenerator.node_is_free and node_sizes; "
+                "run MeshGenerator.generate() before tessellating."
+            )
+        node_is_free = np.asarray(node_is_free, dtype=bool)
+        node_sizes = np.asarray(node_sizes, dtype=float)
+        if node_is_free.shape != (n_nodes,) or node_sizes.shape != (n_nodes,):
+            raise ValueError(
+                "MeshGenerator.node_is_free and node_sizes must be aligned with its nodes "
+                f"({n_nodes}); got {node_is_free.shape} and {node_sizes.shape}. "
+                "Re-run MeshGenerator.generate() before tessellating."
+            )
+        return node_is_free, node_sizes, self.buffer_footprints
+
+    def _lloyd_constraint_lines(self):
+        """Union of the embedded clean lines (barriers and straddle lines included), or None."""
+        lines = self.cm.clean_lines
+        if lines is None or lines.empty:
+            return None
+        if 'embed' in lines.columns:
+            # Missing embed values default to embedded, matching MeshGenerator.
+            embedded = lines['embed'].map(lambda value: True if pd.isna(value) else bool(value))
+            lines = lines[embedded.astype(bool)]
+        geoms = [geom for geom in lines.geometry if geom is not None and not geom.is_empty]
+        return unary_union(geoms) if geoms else None
+
+    def _relax_generators(self, nodes):
+        """Density-weighted Lloyd relaxation of the free mesh nodes (see ``lloyd_iterations``); returns the moved nodes."""
+        node_is_free, node_sizes, footprints = self._lloyd_mesh_inputs(len(nodes))
+        pieces = _zone_pieces(self._embedded_polygons().geometry, footprints)
+        owners, free = _owner_polygons(nodes, node_is_free, pieces)
+        report = {"iterations": 0, "max_rel_shift": 0.0, "rejected": 0}
+        if free.any():
+            logger.info(f"Lloyd relaxation of {int(free.sum())} free generators...")
+            nodes, report = _lloyd.relax(
+                nodes,
+                free,
+                _lloyd.size_interpolator(nodes, node_sizes),
+                self._domain_geometry(),
+                owners,
+                self._lloyd_constraint_lines(),
+                self.lloyd_iterations,
+                damping=self.lloyd_damping,
+                tolerance=self.lloyd_tolerance,
+            )
+            logger.info(
+                f"  -> {report['iterations']} passes, last max residual |centroid - node| "
+                f"{report['max_rel_shift']:.2e} x local size, {report['rejected']} moves rejected"
+            )
+        self.lloyd_report = {**report, "n_free": int(free.sum())}
+        return nodes
 
     def _embedded_polygons(self):
         """Return the clean polygons that define the domain and zones (embed=True)."""
@@ -926,15 +1071,22 @@ class VoronoiTessellator:
         Executes the full Voronoi tessellation workflow.
 
         This method orchestrates the process of:
-        1. Adding "ghost" nodes to create a bounded Voronoi diagram.
-        2. Computing the raw Voronoi polygons, adding a mirror generator
+        1. With ``lloyd_iterations > 0``, moving the free generators towards
+           their density-weighted cell centroids (Lloyd relaxation).
+        2. With ``boundary_centering="inset_mirror"``, shifting boundary
+           generators inward and adding their mirrored outside ghosts.
+        3. Adding "ghost" nodes to create a bounded Voronoi diagram.
+        4. Computing the raw Voronoi polygons, adding a mirror generator
            across each barrier for every node whose cell straddles it.
-        3. Clipping the grid to the model domain.
-        4. Assigning zone IDs to cells based on their generator point location.
-        5. Enforcing barrier lines by splitting cells that still straddle them.
-        6. Merging cell vertices a roundoff distance apart, so no cell has
+        5. Clipping the grid to the model domain.
+        6. Assigning zone IDs to cells based on their generator point location.
+        7. Enforcing barrier lines by splitting cells that still straddle them.
+        8. Merging cell vertices a roundoff distance apart, so no cell has
            a zero-length edge.
-        7. Calculating final cell properties.
+        9. Calculating final cell properties. After Lloyd relaxation this
+           includes ``lloyd_shift``: how far each mesh node moved (0 for fixed
+           nodes; NaN for cells without a mesh node of their own: barrier
+           mirrors, barrier fragments and detached cell parts).
 
         Returns:
             gpd.GeoDataFrame: The final, clean Voronoi grid.
@@ -953,6 +1105,13 @@ class VoronoiTessellator:
         tags = np.asarray(tags)
         if len(tags) != len(nodes):
             raise ValueError("MeshGenerator nodes and node_tags must have the same length.")
+
+        self.lloyd_report = None
+        lloyd_shift = None
+        if self.lloyd_iterations > 0:
+            relaxed = self._relax_generators(nodes)
+            lloyd_shift = pd.Series(np.hypot(*(relaxed - nodes).T), index=tags)
+            nodes = relaxed
 
         nodes, tags, boundary_ghost_nodes, node_metadata = self._prepare_boundary_centered_nodes(nodes, tags)
         
@@ -1066,6 +1225,9 @@ class VoronoiTessellator:
         # Final cleanup after potential splits.
         self.final_grid = _explode_with_unique_ids(self.final_grid)
         self.final_grid = _merge_close_vertices(self.final_grid)
+        if lloyd_shift is not None:
+            # Cells with a node_id that is no mesh node get NaN.
+            self.final_grid['lloyd_shift'] = self.final_grid['node_id'].map(lloyd_shift)
 
         # The 'x' and 'y' columns should always refer to the generator point
         # coordinates, which are essential for quality analysis. We add separate

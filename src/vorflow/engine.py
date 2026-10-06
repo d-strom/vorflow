@@ -59,6 +59,7 @@ from ._features import (
     is_embedded,
     polygon_parts,
     positive_number,
+    ring_seed_coords,
     row_bool,
     sanitize_coords,
     unpinch_polygons,
@@ -268,6 +269,67 @@ def _embedded_constraint_entities(gmsh_map, clean_points, clean_lines):
                         yield 0, int(dimtag[1])
 
 
+def _free_node_tags(gmsh_map, polygons_gdf):
+    """Tags of the mesh nodes inside embedded polygon surfaces, off every curve and point.
+
+    gmsh classifies a node on the lowest-dimension entity it lies on, so
+    getNodes(2, s, includeBoundary=False) leaves out the nodes of the
+    surface's boundary and of the points and curves embedded in it (hex-ring
+    seeds, line nodes, straddle pairs). Quad-buffer surfaces (strips and
+    bands) are left out entirely.
+    """
+    if polygons_gdf is None or polygons_gdf.empty:
+        return set()
+    structured = {
+        int(tag)
+        for dimtags in gmsh_map.get('structured_buffer_surfs', {}).values()
+        for tag in _dimtag_tags(dimtags)
+    }
+    free = set()
+    for surf_tag in sorted(_domain_surface_tags(gmsh_map, polygons_gdf) - structured):
+        node_tags, _, _ = gmsh.model.mesh.getNodes(2, int(surf_tag), includeBoundary=False)
+        free.update(int(t) for t in node_tags)
+    return free
+
+
+def _node_sizes_from_elements(element_data, node_tags, fallback):
+    """Mean length of the unique element edges at each of ``node_tags``; ``fallback`` where a node has none.
+
+    ``element_data`` is the dict from ``MeshGenerator._capture_element_data``
+    (primary-node connectivity per element block, all node tags and xy).
+    """
+    node_tags = np.asarray(node_tags, dtype=np.int64)
+    sizes = np.full(len(node_tags), float(fallback))
+    blocks = [np.asarray(block["connectivity"], dtype=np.int64) for block in element_data["blocks"]]
+    if not blocks or len(node_tags) == 0:
+        return sizes
+    # Each element's edges join consecutive corners (closing back to the first).
+    edges = np.concatenate([
+        np.stack([conn, np.roll(conn, -1, axis=1)], axis=-1).reshape(-1, 2) for conn in blocks
+    ])
+    edges = np.unique(np.sort(edges, axis=1), axis=0)
+
+    known_tags, first = np.unique(np.asarray(element_data["node_tags"], dtype=np.int64), return_index=True)
+    known_xy = np.asarray(element_data["node_xy"], dtype=float)[first]
+    position = np.searchsorted(known_tags, edges)
+    position = np.minimum(position, len(known_tags) - 1)
+    resolved = (known_tags[position] == edges).all(axis=1)
+    edges, position = edges[resolved], position[resolved]
+    if len(edges) == 0:
+        return sizes
+    length = np.hypot(*(known_xy[position[:, 0]] - known_xy[position[:, 1]]).T)
+
+    end_tags, inverse = np.unique(edges.ravel(), return_inverse=True)
+    total = np.bincount(inverse, weights=np.repeat(length, 2), minlength=len(end_tags))
+    count = np.bincount(inverse, minlength=len(end_tags))
+    mean = total / np.maximum(count, 1)
+
+    at = np.minimum(np.searchsorted(end_tags, node_tags), len(end_tags) - 1)
+    has_edges = (end_tags[at] == node_tags) & (mean[at] > 0)
+    sizes[has_edges] = mean[at[has_edges]]
+    return sizes
+
+
 # gmsh_map key for each fragment-input kind recorded in _GeometryInventory.
 _MAP_KEY_BY_KIND = {
     'point': 'points',
@@ -459,10 +521,16 @@ def _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
     return list(groups.values())
 
 
-def _field_target_tags(gmsh_map, feature_ids, field_only_polygon_ids):
-    """Gmsh tags a field group targets, as the tags_dict MeshField.create expects."""
+def _field_target_tags(gmsh_map, feature_ids, field_only_polygons):
+    """Gmsh tags a field group targets, as the tags_dict MeshField.create expects.
+
+    ``field_only_polygons`` maps field-only polygon ids to their geometry.
+    Their surfaces are not part of the domain mesh, so fields locate their
+    interiors from these geometries ('field_only_polygons') instead.
+    """
     tags = {'points': [], 'lines': [], 'surfaces': [],
-            'embedded_surfaces': [], 'field_only_surfaces': []}
+            'embedded_surfaces': [], 'field_only_surfaces': [],
+            'field_only_polygons': []}
     buffer_surfs = gmsh_map.get('structured_buffer_surfs', {})
 
     for fid in feature_ids['points']:
@@ -491,8 +559,11 @@ def _field_target_tags(gmsh_map, feature_ids, field_only_polygon_ids):
             if ('poly', fid) in buffer_surfs:
                 surface_tags = surface_tags + _dimtag_tags(buffer_surfs[('poly', fid)])
             tags['surfaces'].extend(surface_tags)
-            kind = 'field_only_surfaces' if fid in field_only_polygon_ids else 'embedded_surfaces'
-            tags[kind].extend(surface_tags)
+            if fid in field_only_polygons:
+                tags['field_only_surfaces'].extend(surface_tags)
+                tags['field_only_polygons'].append(field_only_polygons[fid])
+            else:
+                tags['embedded_surfaces'].extend(surface_tags)
         elif fid in gmsh_map.get('poly_curves', {}):
             # Field-only polygons without a surface: size from their boundary curves.
             tags['lines'].extend(_dimtag_tags(gmsh_map['poly_curves'][fid]))
@@ -653,6 +724,36 @@ def _endpoint_surfaces(curve_tag):
     return surfaces
 
 
+def _point_entity_nodes(dimtags):
+    """Mesh node tag -> (x, y) of the dim-0 entities in a point feature's map entry."""
+    nodes = {}
+    for dimtag in dimtags:
+        if int(dimtag[0]) != 0:
+            continue
+        node_tags, coords, _ = gmsh.model.mesh.getNodes(0, int(dimtag[1]))
+        for tag, xy in zip(node_tags, np.asarray(coords, dtype=float).reshape(-1, 3)):
+            nodes[int(tag)] = (float(xy[0]), float(xy[1]))
+    return nodes
+
+
+def _hex_ring_intact(dimtags, centre, element_nodes):
+    """True when the meshed ring around ``centre`` is the fan of 6 triangles onto its 6 seeds.
+
+    ``dimtags`` is the point feature's gmsh_map entry (centre plus seeds);
+    ``element_nodes`` holds one (n_elements, n_nodes) tag array per 2D element type.
+    """
+    nodes = _point_entity_nodes(dimtags)
+    if len(nodes) != 7:
+        return False
+    centre_tag = min(nodes, key=lambda t: math.dist(nodes[t], (centre.x, centre.y)))
+    incident = [block[(block == centre_tag).any(axis=1)] for block in element_nodes]
+    incident = [block for block in incident if len(block)]
+    if len(incident) != 1 or incident[0].shape != (6, 3):
+        return False
+    neighbours = {int(t) for t in incident[0].ravel()} - {centre_tag}
+    return neighbours == set(nodes) - {centre_tag}
+
+
 def _entities_to_embed(gmsh_map, points_gdf, lines_gdf):
     """(dim, tag) of every embedded point, line and barrier straddle point, in embedding order."""
     entities = []
@@ -694,10 +795,14 @@ class MeshGenerator:
                 with ``vorflow.set_verbosity()``.
             mesh_algorithm (int): The 2D mesh algorithm to use. Common choices are
                 5 (Delaunay) for speed or 6 (Frontal-Delaunay) for quality.
-            smoothing_steps (int): Number of internal Lloyd smoothing iterations
-                performed by Gmsh during mesh generation.
-            optimization_cycles (int): Number of explicit optimization passes
-                (e.g., Relocate2D, Laplace2D) to run after the initial mesh is generated.
+            smoothing_steps (int): Gmsh ``Mesh.Smoothing``: the number of Laplacian
+                smoothing passes over the triangle-mesh nodes during mesh generation.
+            optimization_cycles (int): Number of extra gmsh ``Relocate2D`` +
+                ``Laplace2D`` passes over the triangles after the initial mesh is
+                generated. Both options improve triangle shape; neither centres the
+                Voronoi generators within their cells. For Lloyd (centroidal
+                Voronoi) relaxation of the generators, use
+                ``VoronoiTessellator(lloyd_iterations=...)``.
             tolerance_initial_delaunay (float): Tolerance for the initial Delaunay
                 point insertion. Increase this (e.g. 1e-4, 1e-2) to handle
                 "Could not insert point" errors caused by near-degenerate geometry
@@ -739,6 +844,14 @@ class MeshGenerator:
         self.triangular_quality = None
         self.element_grid = None
         self._element_data = None
+        # Inputs to VoronoiTessellator(lloyd_iterations=...), set by generate():
+        # node_is_free / node_sizes are aligned with self.nodes (True for
+        # nodes inside embedded polygon surfaces, off every curve and point;
+        # mean incident mesh-edge length), buffer_footprints is the union of
+        # the quad-buffer strip and band footprints (None without any).
+        self.node_is_free = None
+        self.node_sizes = None
+        self.buffer_footprints = None
         self.diagnostics = {}
 
     def _validate_background_lc(self):
@@ -1276,13 +1389,17 @@ class MeshGenerator:
 
     def _add_geometry(self, polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=False):
         """Transfer the clean features into the OCC model and fragment them; returns gmsh_map."""
-        gmsh_map, _ = self._build_occ_model(
+        gmsh_map, _, _ = self._build_occ_model(
             polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=launch_gmsh_gui
         )
         return gmsh_map
 
     def _build_occ_model(self, polygons_gdf, lines_gdf, points_gdf, launch_gmsh_gui=False):
-        """Build and fragment the OCC model; returns (gmsh_map, quad-buffer crossings for _setup_fields)."""
+        """Build and fragment the OCC model.
+
+        Returns (gmsh_map, quad-buffer crossings for _setup_fields, union of
+        the quad-buffer strip and band footprints or None).
+        """
         inventory = _GeometryInventory()
         domain = buffer.domain_union_geometry(polygons_gdf)
 
@@ -1302,7 +1419,7 @@ class MeshGenerator:
         line_strips = self._add_line_features(
             lines_gdf, inventory, plans, corridors, barrier_zone, domain, straddle_plan
         )
-        self._add_polygon_features(
+        footprints = self._add_polygon_features(
             polygons_gdf, inventory, plans, corridors, domain, line_strips
         )
 
@@ -1316,7 +1433,7 @@ class MeshGenerator:
         object_tags = inventory.object_tags()
         if not object_tags:
             logger.warning("Warning: No geometry to mesh.")
-            return inventory.feature_map(), crossings
+            return inventory.feature_map(), crossings, footprints
 
         # "Fragment" combines all the individual geometries into a single,
         # topologically consistent model. Only embedded geometry takes part.
@@ -1333,15 +1450,22 @@ class MeshGenerator:
         self._log_final_map_diagnostics(final_map)
         self._recover_orphan_surfaces(final_map, polygons_gdf)
         self._apply_structured_buffer_meshing(final_map, inventory.structured_buffer_specs)
-        return final_map, crossings
+        return final_map, crossings, footprints
 
     def _add_point_features(self, points_gdf, inventory):
-        """Add one OCC point per point feature."""
+        """Add one OCC point per point feature, plus its hex-ring seeds when it has them.
+
+        Ring seeds are recorded under the point's own feature id, so
+        embedding, node collection and size fields treat them like the point.
+        """
         for idx, row in points_gdf.iterrows():
             tag = gmsh.model.occ.addPoint(row.geometry.x, row.geometry.y, 0)
             key = _to_key(0, tag)
             if is_embedded(row):
                 inventory.record_embedded(key, 'point', idx)
+                for x, y in ring_seed_coords(row):
+                    seed_key = _to_key(0, gmsh.model.occ.addPoint(x, y, 0))
+                    inventory.record_embedded(seed_key, 'point', idx)
             else:
                 inventory.nonembedded_point_tags.setdefault(int(idx), []).append(key)
 
@@ -1531,15 +1655,16 @@ class MeshGenerator:
             logger.warning(f"Warning: No valid line segments were created for feature {idx}.")
 
     def _add_polygon_features(self, polygons_gdf, inventory, plans, corridors, domain, line_strips):
-        """Add quad-buffer bands, then every polygon minus the buffer footprints."""
+        """Add quad-buffer bands, then every polygon minus the buffer footprints; returns their union or None."""
         if polygons_gdf.empty:
-            return
+            return None
         logger.info(f"Adding {len(polygons_gdf)} polygons to Gmsh...")
         band_geoms = self._add_polygon_quad_buffers(polygons_gdf, inventory, plans, corridors, domain)
         footprints = band_geoms + line_strips
         footprints_union = make_valid(unary_union(footprints)) if footprints else None
         for idx, row in polygons_gdf.iterrows():
             self._add_polygon_feature(idx, row, footprints_union, inventory)
+        return footprints_union
 
     def _add_polygon_quad_buffers(self, polygons_gdf, inventory, plans, corridors, domain):
         """Create the band surfaces of embedded quad-buffered polygons; returns the band footprints.
@@ -2337,13 +2462,13 @@ class MeshGenerator:
         self._log_field_setup_diagnostics(gmsh_map, polygons_gdf)
         self._validate_background_lc()
         background_lc = float(self.background_lc)
-        field_only_polygon_ids = {
-            int(idx) for idx, row in polygons_gdf.iterrows() if not is_embedded(row)
+        field_only_polygons = {
+            int(idx): row.geometry for idx, row in polygons_gdf.iterrows() if not is_embedded(row)
         }
 
         field_ids = []
         for group in _group_feature_fields(points_gdf, lines_gdf, polygons_gdf, background_lc):
-            tags_dict = _field_target_tags(gmsh_map, group.feature_ids, field_only_polygon_ids)
+            tags_dict = _field_target_tags(gmsh_map, group.feature_ids, field_only_polygons)
             if not any(tags_dict.values()):
                 continue
             # Private metadata for built-in field helpers; custom MeshField
@@ -2593,7 +2718,9 @@ class MeshGenerator:
         3. Sets up mesh size fields.
         4. Generates the 2D triangular mesh.
         5. Performs optional post-generation optimization.
-        6. Extracts the resulting nodes and their tags.
+        6. Extracts the resulting nodes and their tags, plus the per-node
+           ``node_is_free`` and ``node_sizes`` and the ``buffer_footprints``
+           that ``VoronoiTessellator(lloyd_iterations=...)`` relies on.
 
         Args:
             clean_polys (GeoDataFrame): Non-overlapping polygons.
@@ -2621,10 +2748,13 @@ class MeshGenerator:
         self.triangular_quality = None
         self.element_grid = None
         self._element_data = None
+        self.node_is_free = None
+        self.node_sizes = None
+        self.buffer_footprints = None
         self._initialize_gmsh()
         try:
             logger.info("Transferring Geometry to Gmsh...")
-            gmsh_map, crossings = self._build_occ_model(
+            gmsh_map, crossings, self.buffer_footprints = self._build_occ_model(
                 clean_polys, clean_lines, clean_points, launch_gmsh_gui=launch_gmsh_gui
             )
 
@@ -2636,6 +2766,7 @@ class MeshGenerator:
             self._setup_fields(gmsh_map, clean_polys, clean_lines, clean_points, crossings=crossings)
 
             self._mesh_2d()
+            self._check_hex_rings(gmsh_map, clean_points)
 
             meshed_surface_tags = self._meshed_surface_tags(gmsh_map, clean_polys)
             self.triangular_quality = self._collect_triangular_quality(meshed_surface_tags)
@@ -2646,6 +2777,12 @@ class MeshGenerator:
 
             self.nodes, self.node_tags = self._collect_domain_nodes(
                 gmsh_map, meshed_surface_tags, clean_points, clean_lines
+            )
+            free_tags = _free_node_tags(gmsh_map, clean_polys)
+            self.node_is_free = np.isin(np.asarray(self.node_tags, dtype=np.int64),
+                                        np.fromiter(free_tags, dtype=np.int64, count=len(free_tags)))
+            self.node_sizes = _node_sizes_from_elements(
+                self._element_data, self.node_tags, self.background_lc
             )
             self.zones_gdf = clean_polys
             if launch_gmsh_gui:
@@ -2660,10 +2797,44 @@ class MeshGenerator:
             self._finalize_gmsh()
             raise
 
+    def _check_hex_rings(self, gmsh_map, points_gdf):
+        """Warn for each hex_ring point whose ring the mesher split; record the outcome in diagnostics.
+
+        The blueprint drops rings it can see a conflict for, but explicit
+        size fields it cannot model (or a background_lc below the ring
+        radius) can still make Gmsh insert nodes inside a ring.
+        """
+        rings = [(idx, row) for idx, row in points_gdf.iterrows()
+                 if is_embedded(row) and ring_seed_coords(row)]
+        self.diagnostics['hex_rings'] = {}
+        if not rings:
+            return
+        element_types, _, element_node_tags = gmsh.model.mesh.getElements(2)
+        element_nodes = [
+            np.asarray(tags, dtype=np.int64).reshape(
+                -1, gmsh.model.mesh.getElementProperties(etype)[3]
+            )
+            for etype, tags in zip(element_types, element_node_tags)
+        ]
+        for idx, row in rings:
+            point_id = row.get('point_id', idx)
+            intact = _hex_ring_intact(
+                gmsh_map.get('points', {}).get(int(idx), []), row.geometry, element_nodes
+            )
+            self.diagnostics['hex_rings'][point_id] = intact
+            if not intact:
+                warnings.warn(
+                    f"hex_ring of point {point_id!r} was broken by a size field finer than "
+                    f"its ring radius ({row.get('lc')}); its cell will not be a regular "
+                    "hexagon.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+
     def _mesh_2d(self):
         """Set the meshing options, generate the 2D mesh and run the optimization cycles."""
         gmsh.option.setNumber("Mesh.Algorithm", self.mesh_algorithm)
-        # Number of internal smoothing steps.
+        # Laplacian smoothing passes over the triangle-mesh nodes.
         gmsh.option.setNumber("Mesh.Smoothing", self.smoothing_steps)
         # Tolerance for the initial Delaunay insertion - helps with
         # "Could not insert point" from near-degenerate geometry.
@@ -2680,7 +2851,7 @@ class MeshGenerator:
                     logger.info(f"  -> Cycle {i+1}/{self.optimization_cycles}")
                 # Moves nodes to improve element shape (compactness).
                 gmsh.model.mesh.optimize("Relocate2D", niter=1)
-                # Smooths the mesh to relax gradients (reduces drift).
+                # Laplacian smoothing: moves each free node towards the mean of its neighbours.
                 gmsh.model.mesh.optimize("Laplace2D", niter=1)
 
     @staticmethod
