@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.11.0
+VORFLOW FOR QGIS 0.14.0
 ======================
 
 AUTHOR
@@ -30,7 +30,8 @@ MAIN WORKFLOW
 2. Add any point, line and polygon refinement layers.
 3. Configure global defaults and optional overrides for individual layers.
 4. Choose output products under "Output and quality".
-5. Click "Generate mesh".
+5. Click "Generate mesh". The progress bar shows the current phase and the
+   total timer measures the complete run from click to completion.
 6. If a Voronoi grid was generated, open "MODFLOW 6 / DISV" and click
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
@@ -112,3 +113,31 @@ By default, the plugin does not pass `smoothing_steps` to Vorflow. This preserve
 Vorflow's own default and avoids changing upstream behaviour. Enable
 "Override Vorflow default" to pass an explicit value, including 0 to disable
 smoothing for that run.
+
+
+Required Vorflow support for hex rings and weighted Lloyd
+----------------------------------------------------------
+The plugin interface exposes Rui's point-centring API:
+
+    blueprint.add_point(..., hex_ring=True)
+    VoronoiTessellator(..., lloyd_iterations=20)
+
+The algorithms themselves belong to the upstream ``vorflow`` package, not
+to this QGIS plugin. The plugin checks the installed API and stops with a
+clear error rather than silently ignoring an unsupported option.
+
+For testing Rui's feature branch in a fresh environment:
+
+    python -m venv vorflow-pr
+    vorflow-pr\Scripts\activate
+    pip install "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/point-centring"
+
+If QGIS uses a different Python interpreter, install the package into that
+exact interpreter/environment. Restart QGIS after installation.
+
+Progress reporting
+------------------
+The progress bar reports completed workflow phases. During Gmsh generation
+and weighted Lloyd relaxation it switches to an indeterminate busy state.
+The upstream API currently provides no per-element callback, so an honest
+internal percentage or safe Cancel button cannot be provided by the plugin.

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.14.0
+
+- Added a separate total elapsed-time display below the progress bar.
+- Timing starts immediately when **Generate mesh** is clicked.
+- The final duration remains visible after successful completion.
+- Failed runs also retain and report their elapsed duration.
+- The timer uses `time.perf_counter()` so the measured duration includes all
+  conceptual-model, Gmsh, Lloyd/Voronoi, quality, export and QGIS loading steps.
+
+
+## 0.13.0
+
+Corrected implementation based on the 0.11 plugin codebase.
+
+- Added an opt-in `hex_ring` control for point layers and passes
+  `hex_ring=True` to `ConceptualMesh.add_point`.
+- Added weighted Lloyd relaxation through
+  `VoronoiTessellator(..., lloyd_iterations=N)`.
+- Reports `mesher.diagnostics["hex_rings"]` and `tessellator.lloyd_report`
+  in the diagnostics panel when supplied by Vorflow.
+- Preserves Vorflow's `lloyd_shift` output column in exported Voronoi data.
+- Corrected the previous wording: Gmsh `smoothing_steps` is Laplacian
+  triangle smoothing and is not Lloyd relaxation.
+- Added a phase progress bar. Long Gmsh and Lloyd phases are shown as
+  indeterminate because the current upstream API does not expose granular
+  progress callbacks.
+- Fails clearly if the installed Vorflow does not expose the requested
+  `hex_ring` or `lloyd_iterations` APIs instead of silently ignoring them.
+
+
 ## 0.11.0
 
 - Changed Lloyd smoothing to use Vorflow's own default by default.

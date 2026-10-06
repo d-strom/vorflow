@@ -1,3 +1,28 @@
+# Version 0.14 integration note
+
+This package was rebuilt from the uploaded **0.11** codebase, not from the
+failed 0.12 implementation.
+
+The QGIS plugin does not reimplement Rui's algorithms. It exposes and checks
+the upstream APIs:
+
+```python
+blueprint.add_point(..., hex_ring=True)
+tess = VoronoiTessellator(
+    mesher, blueprint, lloyd_iterations=20
+)
+grid = tess.generate()
+```
+
+It also surfaces `mesher.diagnostics["hex_rings"]` and
+`tess.lloyd_report`. The exported GeoDataFrame is written without dropping
+columns, so upstream `lloyd_shift` is retained.
+
+The progress bar is phase-based and a separate timer measures total run time.
+Gmsh and tessellation are synchronous and
+do not expose granular callbacks; those phases therefore use an
+indeterminate state.
+
 # Question for Vorflow developers: where should Lloyd smoothing occur?
 
 The current `smoothing_steps` parameter is applied by `MeshGenerator`, before

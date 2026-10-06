@@ -12,14 +12,15 @@ import math
 import os
 import re
 import traceback
+import time
 
-from qgis.PyQt.QtCore import QDateTime
+from qgis.PyQt.QtCore import QDateTime, QTimer
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTabWidget,
+    QPushButton, QProgressBar, QScrollArea, QSpinBox, QStackedWidget, QTabWidget,
     QTextBrowser, QVBoxLayout, QWidget
 )
 from qgis.core import (
@@ -237,11 +238,23 @@ PARAMETER_HELP = {
         "robust default."
     ),
     "smoothing_steps": (
-        "Lloyd smoothing steps",
-        "Number of internal Lloyd smoothing iterations performed by Gmsh "
-        "during mesh generation. 0 disables Lloyd smoothing. This is a "
-        "global MeshGenerator setting and does not move constrained boundary "
-        "or embedded geometry nodes freely."
+        "Gmsh smoothing steps",
+        "Number of Laplacian smoothing steps applied to the triangular Gmsh "
+        "mesh. This can improve triangle shapes, but it is not Lloyd relaxation "
+        "and normally does not centre Voronoi cells on their generators."
+    ),
+    "hex_ring": (
+        "Hex ring around points",
+        "Passes hex_ring=True to Blueprint.add_point(). Vorflow places six fixed "
+        "nodes at the point resolution to create a regular hexagonal cell centred "
+        "on the point. Vorflow may drop the ring, with a warning, if another "
+        "feature is within twice the resolution or a finer size field reaches it."
+    ),
+    "lloyd_iterations": (
+        "Weighted Lloyd iterations",
+        "Moves free interior nodes towards size-weighted Voronoi-cell centroids "
+        "before the grid is built. Boundary, zone-edge, point and line nodes stay "
+        "fixed. A value around 20 is a useful starting point."
     ),
 }
 
@@ -304,6 +317,11 @@ class ParameterEditorWidget(QWidget):
             self._add_control(
                 basic_form, "zone_id", "Zone ID:",
                 self._lineedit(defaults.get("zone_id", "domain")),
+            )
+        if geometry_kind == "point":
+            self._add_control(
+                basic_form, "hex_ring", "Hex ring:",
+                self._checkbox(defaults.get("hex_ring", False)),
             )
         layout.addWidget(basic)
 
@@ -541,6 +559,8 @@ class ParameterEditorWidget(QWidget):
             parts.append("barrier")
         if values.get("quad_buffer"):
             parts.append(f"quad × {values.get('quad_buffer_thickness', 1)}")
+        if values.get("hex_ring"):
+            parts.append("hex ring")
         if values.get("field_model") not in (None, "standard"):
             parts.append(str(values["field_model"]))
         return ", ".join(parts) if parts else "Inherits all global values"
@@ -1067,6 +1087,10 @@ class VorflowDialog(QDialog):
         self.last_output_directory = None
         self.last_prefix = None
         self.diagnostic_lines = []
+        self.run_started = None
+        self.run_timer = QTimer(self)
+        self.run_timer.setInterval(250)
+        self.run_timer.timeout.connect(self.update_elapsed_timer)
 
         main = QVBoxLayout(self)
         top_row = QWidget()
@@ -1118,6 +1142,7 @@ class VorflowDialog(QDialog):
             {
                 "resolution": 10.0, "growth_factor": 1.2,
                 "embed": True, "simplify_tolerance": 0.0,
+                "hex_ring": False,
                 "field_model": "geometric", "growth_model": "edge_ratio",
                 "sampling": 25
             }
@@ -1183,8 +1208,8 @@ class VorflowDialog(QDialog):
         self.use_smoothing_override = QCheckBox("Override Vorflow default")
         self.use_smoothing_override.setChecked(False)
         self.use_smoothing_override.setToolTip(
-            "Leave unchecked to use Vorflow's own smoothing_steps default. "
-            "Enable to pass an explicit value to Vorflow."
+            "Leave unchecked to use Vorflow's own Gmsh smoothing_steps default. "
+            "This is Laplacian triangle smoothing, not Lloyd relaxation."
         )
         self.smoothing_steps = QSpinBox()
         self.smoothing_steps.setRange(0, 1000)
@@ -1198,8 +1223,8 @@ class VorflowDialog(QDialog):
         )
         mesh_form.addRow("Global background size:", self.background_lc)
         mesh_form.addRow("Log level:", self.verbosity)
-        mesh_form.addRow("Lloyd smoothing:", self.use_smoothing_override)
-        mesh_form.addRow("Lloyd smoothing steps:", self.smoothing_steps)
+        mesh_form.addRow("Override Gmsh smoothing:", self.use_smoothing_override)
+        mesh_form.addRow("Gmsh smoothing steps:", self.smoothing_steps)
 
         tess_group = QGroupBox("Voronoi tessellation")
         tess_form = QFormLayout(tess_group)
@@ -1209,6 +1234,18 @@ class VorflowDialog(QDialog):
             "Removes or clips portions of Voronoi cells outside the domain."
         )
         tess_form.addRow(self.clip_boundary)
+
+        self.use_lloyd = QCheckBox("Enable weighted Lloyd relaxation")
+        self.use_lloyd.setChecked(False)
+        self.use_lloyd.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
+        self.lloyd_iterations = QSpinBox()
+        self.lloyd_iterations.setRange(1, 1000)
+        self.lloyd_iterations.setValue(20)
+        self.lloyd_iterations.setEnabled(False)
+        self.lloyd_iterations.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
+        self.use_lloyd.toggled.connect(self.lloyd_iterations.setEnabled)
+        tess_form.addRow(self.use_lloyd)
+        tess_form.addRow("Lloyd iterations:", self.lloyd_iterations)
 
         notes = QLabel(
             "<b>Tip:</b> The target size is not an exact cell size. "
@@ -1331,11 +1368,28 @@ class VorflowDialog(QDialog):
         self.diagnostics.setReadOnly(True)
         self.diagnostics.setMinimumHeight(110)
         self.diagnostics.setPlaceholderText(
-            "The installed Vorflow API and Lloyd routing will be shown here after "
-            "you start a run."
+            "The installed Vorflow API, hex-ring diagnostics and Lloyd report "
+            "will be shown here after you start a run."
         )
         diagnostics_layout.addWidget(self.diagnostics)
         main.addWidget(diagnostics_group)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFormat("%p%")
+        self.progress.setToolTip(
+            "Shows workflow phase progress. Gmsh and Vorflow currently do not "
+            "provide fine-grained progress callbacks, so long internal phases "
+            "are shown as indeterminate."
+        )
+        main.addWidget(self.progress)
+
+        self.elapsed_time_label = QLabel("Total time: 00:00:00.0")
+        self.elapsed_time_label.setToolTip(
+            "Total elapsed time from clicking Generate mesh until completion or failure."
+        )
+        main.addWidget(self.elapsed_time_label)
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -1349,7 +1403,8 @@ class VorflowDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.button(QDialogButtonBox.Ok).setText("Generate mesh")
+        self.generate_button = buttons.button(QDialogButtonBox.Ok)
+        self.generate_button.setText("Generate mesh")
         buttons.accepted.connect(self.run_model)
         buttons.rejected.connect(self.reject)
         buttons_layout.addWidget(help_bottom)
@@ -1385,6 +1440,66 @@ class VorflowDialog(QDialog):
     def set_status(self, text):
         self.status.setText(text)
         QApplication.processEvents()
+
+    @staticmethod
+    def format_elapsed_time(seconds):
+        """Format elapsed seconds as HH:MM:SS.t."""
+        seconds = max(0.0, float(seconds))
+        total_seconds = int(seconds)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, whole_seconds = divmod(remainder, 60)
+        tenths = int((seconds - total_seconds) * 10)
+        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{tenths}"
+
+    def start_run_timer(self, started=None):
+        """Start the total timer when Generate mesh is clicked."""
+        self.run_started = started if started is not None else time.perf_counter()
+        self.elapsed_time_label.setText("Total time: 00:00:00.0")
+        self.run_timer.start()
+        QApplication.processEvents()
+
+    def update_elapsed_timer(self):
+        """Refresh the displayed total time while a run is active."""
+        if self.run_started is None:
+            return
+        elapsed = time.perf_counter() - self.run_started
+        self.elapsed_time_label.setText(
+            f"Total time: {self.format_elapsed_time(elapsed)}"
+        )
+
+    def stop_run_timer(self, elapsed=None):
+        """Stop the timer and retain the final total duration."""
+        self.run_timer.stop()
+        if elapsed is None and self.run_started is not None:
+            elapsed = time.perf_counter() - self.run_started
+        if elapsed is not None:
+            self.elapsed_time_label.setText(
+                f"Total time: {self.format_elapsed_time(elapsed)}"
+            )
+        self.run_started = None
+
+    def set_progress(self, value=None, text=None, busy=False):
+        """Update phase progress without inventing an internal Gmsh percentage."""
+        if busy:
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(text or "Working…")
+        else:
+            self.progress.setRange(0, 100)
+            if value is not None:
+                self.progress.setValue(max(0, min(100, int(value))))
+            self.progress.setFormat(f"%p% — {text}" if text else "%p%")
+        if text:
+            self.status.setText(text)
+        self.update_elapsed_timer()
+        QApplication.processEvents()
+
+    @staticmethod
+    def accepts_keyword(function, keyword):
+        try:
+            _, parameters, accepts_kwargs = _callable_parameter_info(function)
+        except (TypeError, ValueError):
+            return False
+        return accepts_kwargs or keyword in parameters
 
     def validate_crs(self):
         crs = QgsProject.instance().crs()
@@ -1448,6 +1563,16 @@ class VorflowDialog(QDialog):
                 kwargs[id_argument] = feature_identifier(
                     feature, id_field, prefix, layer.name()
                 )
+                if (
+                    method_name == "add_point"
+                    and kwargs.get("hex_ring")
+                    and not self.accepts_keyword(method, "hex_ring")
+                ):
+                    raise RuntimeError(
+                        "Hex ring is enabled, but the installed Vorflow does not "
+                        "support add_point(..., hex_ring=True). Install a Vorflow "
+                        "version containing Rui's point-centring change (#32)."
+                    )
                 call_supported(method, geometry, **kwargs)
 
     def export_gdf(self, gdf, path):
@@ -1901,11 +2026,16 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             QMessageBox.critical(self, "MODFLOW 6 / DISV – Error", str(exc))
 
     def run_model(self):
+        started = time.perf_counter()
+        self.start_run_timer(started)
+        self.generate_button.setEnabled(False)
+        self.diagnostic_lines = []
+        self.diagnostics.clear()
+        self.set_progress(2, "Checking Vorflow installation…")
         try:
             self.last_voronoi_grid = None
             self.last_voronoi_path = None
             self.generate_disv_button.setEnabled(False)
-            self.set_status("Checking Vorflow…")
             try:
                 from vorflow import (
                     ConceptualMesh, MeshGenerator, VoronoiTessellator
@@ -1926,7 +2056,7 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             background_lc = self.background_lc.value()
             connectivity = self.connectivity_tolerance.value()
 
-            self.set_status("Building conceptual model…")
+            self.set_progress(12, "Building conceptual model…")
             blueprint = call_supported(
                 ConceptualMesh, crs=crs.authid(),
                 connectivity_tolerance=connectivity
@@ -1942,10 +2072,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 blueprint, self.points, "add_point", "point_id", "point"
             )
 
-            self.set_status("Cleaning and connecting geometries…")
+            self.set_progress(None, "Cleaning and connecting geometries…", busy=True)
             clean_polygons, clean_lines, clean_points = blueprint.generate()
+            self.set_progress(27, "Conceptual model completed.")
 
-            self.set_status("Checking MeshGenerator/Lloyd API…")
+            self.set_progress(32, "Checking the MeshGenerator API…")
             smoothing_override = self.use_smoothing_override.isChecked()
             requested_smoothing = int(self.smoothing_steps.value())
             generator_signature, generator_parameters, generator_kwargs = (
@@ -1956,11 +2087,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             )
             if smoothing_override:
                 self.add_diagnostic(
-                    f"Requested smoothing_steps override: {requested_smoothing}"
+                    f"Requested Gmsh smoothing_steps override: {requested_smoothing}"
                 )
             else:
                 self.add_diagnostic(
-                    "Requested smoothing_steps: Vorflow default "
+                    "Requested Gmsh smoothing_steps: Vorflow default "
                     "(no override supplied by QGIS plugin)."
                 )
 
@@ -2010,44 +2141,63 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 message = (
                     "The installed Vorflow API does not expose smoothing_steps "
                     "in MeshGenerator(...) or mesher.generate(...). "
-                    "The requested Lloyd setting cannot be applied."
+                    "The requested Gmsh smoothing setting cannot be applied."
                 )
                 self.add_diagnostic("ERROR: " + message)
                 raise RuntimeError(message)
 
             if smoothing_override:
                 self.add_diagnostic(
-                    f"Lloyd routing: {smoothing_route}; "
+                    f"Gmsh smoothing routing: {smoothing_route}; "
                     f"effective requested value: {requested_smoothing}"
                 )
                 if requested_smoothing == 0:
                     self.add_diagnostic(
-                        "Lloyd smoothing is explicitly disabled for this run (0)."
+                        "Gmsh Laplacian smoothing is explicitly disabled for this run (0)."
                     )
                 else:
                     self.add_diagnostic(
-                        f"Lloyd smoothing override requested with "
+                        f"Gmsh Laplacian smoothing override requested with "
                         f"{requested_smoothing} iteration(s)."
                     )
                 status_smoothing = str(requested_smoothing)
             else:
                 self.add_diagnostic(
-                    f"Lloyd routing: {smoothing_route}; "
+                    f"Gmsh smoothing routing: {smoothing_route}; "
                     "effective value: Vorflow default"
                 )
                 self.add_diagnostic(
-                    "Vorflow's own smoothing_steps default is being used; "
+                    "Vorflow's own Gmsh smoothing_steps default is being used; "
                     "no value was supplied by the QGIS plugin."
                 )
                 status_smoothing = "Vorflow default"
 
-            self.set_status(
+            self.set_progress(
+                None,
                 f"Generating mesh with Gmsh "
-                f"(Lloyd steps: {status_smoothing})…"
+                f"(Laplacian smoothing: {status_smoothing})…",
+                busy=True,
             )
             mesher.generate(
                 clean_polygons, clean_lines, clean_points, **generate_options
             )
+            self.set_progress(55, "Gmsh mesh generation completed.")
+
+            mesh_diagnostics = getattr(mesher, "diagnostics", None)
+            if isinstance(mesh_diagnostics, dict):
+                hex_diagnostics = mesh_diagnostics.get("hex_rings")
+                if hex_diagnostics is not None:
+                    self.add_diagnostic(
+                        "Hex-ring diagnostics: " + repr(hex_diagnostics)
+                    )
+                else:
+                    self.add_diagnostic(
+                        "Hex-ring diagnostics were not present in mesher.diagnostics."
+                    )
+            else:
+                self.add_diagnostic(
+                    "The installed Vorflow does not expose mesher.diagnostics."
+                )
 
             exported = []
             quality_path = None
@@ -2060,7 +2210,7 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 requests.append(("quads", "quads"))
 
             for suffix, selection in requests:
-                self.set_status(f"Exporting {suffix}…")
+                self.set_progress(62, f"Exporting {suffix}…")
                 grid = (
                     mesher.get_element_grid()
                     if selection is None
@@ -2074,14 +2224,50 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             # whenever either the Voronoi output or the quality report is requested.
             voronoi_grid = None
             if self.export_voronoi.isChecked() or self.export_quality.isChecked():
-                self.set_status("Creating Voronoi grid…")
+                lloyd_count = (
+                    int(self.lloyd_iterations.value())
+                    if self.use_lloyd.isChecked()
+                    else 0
+                )
                 tess_kwargs = {
                     "clip_to_boundary": self.clip_boundary.isChecked()
                 }
+                if lloyd_count:
+                    if not self.accepts_keyword(
+                        VoronoiTessellator, "lloyd_iterations"
+                    ):
+                        raise RuntimeError(
+                            "Weighted Lloyd relaxation is enabled, but the installed "
+                            "Vorflow does not support VoronoiTessellator(..., "
+                            "lloyd_iterations=N). Install a Vorflow version containing "
+                            "Rui's point-centring change (#32)."
+                        )
+                    tess_kwargs["lloyd_iterations"] = lloyd_count
+                    self.add_diagnostic(
+                        f"Weighted Lloyd iterations requested: {lloyd_count}"
+                    )
+                    tess_status = (
+                        f"Running {lloyd_count} weighted Lloyd iterations and "
+                        "creating the Voronoi grid…"
+                    )
+                else:
+                    self.add_diagnostic("Weighted Lloyd relaxation: disabled.")
+                    tess_status = "Creating the Voronoi grid…"
+
+                self.set_progress(None, tess_status, busy=True)
                 tessellator = call_supported(
                     VoronoiTessellator, mesher, blueprint, **tess_kwargs
                 )
                 voronoi_grid = tessellator.generate()
+                lloyd_report = getattr(tessellator, "lloyd_report", None)
+                if lloyd_report is not None:
+                    self.add_diagnostic("Lloyd report: " + repr(lloyd_report))
+                elif lloyd_count:
+                    self.add_diagnostic(
+                        "WARNING: Lloyd was requested, but tessellator.lloyd_report "
+                        "was not exposed by the installed Vorflow."
+                    )
+                self.set_progress(80, "Voronoi grid completed.")
                 self.last_voronoi_grid = voronoi_grid.copy()
                 self.last_output_directory = output_dir
                 self.last_prefix = prefix
@@ -2098,7 +2284,7 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     self.last_voronoi_path = path
 
                 if self.export_quality.isChecked():
-                    self.set_status("Calculating Voronoi-cell quality metrics…")
+                    self.set_progress(86, "Calculating Voronoi-cell quality metrics…")
                     quality_grid = build_voronoi_quality_grid(voronoi_grid)
                     quality_path = os.path.join(output_dir, f"{prefix}_quality.gpkg")
                     if self.export_gdf(quality_grid, quality_path):
@@ -2110,13 +2296,15 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 raise RuntimeError("No outputs were created.")
 
             if self.add_outputs.isChecked():
-                self.set_status("Building layer group and quality styles…")
+                self.set_progress(94, "Building layer group and quality styles…")
                 self.add_outputs_to_project(exported, quality_path, prefix)
 
-            self.set_status("Done.")
+            elapsed = time.perf_counter() - started
+            self.stop_run_timer(elapsed)
+            self.set_progress(100, f"Done in {elapsed:.1f} seconds.")
             QMessageBox.information(
                 self, "Vorflow",
-                "Mesh generation completed.\n\n"
+                f"Mesh generation completed in {elapsed:.1f} seconds.\n\n"
                 "The quality group uses red for low/invalid quality "
                 "and green for high quality.\n\n"
                 + "\n".join(path for path, _, _ in exported)
@@ -2124,8 +2312,17 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
 
         except Exception as exc:
             traceback.print_exc()
-            self.set_status("Processing failed.")
+            elapsed = time.perf_counter() - started
+            self.stop_run_timer(elapsed)
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.progress.setFormat("Failed")
+            self.set_status(f"Processing failed after {elapsed:.1f} seconds.")
             QMessageBox.critical(self, "Vorflow – Error", str(exc))
+        finally:
+            if self.run_timer.isActive():
+                self.stop_run_timer()
+            self.generate_button.setEnabled(True)
 
 
 class VorflowPlugin:
