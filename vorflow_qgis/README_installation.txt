@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.14.0
+VORFLOW FOR QGIS 0.15.0
 ======================
 
 AUTHOR
@@ -19,9 +19,11 @@ INSTALLATION
 3. Install Vorflow and its Python dependencies in the Python environment used
    by QGIS.
 
-On Windows, open OSGeo4W Shell and run:
+Until the short-face feature is included in a Vorflow release, open OSGeo4W
+Shell on Windows and run:
 
-    python -m pip install vorflow geopandas shapely scipy gmsh pyogrio
+    python -m pip install geopandas shapely scipy gmsh pyogrio
+    python -m pip install --no-deps --force-reinstall "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/lloyd-size-smoothing"
 
 4. Restart QGIS.
 
@@ -36,17 +38,21 @@ MAIN WORKFLOW
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
 
-RECOMMENDED DEFAULT PROFILE IN VERSION 0.6
+RECOMMENDED DEFAULT PROFILE IN VERSION 0.15
 - Refinement model: Geometric growth (GeometricGrowthField)
 - Growth model: edge_ratio
-- Growth factor: 1.2
+- Point and line growth factor: 1.1
+- Point hex rings: enabled
+- Weighted Lloyd iterations: 100
+- Minimum face fraction: 0.2
 - Sampling: 25
 
-This profile is preselected for the model domain and global point, line and
-polygon settings. It is intended as a robust general starting point with a
-controlled transition between fine and coarse cells. All settings remain
-editable, and individual layers can still override or disable the global
-refinement model.
+The gentler 1.1 grading is preselected for point and line layers; the domain
+and polygon defaults remain 1.2. Hex rings create regular cells around point
+features such as wells. Lloyd improves grid-wide regularity, and the minimum
+face fraction opens very short faces after Lloyd without moving fixed well,
+line or boundary generators. All settings remain editable, and individual
+layers can override or disable the defaults.
 
 REFINEMENT TERMINOLOGY
 - Standard: target size/resolution and growth factor.
@@ -99,38 +105,46 @@ quality GeoPackage contains one feature per Voronoi cell and the QGIS quality
 group provides themed views of the principal metrics.
 
 
-LLOYD SMOOTHING
-The "Global mesh parameters" tab contains "Lloyd smoothing steps". This is
-passed centrally to Vorflow's MeshGenerator and then to Gmsh during mesh
-generation. The default is 0, which disables smoothing. Increase it to apply
-internal Lloyd smoothing iterations; embedded and constrained geometry nodes
-may remain constrained by the mesh geometry.
+GMSH SMOOTHING, WEIGHTED LLOYD AND SHORT FACES
+Gmsh `smoothing_steps` performs Laplacian smoothing of the auxiliary triangle
+mesh. The plugin leaves Vorflow's default unchanged unless "Override Gmsh
+smoothing" is enabled.
+
+Weighted Lloyd relaxation is a separate VoronoiTessellator operation. It moves
+only free generators towards size-weighted cell centroids; wells, lines, zone
+edges and boundaries remain fixed. Lloyd is mainly a shape/appearance tool.
+For MODFLOW results, local resolution, gentle grading and well-cell centring
+normally matter more.
+
+Lloyd can create a small number of nearly zero-length faces where, for example,
+five- and seven-sided cells meet. `min_face_fraction=0.2` moves nearby free
+generators slightly until those faces open. The face remains perpendicular to
+the generator connector, and fixed generators do not move.
 
 
-Lloyd smoothing default behaviour
----------------------------------
-By default, the plugin does not pass `smoothing_steps` to Vorflow. This preserves
-Vorflow's own default and avoids changing upstream behaviour. Enable
-"Override Vorflow default" to pass an explicit value, including 0 to disable
-smoothing for that run.
-
-
-Required Vorflow support for hex rings and weighted Lloyd
-----------------------------------------------------------
-The plugin interface exposes Rui's point-centring API:
+Required Vorflow support
+------------------------
+The plugin interface exposes the upstream point-centring and short-face APIs:
 
     blueprint.add_point(..., hex_ring=True)
-    VoronoiTessellator(..., lloyd_iterations=20)
+    tess = VoronoiTessellator(
+        mesher,
+        blueprint,
+        lloyd_iterations=100,
+        min_face_fraction=0.2,
+    )
+    grid = tess.generate()
+    print(tess.short_face_report)
 
 The algorithms themselves belong to the upstream ``vorflow`` package, not
 to this QGIS plugin. The plugin checks the installed API and stops with a
 clear error rather than silently ignoring an unsupported option.
 
-For testing Rui's feature branch in a fresh environment:
+For testing the feature branch in a fresh environment:
 
     python -m venv vorflow-pr
     vorflow-pr\Scripts\activate
-    pip install "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/point-centring"
+    pip install "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/lloyd-size-smoothing"
 
 If QGIS uses a different Python interpreter, install the package into that
 exact interpreter/environment. Restart QGIS after installation.

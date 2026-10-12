@@ -152,7 +152,8 @@ PARAMETER_HELP = {
     "growth_factor": (
         "Growth factor",
         "Controls how quickly cell size may increase away from the object. Values close to "
-        "1 give a slow, smooth transition but more cells. Example: 1.1–1.3."
+        "1 give a slow, smooth transition but more cells. Vorflow recommends 1.1 "
+        "for point and line refinements when cell regularity matters."
     ),
     "embed": (
         "Embed geometry",
@@ -202,8 +203,9 @@ PARAMETER_HELP = {
         "Refinement model",
         "Standard uses the object's resolution and growth factor. The other "
         "options create an explicit vorflow mesh field for distance-based "
-        "variation. Version 0.6 defaults to Geometric growth with edge_ratio, "
-        "growth factor 1.2 and sampling 25 as a robust general starting point."
+        "variation. Version 0.15 defaults to Geometric growth with edge_ratio "
+        "and sampling 25. Point and line layers use growth factor 1.1; domain "
+        "and polygon layers retain 1.2."
     ),
     "size_min": (
         "Minimum size",
@@ -254,7 +256,16 @@ PARAMETER_HELP = {
         "Weighted Lloyd iterations",
         "Moves free interior nodes towards size-weighted Voronoi-cell centroids "
         "before the grid is built. Boundary, zone-edge, point and line nodes stay "
-        "fixed. A value around 20 is a useful starting point."
+        "fixed. The recommended comparison profile uses 100 passes. Lloyd mainly "
+        "improves appearance and cell regularity; local resolution and smooth grading "
+        "normally matter more for MODFLOW head accuracy."
+    ),
+    "min_face_fraction": (
+        "Minimum face fraction",
+        "Moves free generators slightly after Lloyd relaxation until no shared face "
+        "is shorter than this fraction of the distance between its two generators. "
+        "A value of 0.2 is recommended. Fixed generators at wells, lines and boundaries "
+        "stay in place; 0 disables the clean-up."
     ),
 }
 
@@ -920,8 +931,6 @@ def build_voronoi_quality_grid(grid):
     CVFD/orthogonality diagnostics.  Native Vorflow diagnostics, if exposed by
     the installed version, can be merged by the caller in future versions.
     """
-    import math
-    import numpy as np
     import pandas as pd
 
     if grid is None or grid.empty:
@@ -936,13 +945,15 @@ def build_voronoi_quality_grid(grid):
     skewness = [[] for _ in range(len(result))]
     neighbour_counts = [0 for _ in range(len(result))]
     geometries = list(result.geometry)
-    index_by_position = {id(geometry): pos for pos, geometry in enumerate(geometries)}
     # GeoPandas' spatial index is available in normal QGIS installations.
     try:
         spatial_index = result.sindex
-        query_candidates = lambda bounds: list(spatial_index.intersection(bounds))
+
+        def query_candidates(bounds):
+            return list(spatial_index.intersection(bounds))
     except Exception:
-        query_candidates = lambda bounds: range(len(geometries))
+        def query_candidates(bounds):
+            return range(len(geometries))
     for position, geometry in enumerate(geometries):
         if geometry is None or geometry.is_empty:
             continue
@@ -1099,8 +1110,9 @@ class VorflowDialog(QDialog):
         information = QLabel(
             "Add any number of point, line and polygon layers. "
             "Use global defaults and configure layer-specific overrides. "
-            "The initial refinement profile uses Geometric growth, edge_ratio, "
-            "growth factor 1.2 and sampling 25."
+            "The recommended profile uses growth factor 1.1 for points and lines, "
+            "hex rings around points, 100 weighted Lloyd passes and short-face "
+            "clean-up at 0.2."
         )
         information.setWordWrap(True)
         help_button = QPushButton("Parameter help…")
@@ -1140,9 +1152,9 @@ class VorflowDialog(QDialog):
         self.points = MultiLayerInputWidget(
             "Point", QgsMapLayerProxyModel.PointLayer, "point",
             {
-                "resolution": 10.0, "growth_factor": 1.2,
+                "resolution": 10.0, "growth_factor": 1.1,
                 "embed": True, "simplify_tolerance": 0.0,
-                "hex_ring": False,
+                "hex_ring": True,
                 "field_model": "geometric", "growth_model": "edge_ratio",
                 "sampling": 25
             }
@@ -1150,7 +1162,7 @@ class VorflowDialog(QDialog):
         self.lines = MultiLayerInputWidget(
             "Line", QgsMapLayerProxyModel.LineLayer, "line",
             {
-                "resolution": 10.0, "growth_factor": 1.2,
+                "resolution": 10.0, "growth_factor": 1.1,
                 "snap_to_polygons": True, "is_barrier": False,
                 "densify": True, "simplify_tolerance": 0.0,
                 "embed": True, "quad_buffer": False,
@@ -1236,16 +1248,32 @@ class VorflowDialog(QDialog):
         tess_form.addRow(self.clip_boundary)
 
         self.use_lloyd = QCheckBox("Enable weighted Lloyd relaxation")
-        self.use_lloyd.setChecked(False)
+        self.use_lloyd.setChecked(True)
         self.use_lloyd.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
         self.lloyd_iterations = QSpinBox()
         self.lloyd_iterations.setRange(1, 1000)
-        self.lloyd_iterations.setValue(20)
-        self.lloyd_iterations.setEnabled(False)
+        self.lloyd_iterations.setValue(100)
+        self.lloyd_iterations.setEnabled(True)
         self.lloyd_iterations.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
         self.use_lloyd.toggled.connect(self.lloyd_iterations.setEnabled)
         tess_form.addRow(self.use_lloyd)
         tess_form.addRow("Lloyd iterations:", self.lloyd_iterations)
+
+        self.use_min_face_fraction = QCheckBox("Remove very short cell faces")
+        self.use_min_face_fraction.setChecked(True)
+        self.use_min_face_fraction.setToolTip(
+            PARAMETER_HELP["min_face_fraction"][1]
+        )
+        self.min_face_fraction = make_double(0.2, 0.0, 0.9999, 3)
+        self.min_face_fraction.setEnabled(True)
+        self.min_face_fraction.setToolTip(
+            PARAMETER_HELP["min_face_fraction"][1]
+        )
+        self.use_min_face_fraction.toggled.connect(
+            self.min_face_fraction.setEnabled
+        )
+        tess_form.addRow(self.use_min_face_fraction)
+        tess_form.addRow("Minimum face fraction:", self.min_face_fraction)
 
         notes = QLabel(
             "<b>Tip:</b> The target size is not an exact cell size. "
@@ -1810,7 +1838,7 @@ class VorflowDialog(QDialog):
         disv_lines.extend(f"    CONSTANT {value:.12g}" for value in bottoms)
         disv_lines.extend([
             "  IDOMAIN LAYERED",
-            *[f"    CONSTANT 1" for _ in range(nlay)],
+            *["    CONSTANT 1" for _ in range(nlay)],
             "END GRIDDATA",
             "",
             "BEGIN VERTICES",
@@ -2229,9 +2257,15 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     if self.use_lloyd.isChecked()
                     else 0
                 )
+                min_face_fraction = (
+                    float(self.min_face_fraction.value())
+                    if self.use_min_face_fraction.isChecked()
+                    else 0.0
+                )
                 tess_kwargs = {
                     "clip_to_boundary": self.clip_boundary.isChecked()
                 }
+                tess_status_parts = []
                 if lloyd_count:
                     if not self.accepts_keyword(
                         VoronoiTessellator, "lloyd_iterations"
@@ -2246,12 +2280,37 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     self.add_diagnostic(
                         f"Weighted Lloyd iterations requested: {lloyd_count}"
                     )
-                    tess_status = (
-                        f"Running {lloyd_count} weighted Lloyd iterations and "
-                        "creating the Voronoi grid…"
+                    tess_status_parts.append(
+                        f"{lloyd_count} weighted Lloyd iterations"
                     )
                 else:
                     self.add_diagnostic("Weighted Lloyd relaxation: disabled.")
+
+                if min_face_fraction > 0:
+                    if not self.accepts_keyword(
+                        VoronoiTessellator, "min_face_fraction"
+                    ):
+                        raise RuntimeError(
+                            "Short-face clean-up is enabled, but the installed "
+                            "Vorflow does not support VoronoiTessellator(..., "
+                            "min_face_fraction=...). Install the feature from "
+                            "rhugman/vorflow#34 or a later release."
+                        )
+                    tess_kwargs["min_face_fraction"] = min_face_fraction
+                    self.add_diagnostic(
+                        "Minimum face fraction requested: "
+                        f"{min_face_fraction:g} x generator distance"
+                    )
+                    tess_status_parts.append("short-face clean-up")
+                else:
+                    self.add_diagnostic("Short-face clean-up: disabled.")
+
+                if tess_status_parts:
+                    tess_status = (
+                        "Running " + " and ".join(tess_status_parts)
+                        + " and creating the Voronoi grid…"
+                    )
+                else:
                     tess_status = "Creating the Voronoi grid…"
 
                 self.set_progress(None, tess_status, busy=True)
@@ -2266,6 +2325,19 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     self.add_diagnostic(
                         "WARNING: Lloyd was requested, but tessellator.lloyd_report "
                         "was not exposed by the installed Vorflow."
+                    )
+                short_face_report = getattr(
+                    tessellator, "short_face_report", None
+                )
+                if short_face_report is not None:
+                    self.add_diagnostic(
+                        "Short-face report: " + repr(short_face_report)
+                    )
+                elif min_face_fraction > 0:
+                    self.add_diagnostic(
+                        "WARNING: Short-face clean-up was requested, but "
+                        "tessellator.short_face_report was not exposed by the "
+                        "installed Vorflow."
                     )
                 self.set_progress(80, "Voronoi grid completed.")
                 self.last_voronoi_grid = voronoi_grid.copy()

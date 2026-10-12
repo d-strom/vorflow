@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.0
+
+- Updated the recommended defaults from the Vorflow developer's grid-quality
+  review: `growth_factor=1.1` for points and lines, `hex_ring=True` for point
+  layers, and 100 weighted Lloyd passes.
+- Added an enabled-by-default `min_face_fraction=0.2` control for removing very
+  short Voronoi faces while keeping wells, lines and boundary generators fixed.
+- Added `short_face_report` to Run diagnostics and a clear compatibility error
+  when the installed Vorflow package does not expose the new API.
+- Integrated the upstream Lloyd size-smoothing and short-face-removal changes
+  from `rhugman/vorflow` feature branch `feat/lloyd-size-smoothing`.
+
 ## 0.14.0
 
 - Added a separate total elapsed-time display below the progress bar.
