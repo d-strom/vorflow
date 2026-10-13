@@ -215,6 +215,21 @@ centroid-to-centroid `ortho_error` from 4.1 to 2.7 degrees for about 0.4 s of
 extra runtime; the grid is then no longer the exact dual of
 `MeshGenerator.get_element_grid()`.
 
+## Embedded line-junction normalisation
+
+The current development patch normalises embedded line networks before Gmsh meshing. Exact intersections are made explicit as shared line vertices, and nearby endpoint-to-line connections can be repaired within `junction_tolerance`. Field-only lines (`embed=False`) and nearby parallel lines are not merged.
+
+```python
+blueprint = ConceptualMesh(
+    crs="EPSG:3006",
+    connectivity_tolerance=0.001,
+    junction_tolerance=0.001,
+    normalize_line_junctions=True,
+)
+```
+
+The run result is available in `blueprint.junction_diagnostics`. See [`JUNCTION_PATCH.md`](JUNCTION_PATCH.md) for the exact scope, limitations, and QGIS installation instructions.
+
 ## Examples
 
 The [examples/](https://github.com/rhugman/vorflow/tree/main/examples)

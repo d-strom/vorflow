@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Added isolated embedded line-junction normalisation before Gmsh.
+- Added `junction_tolerance`, `normalize_line_junctions`, and
+  `ConceptualMesh.junction_diagnostics`.
+- Added explicit tests for crossings, endpoint connections, field-only lines,
+  and parallel-line safety.
+- Documented the patch and its QGIS 0.16.0 integration in `JUNCTION_PATCH.md`.
+
+
 All notable changes to `vorflow` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

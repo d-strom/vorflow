@@ -6,7 +6,7 @@ import warnings
 import geopandas as gpd
 import pandas as pd
 import numpy as np
-from shapely.geometry import Polygon, LineString, MultiPolygon
+from shapely.geometry import Point, Polygon, LineString, MultiPolygon
 from shapely.ops import unary_union, snap, polygonize
 from shapely.prepared import prep
 from shapely.validation import make_valid
@@ -58,6 +58,277 @@ def _coerce_connectivity_tolerance(value, parameter_name="connectivity_tolerance
     if value < 0:
         raise ValueError(f"{parameter_name} must be non-negative. Got {value}.")
     return float(value)
+
+
+# ============================================================================ #
+# JUNCTION NORMALISATION BLOCK (isolated patch)
+# ---------------------------------------------------------------------------- #
+# This block deliberately lives in one place so the feature can be reviewed,
+# tested, removed, or replaced independently of the rest of ConceptualMesh.
+#
+# Purpose:
+#   * make embedded line/line intersections explicit in the line vertices;
+#   * make near-coincident line ENDPOINTS snap to one canonical coordinate;
+#   * leave field-only lines (embed=False) untouched;
+#   * never merge merely-nearby parallel lines;
+#   * preserve line feature records and line_id values.
+#
+# This is geometry normalisation, not Voronoi-cell post-processing. It runs
+# before Gmsh sees the features, so the existing Gmsh, Lloyd, barrier and
+# short-face algorithms can work with an unambiguous line network.
+#
+# Deliberate scope:
+#   * exact crossings are always noded;
+#   * tolerance-based repair is restricted to endpoint-to-line connections;
+#   * collinear overlaps are not merged into one feature;
+#   * no Voronoi cells are merged here.
+# ============================================================================ #
+
+def _junction_point_parts(geometry):
+    """Return point-like pieces from a Shapely intersection geometry."""
+    if geometry is None or geometry.is_empty:
+        return []
+    if geometry.geom_type == "Point":
+        return [geometry]
+    if geometry.geom_type in ("MultiPoint", "GeometryCollection"):
+        return [
+            part for part in geometry.geoms
+            if part.geom_type == "Point" and not part.is_empty
+        ]
+    if geometry.geom_type in ("LineString", "LinearRing", "MultiLineString"):
+        parts = [geometry] if geometry.geom_type != "MultiLineString" else list(geometry.geoms)
+        points = []
+        for part in parts:
+            coords = list(part.coords)
+            if coords:
+                points.extend([Point(coords[0]), Point(coords[-1])])
+        return points
+    return []
+
+
+def _line_endpoint_points(line):
+    """Return the two endpoints of a non-degenerate line."""
+    coords = list(line.coords)
+    return [Point(coords[0]), Point(coords[-1])] if len(coords) >= 2 else []
+
+
+def _endpoint_tangent(line, endpoint):
+    """Return the non-zero segment vector that leaves ``endpoint``."""
+    coords = list(line.coords)
+    if len(coords) < 2:
+        return None
+    endpoint_xy = (float(endpoint.x), float(endpoint.y))
+    if endpoint_xy == tuple(coords[0][:2]):
+        candidates = ((coords[i][0] - coords[0][0], coords[i][1] - coords[0][1])
+                      for i in range(1, len(coords)))
+    elif endpoint_xy == tuple(coords[-1][:2]):
+        candidates = ((coords[i][0] - coords[-1][0], coords[i][1] - coords[-1][1])
+                      for i in range(len(coords) - 2, -1, -1))
+    else:
+        return None
+    return next((vector for vector in candidates if np.hypot(*vector) > 0), None)
+
+
+def _line_tangent_at(line, distance):
+    """Return the non-zero segment vector at a distance along ``line``."""
+    coords = list(line.coords)
+    if len(coords) < 2:
+        return None
+    travelled = 0.0
+    fallback = None
+    for start, end in zip(coords[:-1], coords[1:]):
+        vector = (end[0] - start[0], end[1] - start[1])
+        length = float(np.hypot(*vector))
+        if length <= 0:
+            continue
+        fallback = vector
+        if distance <= travelled + length:
+            return vector
+        travelled += length
+    return fallback
+
+
+def _is_lateral_parallel_near_miss(source, endpoint, target):
+    """Return True for side-by-side parallel lines that must not be joined."""
+    source_tangent = _endpoint_tangent(source, endpoint)
+    along = float(target.project(endpoint))
+    target_tangent = _line_tangent_at(target, along)
+    if source_tangent is None or target_tangent is None:
+        return False
+
+    source_length = float(np.hypot(*source_tangent))
+    target_length = float(np.hypot(*target_tangent))
+    cross = abs(source_tangent[0] * target_tangent[1]
+                - source_tangent[1] * target_tangent[0])
+    # Treat tiny angular differences as parallel too: an earlier endpoint snap
+    # may tilt a long line by a few microradians without changing its intent.
+    parallel_sine_tolerance = 1e-3
+    if cross > parallel_sine_tolerance * source_length * target_length:
+        return False
+
+    nearest = target.interpolate(along)
+    offset = (float(nearest.x - endpoint.x), float(nearest.y - endpoint.y))
+    offset_length = float(np.hypot(*offset))
+    if offset_length <= 1e-15:
+        return False
+    lateral = abs(source_tangent[0] * offset[1] - source_tangent[1] * offset[0])
+    return lateral > parallel_sine_tolerance * source_length * offset_length
+
+
+def _insert_junction_vertices(line, points, tolerance):
+    """Insert points that lie on ``line`` as explicit vertices, preserving line order."""
+    if not points or line.is_empty or line.length <= 0:
+        return line
+    additions = []
+    for point in points:
+        if point is None or point.is_empty:
+            continue
+        distance = float(line.distance(point))
+        if distance > max(tolerance, 1e-12):
+            continue
+        along = float(line.project(point))
+        if tolerance < along < line.length - tolerance:
+            on_line = line.interpolate(along)
+            additions.append((along, (on_line.x, on_line.y)))
+    if not additions:
+        return line
+
+    original = list(line.coords)
+    entries = [(0.0, tuple(original[0]))]
+    travelled = 0.0
+    for start, end in zip(original[:-1], original[1:]):
+        travelled += float(np.hypot(end[0] - start[0], end[1] - start[1]))
+        entries.append((travelled, tuple(end)))
+    entries.extend(additions)
+    entries.sort(key=lambda item: item[0])
+
+    coords = []
+    for _, xy in entries:
+        if not coords or coords[-1][:2] != xy[:2]:
+            coords.append(xy)
+    return LineString(coords) if len(coords) >= 2 else line
+
+
+def _normalise_embedded_line_junctions(line_records, tolerance):
+    """Return ``(records, diagnostics)`` after explicit embedded-line junction repair.
+
+    The input records are copied shallowly; the caller's raw feature records are
+    not modified in-place outside the current ConceptualMesh.generate() run.
+    """
+    tolerance = float(tolerance)
+    embedded = [
+        i for i, record in enumerate(line_records)
+        if bool(record.get("embed", True))
+        and record.get("geometry") is not None
+        and record["geometry"].geom_type == "LineString"
+        and not record["geometry"].is_empty
+    ]
+    if len(embedded) < 2:
+        return line_records, {"enabled": True, "junction_count": 0, "noded_pairs": 0,
+                              "endpoint_snaps": 0, "junctions": []}
+
+    records = [record.copy() for record in line_records]
+    junctions = []
+    noded_pairs = 0
+    endpoint_snaps = 0
+
+    # First pass: exact intersections and endpoint-to-line connections within
+    # tolerance. Pairwise processing is intentional: it preserves attribution.
+    for left_pos, left_i in enumerate(embedded):
+        left = records[left_i]["geometry"]
+        for right_i in embedded[left_pos + 1:]:
+            right = records[right_i]["geometry"]
+            inter = left.intersection(right)
+            exact_points = _junction_point_parts(inter)
+            candidates = [(point, True) for point in exact_points]
+
+            if not candidates and tolerance > 0 and left.distance(right) <= tolerance:
+                left_endpoints = _line_endpoint_points(left)
+                right_endpoints = _line_endpoint_points(right)
+                left_near = [
+                    endpoint for endpoint in left_endpoints
+                    if endpoint.distance(right) <= tolerance
+                    and not _is_lateral_parallel_near_miss(left, endpoint, right)
+                ]
+                right_near = [
+                    endpoint for endpoint in right_endpoints
+                    if endpoint.distance(left) <= tolerance
+                    and not _is_lateral_parallel_near_miss(right, endpoint, left)
+                ]
+                if left_near:
+                    # Keep the point on the right-hand line exactly, then
+                    # snap the left endpoint to it and make it an explicit
+                    # vertex on the right-hand line.
+                    endpoint = min(left_near, key=lambda p: p.distance(right))
+                    candidates = [(right.interpolate(right.project(endpoint)), False)]
+                elif right_near:
+                    endpoint = min(right_near, key=lambda p: p.distance(left))
+                    candidates = [(left.interpolate(left.project(endpoint)), False)]
+
+            if not candidates:
+                continue
+
+            for point, exact in candidates:
+                # Exact crossings are noded on both lines. For a tolerance
+                # repair, snap only the nearby endpoint; interior near misses
+                # are intentionally not warped.
+                if exact:
+                    left = _insert_junction_vertices(left, [point], tolerance)
+                    right = _insert_junction_vertices(right, [point], tolerance)
+                    noded_pairs += 1
+                else:
+                    left = snap(left, point, tolerance)
+                    right = snap(right, point, tolerance)
+                    # ``snap`` moves nearby vertices but does not create a
+                    # vertex at an interior projection. Explicitly insert the
+                    # canonical point after snapping so both records expose
+                    # the same junction coordinate to Gmsh.
+                    left = _insert_junction_vertices(left, [point], tolerance)
+                    right = _insert_junction_vertices(right, [point], tolerance)
+                    endpoint_snaps += 1
+
+                junctions.append({
+                    "point": (float(point.x), float(point.y)),
+                    "line_a": records[left_i].get("line_id"),
+                    "line_b": records[right_i].get("line_id"),
+                    "exact": bool(exact),
+                })
+
+            records[left_i]["geometry"] = left
+            records[right_i]["geometry"] = right
+
+    # Second pass: intersections introduced by endpoint snapping are noded.
+    # This keeps the common coordinate explicit without repeating the full
+    # tolerance repair.
+    for left_pos, left_i in enumerate(embedded):
+        left = records[left_i]["geometry"]
+        for right_i in embedded[left_pos + 1:]:
+            right = records[right_i]["geometry"]
+            points = _junction_point_parts(left.intersection(right))
+            if points:
+                left = _insert_junction_vertices(left, points, tolerance)
+                right = _insert_junction_vertices(right, points, tolerance)
+                records[left_i]["geometry"] = left
+                records[right_i]["geometry"] = right
+
+    # Deduplicate diagnostics by coordinate and incident line IDs.
+    unique = {}
+    for item in junctions:
+        key = (
+            round(item["point"][0], 12),
+            round(item["point"][1], 12),
+            tuple(sorted((str(item["line_a"]), str(item["line_b"])))),
+        )
+        unique[key] = item
+    diagnostics = {
+        "enabled": True,
+        "tolerance": tolerance,
+        "junction_count": len(unique),
+        "noded_pairs": noded_pairs,
+        "endpoint_snaps": endpoint_snaps,
+        "junctions": list(unique.values()),
+    }
+    return records, diagnostics
 
 
 def _simplify_keeping_shared_edges(geom, tol, neighbours):
@@ -322,7 +593,8 @@ def _warn_if_geographic_crs(crs):
 
 
 class ConceptualMesh:
-    def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE):
+    def __init__(self, crs=None, connectivity_tolerance=DEFAULT_CONNECTIVITY_TOLERANCE,
+                 junction_tolerance=None, normalize_line_junctions=True):
         """
         Initializes the conceptual model, which holds raw geometric inputs.
 
@@ -341,10 +613,28 @@ class ConceptualMesh:
             connectivity_tolerance (float, optional): Default snapping tolerance used
                 during topology cleanup in generate(). Larger values make lines and
                 points connect more aggressively to nearby geometry.
+            junction_tolerance (float, optional): Tolerance used only for the
+                isolated embedded line-junction normalisation block. If None,
+                connectivity_tolerance is reused.
+            normalize_line_junctions (bool): If True, exact embedded line
+                intersections are made explicit before Gmsh meshing, and
+                nearby line endpoints are connected within junction_tolerance.
         """
         self.crs = crs
         _warn_if_geographic_crs(crs)
         self.connectivity_tolerance = _coerce_connectivity_tolerance(connectivity_tolerance)
+        self.junction_tolerance = (
+            self.connectivity_tolerance if junction_tolerance is None
+            else _coerce_connectivity_tolerance(junction_tolerance, "junction_tolerance")
+        )
+        self.normalize_line_junctions = bool(normalize_line_junctions)
+        self.junction_diagnostics = {
+            "enabled": self.normalize_line_junctions,
+            "junction_count": 0,
+            "noded_pairs": 0,
+            "endpoint_snaps": 0,
+            "junctions": [],
+        }
         # Store raw geometric inputs before processing.
         self.raw_polygons = [] 
         self.raw_lines = []
@@ -831,7 +1121,7 @@ class ConceptualMesh:
 
         self.clean_polygons = gpd.GeoDataFrame(final_features, crs=self.crs)
 
-    def _enforce_connectivity(self, connectivity_tolerance=None):
+    def _enforce_connectivity(self, connectivity_tolerance=None, junction_tolerance=None):
         """
         Snaps features together to ensure they are topologically connected before
         being passed to the mesher. This is crucial for Gmsh to correctly
@@ -860,6 +1150,29 @@ class ConceptualMesh:
                 original_line = line_data['geometry']
                 snapped_line = snap(original_line, poly_boundaries, tolerance)
                 self.raw_lines[i]['geometry'] = snapped_line
+
+        # ==================================================================== #
+        # JUNCTION NORMALISATION HOOK (isolated patch)
+        # -------------------------------------------------------------------- #
+        # Keep this call in the topology stage: polygon snapping happens first,
+        # so a line endpoint that was snapped onto a polygon boundary can also
+        # participate in the line network normalisation.
+        # ==================================================================== #
+        if self.normalize_line_junctions:
+            jt = self.junction_tolerance if junction_tolerance is None else _coerce_connectivity_tolerance(
+                junction_tolerance, "junction_tolerance"
+            )
+            self.raw_lines, self.junction_diagnostics = _normalise_embedded_line_junctions(
+                self.raw_lines, jt
+            )
+        else:
+            self.junction_diagnostics = {
+                "enabled": False,
+                "junction_count": 0,
+                "noded_pairs": 0,
+                "endpoint_snaps": 0,
+                "junctions": [],
+            }
 
         # 3. Snap points to all other geometries (lines and polygon boundaries).
         # This ensures points like wells are located exactly on a feature.
@@ -1051,7 +1364,7 @@ class ConceptualMesh:
                 continue
             point_data['ring_seeds'] = seeds
 
-    def generate(self, connectivity_tolerance=None):
+    def generate(self, connectivity_tolerance=None, junction_tolerance=None):
         """
         Runs the full preprocessing workflow: resolves polygon overlaps,
         ensures topological connectivity, and prepares clean GeoDataFrames
@@ -1061,6 +1374,8 @@ class ConceptualMesh:
         Args:
             connectivity_tolerance (float, optional): Override for the instance's
                 default topology snapping tolerance during this preprocessing run.
+            junction_tolerance (float, optional): Override for the line-junction
+                normalisation tolerance during this preprocessing run.
         """
         raw_inputs = self.raw_polygons, self.raw_lines, self.raw_points
         # Preprocessing replaces geometries and filters feature records, but does
@@ -1070,11 +1385,11 @@ class ConceptualMesh:
             for raw_features in raw_inputs
         )
         try:
-            return self._generate_working_features(connectivity_tolerance)
+            return self._generate_working_features(connectivity_tolerance, junction_tolerance)
         finally:
             self.raw_polygons, self.raw_lines, self.raw_points = raw_inputs
 
-    def _generate_working_features(self, connectivity_tolerance):
+    def _generate_working_features(self, connectivity_tolerance, junction_tolerance=None):
         logger.info("Applying optional geometry simplification...")
         self._apply_simplification()
 
@@ -1093,7 +1408,10 @@ class ConceptualMesh:
         self._resolve_overlaps()
         
         logger.info("Enforcing strict topology...")
-        self._enforce_connectivity(connectivity_tolerance=connectivity_tolerance)
+        self._enforce_connectivity(
+            connectivity_tolerance=connectivity_tolerance,
+            junction_tolerance=junction_tolerance,
+        )
 
         logger.info("Clipping features to domain...")
         self._clip_features_to_domain()
