@@ -228,7 +228,9 @@ blueprint = ConceptualMesh(
 )
 ```
 
-The run result is available in `blueprint.junction_diagnostics`. See [`JUNCTION_PATCH.md`](JUNCTION_PATCH.md) for the exact scope, limitations, and QGIS installation instructions.
+The run result is available in `blueprint.junction_diagnostics`. See
+[`JUNCTION_PATCH.md`](JUNCTION_PATCH.md) for the API, algorithmic scope, and
+limitations.
 
 ## Examples
 

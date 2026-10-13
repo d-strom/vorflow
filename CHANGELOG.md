@@ -7,7 +7,8 @@
   `ConceptualMesh.junction_diagnostics`.
 - Added explicit tests for crossings, endpoint connections, field-only lines,
   and parallel-line safety.
-- Documented the patch and its QGIS 0.16.0 integration in `JUNCTION_PATCH.md`.
+- Documented the API, algorithmic scope, and limitations in
+  `JUNCTION_PATCH.md`.
 
 
 All notable changes to `vorflow` are documented in this file.
