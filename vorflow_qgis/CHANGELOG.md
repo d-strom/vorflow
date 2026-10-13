@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.17.0
+
+- Replaced the duplicated basic/advanced growth controls with one effective
+  size-transition control. The previous basic growth factor was ignored while
+  the default explicit `GeometricGrowthField` was active.
+- Changed every plugin geometric-growth default to `growth_factor=1.1` with
+  `growth_model="continuous_metric"`; legacy `edge_ratio` remains selectable.
+- Model-domain boundary refinement is now an explicit opt-in. When disabled,
+  the domain defines extent only and no redundant boundary refinement line is
+  added. When enabled, its growth settings grade a finer boundary size back to
+  the global background size.
+- Added controls for Gmsh algorithm, optimisation cycles, initial Delaunay
+  tolerance and optional OCC shape healing.
+- Added controls for boundary-cell centring. `inset_mirror` with inset 0.25 and
+  corner angle 135 degrees is the new plugin default; historical `clip` remains
+  selectable.
+- Added Lloyd damping, stopping tolerance and size-smoothing controls, retaining
+  the tested defaults 1.0, 0.001 and 5 passes.
+- Added numeric geometry-densification spacing and barrier straddle width.
+- Corrected the quad-corridor row range from 1–1000 to Vorflow's supported 1–2.
+- Corrected log-level choices to Vorflow's actual 0–2 API.
+- Line-junction tolerance now follows connectivity tolerance by default and is
+  only independent when explicitly requested.
+- Disabled the redundant all-elements export by default; the Voronoi grid and
+  Voronoi quality report remain enabled.
+- Added `DEFAULTS_AUDIT.md` documenting every reviewed default and intentionally
+  unexposed low-level option.
+
 ## 0.16.0
 
 - Added controls for Vorflow internal embedded-line junction normalisation.

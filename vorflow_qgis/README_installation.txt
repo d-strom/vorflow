@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.16.0
+VORFLOW FOR QGIS 0.17.0
 ======================
 
 AUTHOR
@@ -19,11 +19,11 @@ INSTALLATION
 3. Install Vorflow and its Python dependencies in the Python environment used
    by QGIS.
 
-Until the short-face feature is included in a Vorflow release, open OSGeo4W
+For the matching Vorflow features on this development branch, open OSGeo4W
 Shell on Windows and run:
 
     python -m pip install geopandas shapely scipy gmsh pyogrio
-    python -m pip install --no-deps --force-reinstall "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/lloyd-size-smoothing"
+    python -m pip install --no-deps --force-reinstall "vorflow @ git+https://github.com/d-strom/vorflow.git@dev"
 
 4. Restart QGIS.
 
@@ -38,32 +38,44 @@ MAIN WORKFLOW
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
 
-RECOMMENDED DEFAULT PROFILE IN VERSION 0.15
+QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.17
 - Refinement model: Geometric growth (GeometricGrowthField)
-- Growth model: edge_ratio
-- Point and line growth factor: 1.1
+- Growth model: continuous_metric
+- Growth factor: 1.1 for points, lines, polygons and optional domain-boundary refinement
+- Model-domain boundary refinement: disabled unless explicitly enabled
 - Point hex rings: enabled
+- Boundary-cell centring: inset_mirror, inset fraction 0.25
 - Weighted Lloyd iterations: 100
+- Lloyd damping / tolerance / size smoothing: 1.0 / 0.001 / 5
 - Minimum face fraction: 0.2
 - Sampling: 25
 
-The gentler 1.1 grading is preselected for point and line layers; the domain
-and polygon defaults remain 1.2. Hex rings create regular cells around point
-features such as wells. Lloyd improves grid-wide regularity, and the minimum
-face fraction opens very short faces after Lloyd without moving fixed well,
-line or boundary generators. All settings remain editable, and individual
-layers can override or disable the defaults.
+The continuous-metric interpretation uses log(growth_factor), making 1.1 about
+4.7% gentler than the legacy edge-ratio interpretation. Hex rings create
+regular cells around point features such as wells. Inset/mirror centring
+improves typical boundary orthogonality. Lloyd improves grid-wide regularity,
+and the minimum face fraction opens very short faces after Lloyd without moving
+fixed well, line or boundary generators. Individual layers can override the
+feature settings.
+
+The model domain normally defines extent only. Enable "Refine model-domain
+boundary" when the outer boundary itself needs a smaller target size than the
+global background. Only then does the domain growth control grade that finer
+boundary size into the model interior.
 
 REFINEMENT TERMINOLOGY
-- Standard: target size/resolution and growth factor.
-- Geometric growth: GeometricGrowthField.
+- Geometric growth: GeometricGrowthField with selectable continuous_metric or legacy edge_ratio convention.
 - Threshold: ThresholdField with size_min, size_max, dist_min and dist_max.
 - Exponential: ExponentialField with size_min, size_max and decay_length.
 - Sampling: number of samples used to represent the mesh field.
-- edge_ratio and continuous_metric retain Vorflow's parameter names.
+- Densification spacing: optional geometry-segment limit; 0 uses resolution.
+- Barrier straddle width: optional paired-generator spacing; 0 uses Vorflow automatic sizing.
 
 Different input layers may use different refinement models in the same mesh,
 subject to support in the installed Vorflow version.
+
+See DEFAULTS_AUDIT.md for the complete parameter review, default rationale and
+the low-level options that intentionally remain automatic.
 
 MODFLOW 6 / DISV EXPORT
 The exporter creates:

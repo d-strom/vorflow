@@ -49,7 +49,7 @@ vorflow_qgis.zip
 ```bash
 git status
 git add vorflow_qgis
-git commit -m "Adapt QGIS wrapper to Vorflow short-face smoothing"
+git commit -m "Optimise QGIS mesh defaults and controls"
 git push -u origin dev
 ```
 
@@ -66,11 +66,11 @@ Create a tag after merging:
 ```bash
 git checkout main
 git pull origin main
-git tag -a qgis-v0.15.0 -m "Vorflow QGIS plugin 0.15.0"
-git push origin qgis-v0.15.0
+git tag -a qgis-v0.17.0 -m "Vorflow QGIS plugin 0.17.0"
+git push origin qgis-v0.17.0
 ```
 
-Then create a GitHub Release for `qgis-v0.15.0` and attach the QGIS-installable ZIP.
+Then create a GitHub Release for `qgis-v0.17.0` and attach the QGIS-installable ZIP.
 
 Do not commit credentials or personal access tokens. For HTTPS authentication,
 use Git Credential Manager or a GitHub personal access token when prompted.

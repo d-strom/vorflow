@@ -32,6 +32,12 @@ from qgis.core import (
 from qgis.gui import QgsMapLayerComboBox
 
 
+DEFAULT_BACKGROUND_SIZE = 100.0
+RECOMMENDED_GROWTH_FACTOR = 1.1
+RECOMMENDED_GROWTH_MODEL = "continuous_metric"
+RECOMMENDED_FIELD_SAMPLING = 25
+
+
 def parse_json(text, title):
     text = text.strip()
     if not text:
@@ -100,8 +106,31 @@ def build_fields(kwargs):
                 f"Unknown field type '{field_type}'. Allowed: "
                 + ", ".join(classes)
             )
-        fields.append(call_supported(classes[field_type], **specification))
+        field_class = classes[field_type]
+        _, parameters, accepts_kwargs = _callable_parameter_info(field_class)
+        unsupported = sorted(
+            key for key in specification
+            if key not in parameters and not accepts_kwargs
+        )
+        if unsupported:
+            raise RuntimeError(
+                f"The installed Vorflow does not support {field_type} "
+                f"parameter(s): {', '.join(unsupported)}. Install the Vorflow "
+                "version bundled with this plugin branch."
+            )
+        fields.append(field_class(**specification))
     kwargs["fields"] = fields
+    return kwargs
+
+
+def normalise_feature_parameters(kwargs):
+    """Translate plugin-only convenience controls to the Vorflow API."""
+    kwargs = dict(kwargs)
+    densify_spacing = kwargs.pop("densify_spacing", 0.0)
+    if kwargs.get("densify", False) and float(densify_spacing) > 0.0:
+        kwargs["densify"] = float(densify_spacing)
+    if "straddle_width" in kwargs and float(kwargs["straddle_width"]) <= 0.0:
+        kwargs["straddle_width"] = None
     return kwargs
 
 
@@ -149,11 +178,18 @@ PARAMETER_HELP = {
         "It is a target, not a guarantee of identical cells. The finest "
         "requirement from overlapping objects normally controls."
     ),
+    "refine_domain_boundary": (
+        "Refine model-domain boundary",
+        "When disabled, the domain only defines the model extent and the global "
+        "background size controls its interior. Enable this only when the outer "
+        "boundary itself needs smaller cells; its size-transition controls then "
+        "grade that finer boundary size back to the background size."
+    ),
     "growth_factor": (
         "Growth factor",
-        "Controls how quickly cell size may increase away from the object. Values close to "
-        "1 give a slow, smooth transition but more cells. Vorflow recommends 1.1 "
-        "for point and line refinements when cell regularity matters."
+        "Controls how quickly target edge length increases away from the object. "
+        "Values close to 1 give a slower, smoother transition but more cells. "
+        "The plugin uses 1.1 for every geometric transition."
     ),
     "embed": (
         "Embed geometry",
@@ -170,6 +206,12 @@ PARAMETER_HELP = {
         "Adds more vertices along geometry so the mesh can better "
         "follow its shape and the specified target-size variation."
     ),
+    "densify_spacing": (
+        "Densification spacing",
+        "Maximum source-geometry segment length. 0 uses the feature resolution; "
+        "a positive value gives independent control. It has no effect when "
+        "densification is disabled."
+    ),
     "snap_to_polygons": (
         "Snap to polygons",
         "Snaps lines to nearby polygon boundaries where supported by vorflow. "
@@ -179,6 +221,11 @@ PARAMETER_HELP = {
         "Barrier",
         "Treats the line as a barrier in the conceptual model. Use "
         "for objects across which connectivity or flow should not pass freely."
+    ),
+    "straddle_width": (
+        "Barrier straddle width",
+        "Distance between the paired generators used to align Voronoi faces "
+        "with a line. 0 lets Vorflow choose from the local resolution."
     ),
     "quad_buffer": (
         "Quad corridor",
@@ -201,11 +248,9 @@ PARAMETER_HELP = {
     ),
     "field_model": (
         "Refinement model",
-        "Standard uses the object's resolution and growth factor. The other "
-        "options create an explicit vorflow mesh field for distance-based "
-        "variation. Version 0.15 defaults to Geometric growth with edge_ratio "
-        "and sampling 25. Point and line layers use growth factor 1.1; domain "
-        "and polygon layers retain 1.2."
+        "Selects the explicit Vorflow size field used away from the geometry. "
+        "Geometric growth is the recommended general-purpose model; Threshold "
+        "and Exponential are retained for deliberately prescribed transitions."
     ),
     "size_min": (
         "Minimum size",
@@ -214,7 +259,7 @@ PARAMETER_HELP = {
     "size_max": (
         "Maximum size",
         "Maximum target size far from the object for ThresholdField or "
-        "ExponentialField."
+        "ExponentialField. 0 follows the run's global background size."
     ),
     "dist_min": (
         "Minimum distance",
@@ -235,15 +280,57 @@ PARAMETER_HELP = {
     ),
     "growth_model": (
         "Growth model",
-        "edge_ratio gives stepwise geometric edge growth. continuous_metric "
-        "gives a more continuous size function. edge_ratio is the recommended "
-        "robust default."
+        "continuous_metric uses log(growth_factor), which is the continuous "
+        "metric interpretation of a requested neighbouring-edge ratio and is "
+        "slightly gentler than edge_ratio. edge_ratio is retained for exact "
+        "backward comparisons."
     ),
     "smoothing_steps": (
         "Gmsh smoothing steps",
         "Number of Laplacian smoothing steps applied to the triangular Gmsh "
         "mesh. This can improve triangle shapes, but it is not Lloyd relaxation "
         "and normally does not centre Voronoi cells on their generators."
+    ),
+    "mesh_algorithm": (
+        "Gmsh 2D algorithm",
+        "Frontal-Delaunay (6) prioritises triangle quality and is the default. "
+        "Delaunay (5) can be faster on large or difficult models."
+    ),
+    "optimization_cycles": (
+        "Gmsh optimisation cycles",
+        "Additional Relocate2D and Laplace2D passes after meshing. Two passes "
+        "are Vorflow's quality-oriented default."
+    ),
+    "tolerance_initial_delaunay": (
+        "Initial Delaunay tolerance",
+        "Gmsh insertion tolerance. Keep 1e-8 unless near-degenerate geometry "
+        "causes 'Could not insert point' errors."
+    ),
+    "heal_shapes": (
+        "Heal OCC shapes",
+        "Optional topology repair before meshing. It can fix invalid tiny "
+        "entities but may merge or remove details, so it is disabled by default."
+    ),
+    "boundary_centering": (
+        "Boundary-cell centring",
+        "Inset + mirror moves non-corner boundary generators slightly inward "
+        "and mirrors ghost generators outside the domain. It improves typical "
+        "boundary orthogonality; Clip retains the historical behaviour."
+    ),
+    "lloyd_damping": (
+        "Lloyd damping",
+        "Fraction of each accepted centroid shift applied per pass. 1.0 uses "
+        "the complete shift and is Vorflow's tested default."
+    ),
+    "lloyd_tolerance": (
+        "Lloyd stopping tolerance",
+        "Stops early when the largest remaining shift relative to local mesh "
+        "size is below this value. Graded meshes commonly use all passes."
+    ),
+    "lloyd_size_smoothing": (
+        "Lloyd size smoothing",
+        "Smooths Gmsh's per-node size noise before it becomes Lloyd density. "
+        "Five passes is the tested default; excessive smoothing can flatten grading."
     ),
     "hex_ring": (
         "Hex ring around points",
@@ -307,6 +394,16 @@ class ParameterEditorWidget(QWidget):
         self.controls = {}
         self.overrides = {}
         defaults = defaults or {}
+        resolution_default = float(defaults.get("resolution", 10.0))
+        background_default = float(
+            defaults.get("background_size", DEFAULT_BACKGROUND_SIZE)
+        )
+        size_span = max(background_default - resolution_default, 0.0)
+        continuous_gradient = math.log(RECOMMENDED_GROWTH_FACTOR)
+        transition_length = max(
+            resolution_default,
+            size_span / continuous_gradient if size_span else resolution_default,
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -321,18 +418,20 @@ class ParameterEditorWidget(QWidget):
             make_double(defaults.get("resolution", 10.0), 0.000001),
         )
         if geometry_kind == "domain":
+            self._add_control(
+                basic_form, "refine_domain_boundary",
+                "Refine model-domain boundary:",
+                self._checkbox(defaults.get("refine_domain_boundary", False)),
+            )
             self.controls["resolution"].setToolTip(
                 "Target mesh size at the model-domain boundary. Away from the "
                 "boundary, the mesh may grow to the Global background size."
             )
-        self._add_control(
-            basic_form, "growth_factor", "Growth factor:",
-            make_double(defaults.get("growth_factor", 1.2), 1.0, 1000.0, 4),
-        )
-        self._add_control(
-            basic_form, "embed", "Embed geometry:",
-            self._checkbox(defaults.get("embed", True)),
-        )
+        if geometry_kind != "domain":
+            self._add_control(
+                basic_form, "embed", "Embed geometry:",
+                self._checkbox(defaults.get("embed", True)),
+            )
         self._add_control(
             basic_form, "simplify_tolerance", "Simplification tolerance:",
             make_double(defaults.get("simplify_tolerance", 0.0), 0.0),
@@ -357,9 +456,15 @@ class ParameterEditorWidget(QWidget):
                 self._checkbox(defaults.get("densify", True)),
             )
             self._add_control(
-                geometry_form, "z_order", "Priority (z-order):",
-                self._intspin(defaults.get("z_order", 0), -100000, 100000),
+                geometry_form, "densify_spacing",
+                "Densification spacing (0 = resolution):",
+                make_double(defaults.get("densify_spacing", 0.0), 0.0),
             )
+            if geometry_kind in ("line", "polygon"):
+                self._add_control(
+                    geometry_form, "z_order", "Priority (z-order):",
+                    self._intspin(defaults.get("z_order", 0), -100000, 100000),
+                )
             if geometry_kind == "line":
                 self._add_control(
                     geometry_form, "snap_to_polygons",
@@ -370,6 +475,11 @@ class ParameterEditorWidget(QWidget):
                     geometry_form, "is_barrier", "Treat as barrier:",
                     self._checkbox(defaults.get("is_barrier", False)),
                 )
+                self._add_control(
+                    geometry_form, "straddle_width",
+                    "Barrier straddle width (0 = automatic):",
+                    make_double(defaults.get("straddle_width", 0.0), 0.0),
+                )
             if geometry_kind in ("line", "polygon"):
                 self._add_control(
                     geometry_form, "quad_buffer",
@@ -379,15 +489,14 @@ class ParameterEditorWidget(QWidget):
                 self._add_control(
                     geometry_form, "quad_buffer_thickness",
                     "Number of quad rows:",
-                    self._intspin(defaults.get("quad_buffer_thickness", 1), 1, 1000),
+                    self._intspin(defaults.get("quad_buffer_thickness", 1), 1, 2),
                 )
             layout.addWidget(geometry)
 
-        refinement = QGroupBox("Advanced refinement model")
+        refinement = QGroupBox("Size transition away from geometry")
         refinement_form = QFormLayout(refinement)
         self.field_model = QComboBox()
-        self.field_model.addItem("Standard – resolution and growth factor", "standard")
-        self.field_model.addItem("Geometric growth", "geometric")
+        self.field_model.addItem("Geometric growth (recommended)", "geometric")
         self.field_model.addItem("Threshold", "threshold")
         self.field_model.addItem("Exponential", "exponential")
         model = defaults.get("field_model", "geometric")
@@ -413,25 +522,26 @@ class ParameterEditorWidget(QWidget):
 
         self.field_stack = QStackedWidget()
 
-        standard = QLabel(
-            "No additional mesh field. The object's resolution and growth factor are used."
-        )
-        standard.setWordWrap(True)
-        self.field_stack.addWidget(standard)
-
         geometric = QWidget()
         gf = QFormLayout(geometric)
         self.field_growth_factor = make_double(
-            defaults.get("field_growth_factor", defaults.get("growth_factor", 1.2)),
-            1.0, 1000.0, 4
+            defaults.get(
+                "field_growth_factor",
+                defaults.get("growth_factor", RECOMMENDED_GROWTH_FACTOR),
+            ),
+            1.0001, 1000.0, 4
         )
         self.growth_model = QComboBox()
-        self.growth_model.addItem("Edge ratio (edge_ratio)", "edge_ratio")
-        self.growth_model.addItem("Continuous metric (continuous_metric)", "continuous_metric")
-        growth_model = defaults.get("growth_model", "edge_ratio")
+        self.growth_model.addItem(
+            "Continuous metric (recommended)", "continuous_metric"
+        )
+        self.growth_model.addItem("Edge ratio (legacy comparison)", "edge_ratio")
+        growth_model = defaults.get("growth_model", RECOMMENDED_GROWTH_MODEL)
         growth_idx = self.growth_model.findData(growth_model)
         self.growth_model.setCurrentIndex(max(0, growth_idx))
-        self.field_sampling_g = self._intspin(defaults.get("sampling", 25), 1, 100000)
+        self.field_sampling_g = self._intspin(
+            defaults.get("sampling", RECOMMENDED_FIELD_SAMPLING), 1, 100000
+        )
         gf.addRow("Growth factor:", self.field_growth_factor)
         gf.addRow("Growth model:", self.growth_model)
         gf.addRow("Sampling:", self.field_sampling_g)
@@ -439,13 +549,23 @@ class ParameterEditorWidget(QWidget):
 
         threshold = QWidget()
         tf = QFormLayout(threshold)
-        self.threshold_min = make_double(defaults.get("size_min", 5.0), 0.000001)
-        self.threshold_max = make_double(defaults.get("size_max", 100.0), 0.000001)
-        self.dist_min = make_double(defaults.get("dist_min", 10.0), 0.0)
-        self.dist_max = make_double(defaults.get("dist_max", 500.0), 0.0)
-        self.field_sampling_t = self._intspin(defaults.get("sampling", 25), 1, 100000)
+        self.threshold_min = make_double(
+            defaults.get("size_min", resolution_default), 0.000001
+        )
+        self.threshold_max = make_double(
+            defaults.get("size_max", 0.0), 0.0
+        )
+        self.dist_min = make_double(
+            defaults.get("dist_min", resolution_default), 0.0
+        )
+        self.dist_max = make_double(
+            defaults.get("dist_max", resolution_default + transition_length), 0.0
+        )
+        self.field_sampling_t = self._intspin(
+            defaults.get("sampling", RECOMMENDED_FIELD_SAMPLING), 1, 100000
+        )
         tf.addRow("Minimum size:", self.threshold_min)
-        tf.addRow("Maximum size:", self.threshold_max)
+        tf.addRow("Maximum size (0 = global background):", self.threshold_max)
         tf.addRow("Minimum distance:", self.dist_min)
         tf.addRow("Maximum distance:", self.dist_max)
         tf.addRow("Sampling:", self.field_sampling_t)
@@ -453,12 +573,20 @@ class ParameterEditorWidget(QWidget):
 
         exponential = QWidget()
         ef = QFormLayout(exponential)
-        self.exp_min = make_double(defaults.get("size_min", 5.0), 0.000001)
-        self.exp_max = make_double(defaults.get("size_max", 100.0), 0.000001)
-        self.decay_length = make_double(defaults.get("decay_length", 150.0), 0.000001)
-        self.field_sampling_e = self._intspin(defaults.get("sampling", 25), 1, 100000)
+        self.exp_min = make_double(
+            defaults.get("size_min", resolution_default), 0.000001
+        )
+        self.exp_max = make_double(
+            defaults.get("size_max", 0.0), 0.0
+        )
+        self.decay_length = make_double(
+            defaults.get("decay_length", transition_length), 0.000001
+        )
+        self.field_sampling_e = self._intspin(
+            defaults.get("sampling", RECOMMENDED_FIELD_SAMPLING), 1, 100000
+        )
         ef.addRow("Minimum size:", self.exp_min)
-        ef.addRow("Maximum size:", self.exp_max)
+        ef.addRow("Maximum size (0 = global background):", self.exp_max)
         ef.addRow("Decay length:", self.decay_length)
         ef.addRow("Sampling:", self.field_sampling_e)
         self.field_stack.addWidget(exponential)
@@ -466,6 +594,13 @@ class ParameterEditorWidget(QWidget):
         refinement_form.addRow(self.field_stack)
         layout.addWidget(refinement)
         layout.addStretch()
+
+        if geometry_kind == "domain":
+            refine_boundary = self.controls["refine_domain_boundary"]
+            self.controls["resolution"].setEnabled(refine_boundary.isChecked())
+            refinement.setEnabled(refine_boundary.isChecked())
+            refine_boundary.toggled.connect(self.controls["resolution"].setEnabled)
+            refine_boundary.toggled.connect(refinement.setEnabled)
 
         self.field_model.currentIndexChanged.connect(self._update_field_page)
         self._update_field_page()
@@ -546,46 +681,63 @@ class ParameterEditorWidget(QWidget):
                     "sampling": self.field_sampling_g.value(),
                 }]
             elif model == "threshold":
-                if self.threshold_max.value() < self.threshold_min.value():
+                if (
+                    self.threshold_max.value() > 0
+                    and self.threshold_max.value() < self.threshold_min.value()
+                ):
                     raise ValueError("Maximum size must be greater than or equal to minimum size.")
                 if self.dist_max.value() < self.dist_min.value():
                     raise ValueError("Maximum distance must be greater than or equal to minimum distance.")
                 values["fields"] = [{
                     "type": "ThresholdField",
                     "size_min": self.threshold_min.value(),
-                    "size_max": self.threshold_max.value(),
+                    "size_max": (
+                        self.threshold_max.value()
+                        if self.threshold_max.value() > 0 else None
+                    ),
                     "dist_min": self.dist_min.value(),
                     "dist_max": self.dist_max.value(),
                     "sampling": self.field_sampling_t.value(),
                 }]
             elif model == "exponential":
-                if self.exp_max.value() < self.exp_min.value():
+                if (
+                    self.exp_max.value() > 0
+                    and self.exp_max.value() < self.exp_min.value()
+                ):
                     raise ValueError("Maximum size must be greater than or equal to minimum size.")
                 values["fields"] = [{
                     "type": "ExponentialField",
                     "size_min": self.exp_min.value(),
-                    "size_max": self.exp_max.value(),
+                    "size_max": (
+                        self.exp_max.value()
+                        if self.exp_max.value() > 0 else None
+                    ),
                     "decay_length": self.decay_length.value(),
                     "sampling": self.field_sampling_e.value(),
                 }]
-            else:
-                values.pop("fields", None)
         return values
 
     def summary(self):
         values = self.values()
+        if self.geometry_kind == "domain" and not values.get(
+            "refine_domain_boundary", False
+        ):
+            return "Domain extent only; boundary refinement disabled"
         parts = []
         if "resolution" in values:
             parts.append(f"size {values['resolution']:g}")
-        if "growth_factor" in values:
-            parts.append(f"growth {values['growth_factor']:g}")
+        if values.get("field_model") == "geometric" and "fields" in values:
+            field = values["fields"][0]
+            parts.append(
+                f"growth {field['growth_factor']:g} ({field['growth_model']})"
+            )
         if values.get("is_barrier"):
             parts.append("barrier")
         if values.get("quad_buffer"):
             parts.append(f"quad × {values.get('quad_buffer_thickness', 1)}")
         if values.get("hex_ring"):
             parts.append("hex ring")
-        if values.get("field_model") not in (None, "standard"):
+        if values.get("field_model") is not None:
             parts.append(str(values["field_model"]))
         return ", ".join(parts) if parts else "Inherits all global values"
 
@@ -720,11 +872,8 @@ class LayerSourceWidget(QGroupBox):
     def merged_parameters(self, global_parameters):
         parameters = dict(global_parameters)
         own = self.editor.values()
-        # A layer-specific Standard selection must also be able to disable a global field.
-        if own.get("field_model") == "standard":
-            parameters.pop("fields", None)
         parameters.update({k: v for k, v in own.items() if k != "field_model"})
-        return build_fields(parameters)
+        return build_fields(normalise_feature_parameters(parameters))
 
 
 class MultiLayerInputWidget(QWidget):
@@ -814,11 +963,17 @@ class ParameterHelpDialog(QDialog):
             "that every cell will have exactly that size.</p>",
         ]
         for key in (
-            "resolution", "growth_factor", "embed", "simplify_tolerance",
-            "densify", "snap_to_polygons", "is_barrier", "quad_buffer",
+            "resolution", "refine_domain_boundary", "growth_factor", "embed",
+            "simplify_tolerance",
+            "densify", "densify_spacing", "snap_to_polygons", "is_barrier",
+            "straddle_width", "quad_buffer",
             "quad_buffer_thickness", "z_order", "field_model", "size_min",
             "size_max", "dist_min", "dist_max", "decay_length", "sampling",
-            "growth_model"
+            "growth_model", "mesh_algorithm", "optimization_cycles",
+            "tolerance_initial_delaunay", "heal_shapes", "smoothing_steps",
+            "boundary_centering", "lloyd_iterations", "lloyd_damping",
+            "lloyd_tolerance", "lloyd_size_smoothing", "min_face_fraction",
+            "normalize_line_junctions", "junction_tolerance"
         ):
             title, body = PARAMETER_HELP[key]
             sections.append(f"<h3>{title}</h3><p>{body}</p>")
@@ -1123,9 +1278,9 @@ class VorflowDialog(QDialog):
         information = QLabel(
             "Add any number of point, line and polygon layers. "
             "Use global defaults and configure layer-specific overrides. "
-            "The recommended profile uses growth factor 1.1 for points and lines, "
-            "hex rings around points, 100 weighted Lloyd passes and short-face "
-            "clean-up at 0.2."
+            "The quality profile uses continuous-metric growth at 1.1 for every "
+            "feature type, hex rings around points, inset boundary centring, 100 "
+            "weighted Lloyd passes and short-face clean-up at 0.2."
         )
         information.setWordWrap(True)
         help_button = QPushButton("Parameter help…")
@@ -1145,14 +1300,19 @@ class VorflowDialog(QDialog):
             "The model domain must be a polygon layer. All valid polygons "
             "in the layer are merged into one domain geometry. Boundary "
             "resolution refines the domain edge; Global background size "
-            "controls the general size inside the domain."
+            "controls the general size inside the domain. The boundary growth "
+            "settings matter only when the boundary requests a finer size than "
+            "the global background."
         )
         domain_info.setWordWrap(True)
         self.domain_defaults = {
-            "zone_id": "domain", "resolution": 100.0, "z_order": -1000,
-            "densify": True, "embed": True, "growth_factor": 1.2,
+            "zone_id": "domain", "resolution": DEFAULT_BACKGROUND_SIZE,
+            "background_size": DEFAULT_BACKGROUND_SIZE, "densify": True,
+            "refine_domain_boundary": False,
             "simplify_tolerance": 0.0, "field_model": "geometric",
-            "growth_model": "edge_ratio", "sampling": 25
+            "field_growth_factor": RECOMMENDED_GROWTH_FACTOR,
+            "growth_model": RECOMMENDED_GROWTH_MODEL,
+            "sampling": RECOMMENDED_FIELD_SAMPLING,
         }
         self.domain_source = LayerSourceWidget(
             QgsMapLayerProxyModel.PolygonLayer, "domain", None,
@@ -1165,34 +1325,40 @@ class VorflowDialog(QDialog):
         self.points = MultiLayerInputWidget(
             "Point", QgsMapLayerProxyModel.PointLayer, "point",
             {
-                "resolution": 10.0, "growth_factor": 1.1,
+                "resolution": 10.0, "background_size": DEFAULT_BACKGROUND_SIZE,
                 "embed": True, "simplify_tolerance": 0.0,
                 "hex_ring": True,
-                "field_model": "geometric", "growth_model": "edge_ratio",
-                "sampling": 25
+                "field_model": "geometric",
+                "field_growth_factor": RECOMMENDED_GROWTH_FACTOR,
+                "growth_model": RECOMMENDED_GROWTH_MODEL,
+                "sampling": RECOMMENDED_FIELD_SAMPLING,
             }
         )
         self.lines = MultiLayerInputWidget(
             "Line", QgsMapLayerProxyModel.LineLayer, "line",
             {
-                "resolution": 10.0, "growth_factor": 1.1,
+                "resolution": 10.0, "background_size": DEFAULT_BACKGROUND_SIZE,
                 "snap_to_polygons": True, "is_barrier": False,
                 "densify": True, "simplify_tolerance": 0.0,
                 "embed": True, "quad_buffer": False,
                 "quad_buffer_thickness": 1, "z_order": 0,
-                "field_model": "geometric", "growth_model": "edge_ratio",
-                "sampling": 25
+                "field_model": "geometric",
+                "field_growth_factor": RECOMMENDED_GROWTH_FACTOR,
+                "growth_model": RECOMMENDED_GROWTH_MODEL,
+                "sampling": RECOMMENDED_FIELD_SAMPLING,
             }
         )
         self.polygons = MultiLayerInputWidget(
             "Polygon", QgsMapLayerProxyModel.PolygonLayer, "polygon",
             {
-                "resolution": 25.0, "growth_factor": 1.2,
+                "resolution": 25.0, "background_size": DEFAULT_BACKGROUND_SIZE,
                 "z_order": 1, "densify": True,
                 "simplify_tolerance": 0.0, "embed": True,
                 "quad_buffer": False, "quad_buffer_thickness": 1,
-                "field_model": "geometric", "growth_model": "edge_ratio",
-                "sampling": 25
+                "field_model": "geometric",
+                "field_growth_factor": RECOMMENDED_GROWTH_FACTOR,
+                "growth_model": RECOMMENDED_GROWTH_MODEL,
+                "sampling": RECOMMENDED_FIELD_SAMPLING,
             }
         )
 
@@ -1203,11 +1369,19 @@ class VorflowDialog(QDialog):
         tabs.addTab(geometry_tabs, "Geometry and refinement")
 
         mesh_tab = QWidget()
-        mesh_layout = QVBoxLayout(mesh_tab)
+        mesh_outer_layout = QVBoxLayout(mesh_tab)
+        mesh_outer_layout.setContentsMargins(0, 0, 0, 0)
+        mesh_scroll = QScrollArea()
+        mesh_scroll.setWidgetResizable(True)
+        mesh_content = QWidget()
+        mesh_layout = QVBoxLayout(mesh_content)
+        mesh_scroll.setWidget(mesh_content)
+        mesh_outer_layout.addWidget(mesh_scroll)
 
         conceptual_group = QGroupBox("Conceptual model")
         conceptual_form = QFormLayout(conceptual_group)
         self.connectivity_tolerance = make_double(0.001, 0.0, 1.0e12, 8)
+        self.connectivity_tolerance.setSingleStep(0.001)
         self.connectivity_tolerance.setToolTip(
             "Tolerance used to consider geometries connected. Choose a "
             "value that is small relative to the model scale."
@@ -1225,25 +1399,70 @@ class VorflowDialog(QDialog):
             PARAMETER_HELP["normalize_line_junctions"][1]
         )
         conceptual_form.addRow(self.normalize_line_junctions)
+        self.use_connectivity_for_junctions = QCheckBox(
+            "Use connectivity tolerance for line junctions"
+        )
+        self.use_connectivity_for_junctions.setChecked(True)
+        self.use_connectivity_for_junctions.setToolTip(
+            "Keeps the line-junction tolerance tied to the conceptual model's "
+            "connectivity tolerance. Clear only when line endpoints need a "
+            "separate repair distance."
+        )
         self.junction_tolerance = make_double(
             self.connectivity_tolerance.value(), 0.0, 1.0e12, 8
         )
+        self.junction_tolerance.setSingleStep(0.001)
+        self.junction_tolerance.setEnabled(False)
         self.junction_tolerance.setToolTip(PARAMETER_HELP["junction_tolerance"][1])
+        self.use_connectivity_for_junctions.toggled.connect(
+            lambda checked: self.junction_tolerance.setEnabled(
+                self.normalize_line_junctions.isChecked() and not checked
+            )
+        )
+        self.normalize_line_junctions.toggled.connect(
+            self.use_connectivity_for_junctions.setEnabled
+        )
+        self.normalize_line_junctions.toggled.connect(
+            lambda checked: self.junction_tolerance.setEnabled(
+                checked and not self.use_connectivity_for_junctions.isChecked()
+            )
+        )
+        conceptual_form.addRow(self.use_connectivity_for_junctions)
         conceptual_form.addRow("Line-junction tolerance:", self.junction_tolerance)
 
         mesh_group = QGroupBox("Gmsh / MeshGenerator")
         mesh_form = QFormLayout(mesh_group)
-        self.background_lc = make_double(100.0, 0.000001, 1.0e12, 4)
+        self.background_lc = make_double(
+            DEFAULT_BACKGROUND_SIZE, 0.000001, 1.0e12, 4
+        )
         self.background_lc.setToolTip(
             "Global background size where no finer object or mesh field controls the size."
         )
         self.verbosity = QComboBox()
         for level, description in (
-            (0, "0 – silent"), (1, "1 – errors"), (2, "2 – warnings"),
-            (3, "3 – information"), (4, "4 – detailed"), (5, "5 – debug")
+            (0, "0 – warnings and errors only"),
+            (1, "1 – progress (recommended)"),
+            (2, "2 – debug diagnostics"),
         ):
             self.verbosity.addItem(description, level)
         self.verbosity.setCurrentIndex(1)
+        self.mesh_algorithm = QComboBox()
+        self.mesh_algorithm.addItem("6 – Frontal-Delaunay (quality)", 6)
+        self.mesh_algorithm.addItem("5 – Delaunay (speed/robustness)", 5)
+        self.mesh_algorithm.setToolTip(PARAMETER_HELP["mesh_algorithm"][1])
+        self.optimization_cycles = QSpinBox()
+        self.optimization_cycles.setRange(0, 20)
+        self.optimization_cycles.setValue(2)
+        self.optimization_cycles.setToolTip(
+            PARAMETER_HELP["optimization_cycles"][1]
+        )
+        self.tolerance_initial_delaunay = make_double(
+            1.0e-8, 0.0, 1.0, 12
+        )
+        self.tolerance_initial_delaunay.setSingleStep(1.0e-8)
+        self.tolerance_initial_delaunay.setToolTip(
+            PARAMETER_HELP["tolerance_initial_delaunay"][1]
+        )
         self.use_smoothing_override = QCheckBox("Override Vorflow default")
         self.use_smoothing_override.setChecked(False)
         self.use_smoothing_override.setToolTip(
@@ -1260,10 +1479,41 @@ class VorflowDialog(QDialog):
         self.use_smoothing_override.toggled.connect(
             self.smoothing_steps.setEnabled
         )
+        self.heal_shapes = QCheckBox("Heal OCC shapes before meshing")
+        self.heal_shapes.setChecked(False)
+        self.heal_shapes.setToolTip(PARAMETER_HELP["heal_shapes"][1])
+        self.heal_tolerance = make_double(1.0e-8, 0.0, 1.0e6, 12)
+        self.heal_tolerance.setSingleStep(1.0e-8)
+        self.heal_tolerance.setEnabled(False)
+        self.heal_tolerance.setToolTip(
+            "Entities below this scale may be repaired, merged or removed."
+        )
+        self.heal_fix_degenerated = QCheckBox("Repair degenerated entities")
+        self.heal_fix_small_edges = QCheckBox("Repair very small edges")
+        self.heal_fix_small_faces = QCheckBox("Repair very small faces")
+        for option in (
+            self.heal_fix_degenerated,
+            self.heal_fix_small_edges,
+            self.heal_fix_small_faces,
+        ):
+            option.setChecked(True)
+            option.setEnabled(False)
+            self.heal_shapes.toggled.connect(option.setEnabled)
+        self.heal_shapes.toggled.connect(self.heal_tolerance.setEnabled)
         mesh_form.addRow("Global background size:", self.background_lc)
         mesh_form.addRow("Log level:", self.verbosity)
+        mesh_form.addRow("Gmsh 2D algorithm:", self.mesh_algorithm)
+        mesh_form.addRow("Optimisation cycles:", self.optimization_cycles)
+        mesh_form.addRow(
+            "Initial Delaunay tolerance:", self.tolerance_initial_delaunay
+        )
         mesh_form.addRow("Override Gmsh smoothing:", self.use_smoothing_override)
         mesh_form.addRow("Gmsh smoothing steps:", self.smoothing_steps)
+        mesh_form.addRow(self.heal_shapes)
+        mesh_form.addRow("Healing tolerance:", self.heal_tolerance)
+        mesh_form.addRow(self.heal_fix_degenerated)
+        mesh_form.addRow(self.heal_fix_small_edges)
+        mesh_form.addRow(self.heal_fix_small_faces)
 
         tess_group = QGroupBox("Voronoi tessellation")
         tess_form = QFormLayout(tess_group)
@@ -1274,6 +1524,37 @@ class VorflowDialog(QDialog):
         )
         tess_form.addRow(self.clip_boundary)
 
+        self.boundary_centering = QComboBox()
+        self.boundary_centering.addItem(
+            "Inset + mirror (recommended)", "inset_mirror"
+        )
+        self.boundary_centering.addItem("Clip only (historical)", "clip")
+        self.boundary_centering.setToolTip(
+            PARAMETER_HELP["boundary_centering"][1]
+        )
+        self.boundary_inset_fraction = make_double(0.25, 0.0001, 10.0, 4)
+        self.boundary_inset_fraction.setToolTip(
+            "Fraction of local boundary-node spacing used for the inward shift. "
+            "Vorflow's tested range is 0.2–0.3."
+        )
+        self.boundary_corner_angle = make_double(135.0, 0.0001, 179.9999, 2)
+        self.boundary_corner_angle.setToolTip(
+            "Boundary vertices sharper than this angle stay fixed."
+        )
+        self.boundary_centering.currentIndexChanged.connect(
+            lambda _index: self.boundary_inset_fraction.setEnabled(
+                self.boundary_centering.currentData() == "inset_mirror"
+            )
+        )
+        self.boundary_centering.currentIndexChanged.connect(
+            lambda _index: self.boundary_corner_angle.setEnabled(
+                self.boundary_centering.currentData() == "inset_mirror"
+            )
+        )
+        tess_form.addRow("Boundary-cell centring:", self.boundary_centering)
+        tess_form.addRow("Boundary inset fraction:", self.boundary_inset_fraction)
+        tess_form.addRow("Sharp-corner angle:", self.boundary_corner_angle)
+
         self.use_lloyd = QCheckBox("Enable weighted Lloyd relaxation")
         self.use_lloyd.setChecked(True)
         self.use_lloyd.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
@@ -1283,8 +1564,28 @@ class VorflowDialog(QDialog):
         self.lloyd_iterations.setEnabled(True)
         self.lloyd_iterations.setToolTip(PARAMETER_HELP["lloyd_iterations"][1])
         self.use_lloyd.toggled.connect(self.lloyd_iterations.setEnabled)
+        self.lloyd_damping = make_double(1.0, 0.0001, 1.0, 4)
+        self.lloyd_damping.setToolTip(PARAMETER_HELP["lloyd_damping"][1])
+        self.lloyd_tolerance = make_double(0.001, 0.0, 1.0e6, 8)
+        self.lloyd_tolerance.setSingleStep(0.0001)
+        self.lloyd_tolerance.setToolTip(PARAMETER_HELP["lloyd_tolerance"][1])
+        self.lloyd_size_smoothing = QSpinBox()
+        self.lloyd_size_smoothing.setRange(0, 1000)
+        self.lloyd_size_smoothing.setValue(5)
+        self.lloyd_size_smoothing.setToolTip(
+            PARAMETER_HELP["lloyd_size_smoothing"][1]
+        )
+        for option in (
+            self.lloyd_damping,
+            self.lloyd_tolerance,
+            self.lloyd_size_smoothing,
+        ):
+            self.use_lloyd.toggled.connect(option.setEnabled)
         tess_form.addRow(self.use_lloyd)
         tess_form.addRow("Lloyd iterations:", self.lloyd_iterations)
+        tess_form.addRow("Lloyd damping:", self.lloyd_damping)
+        tess_form.addRow("Lloyd stopping tolerance:", self.lloyd_tolerance)
+        tess_form.addRow("Lloyd size-smoothing passes:", self.lloyd_size_smoothing)
 
         self.use_min_face_fraction = QCheckBox("Remove very short cell faces")
         self.use_min_face_fraction.setChecked(True)
@@ -1331,7 +1632,7 @@ class VorflowDialog(QDialog):
         self.export_voronoi = QCheckBox()
         self.export_voronoi.setChecked(True)
         self.export_elements = QCheckBox()
-        self.export_elements.setChecked(True)
+        self.export_elements.setChecked(False)
         self.export_triangles = QCheckBox()
         self.export_quads = QCheckBox()
         self.export_quality = QCheckBox()
@@ -1584,12 +1885,43 @@ class VorflowDialog(QDialog):
         domain_geometry = unary_union(geometries)
         kwargs = source.merged_parameters({})
         zone_id = kwargs.pop("zone_id", "domain")
+        refine_boundary = bool(kwargs.pop("refine_domain_boundary", False))
+        boundary_size = float(kwargs.get("resolution", background_lc))
+        boundary_fields = kwargs.get("fields") or []
+        geometric_field = next(
+            (
+                field for field in boundary_fields
+                if type(field).__name__ == "GeometricGrowthField"
+            ),
+            None,
+        )
+        if not refine_boundary:
+            self.add_diagnostic(
+                "Model-domain boundary refinement is disabled; the boundary "
+                "defines extent only and the global background size controls "
+                "the general domain mesh."
+            )
+        elif geometric_field is not None and boundary_size >= background_lc:
+            self.add_diagnostic(
+                "Model-domain boundary grading is inactive because boundary "
+                f"resolution ({boundary_size:g}) is not finer than the global "
+                f"background size ({background_lc:g})."
+            )
+        elif geometric_field is not None:
+            self.add_diagnostic(
+                "Model-domain boundary grading is active: size "
+                f"{boundary_size:g} to {background_lc:g}, growth factor "
+                f"{geometric_field.growth_factor:g} "
+                f"({geometric_field.growth_model})."
+            )
 
         # The domain polygon defines the mesh extent. Keep its interior at the
         # global background size instead of applying the boundary resolution
         # as a constant size field throughout the polygon.
         domain_kwargs = dict(kwargs)
         domain_kwargs["resolution"] = background_lc
+        domain_kwargs["embed"] = True
+        domain_kwargs["z_order"] = -1000
         domain_kwargs.pop("fields", None)
         call_supported(
             blueprint.add_polygon, domain_geometry,
@@ -1599,8 +1931,11 @@ class VorflowDialog(QDialog):
         # Apply the configured domain resolution and growth field only to the
         # polygon boundary. The boundary is already part of the domain
         # topology, so this internal refinement line must not be embedded again.
+        if not refine_boundary:
+            return
         boundary_kwargs = dict(kwargs)
         boundary_kwargs["embed"] = False
+        boundary_kwargs["z_order"] = -1000
         call_supported(
             blueprint.add_line, domain_geometry.boundary,
             line_id=f"{zone_id}::boundary", **boundary_kwargs
@@ -2110,7 +2445,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             prefix = safe_name(self.output_name.text().strip() or "vorflow_grid")
             background_lc = self.background_lc.value()
             connectivity = self.connectivity_tolerance.value()
-            junction_tolerance = self.junction_tolerance.value()
+            junction_tolerance = (
+                None
+                if self.use_connectivity_for_junctions.isChecked()
+                else self.junction_tolerance.value()
+            )
             normalize_junctions = self.normalize_line_junctions.isChecked()
 
             self.set_progress(12, "Building conceptual model…")
@@ -2166,7 +2505,37 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             common_mesh_kwargs = {
                 "background_lc": background_lc,
                 "verbosity": self.verbosity.currentData(),
+                "mesh_algorithm": self.mesh_algorithm.currentData(),
+                "optimization_cycles": self.optimization_cycles.value(),
+                "tolerance_initial_delaunay": (
+                    self.tolerance_initial_delaunay.value()
+                ),
+                "heal_shapes": self.heal_shapes.isChecked(),
+                "heal_tolerance": self.heal_tolerance.value(),
+                "heal_fix_degenerated": self.heal_fix_degenerated.isChecked(),
+                "heal_fix_small_edges": self.heal_fix_small_edges.isChecked(),
+                "heal_fix_small_faces": self.heal_fix_small_faces.isChecked(),
             }
+            unsupported_mesh_controls = sorted(
+                key for key in common_mesh_kwargs
+                if key not in generator_parameters and not generator_kwargs
+            )
+            if unsupported_mesh_controls:
+                raise RuntimeError(
+                    "The installed Vorflow MeshGenerator does not support the "
+                    "plugin control(s): "
+                    + ", ".join(unsupported_mesh_controls)
+                    + ". Install the Vorflow version bundled with this plugin "
+                    "branch."
+                )
+            self.add_diagnostic(
+                "Gmsh controls: algorithm "
+                f"{common_mesh_kwargs['mesh_algorithm']}, optimisation cycles "
+                f"{common_mesh_kwargs['optimization_cycles']}, initial Delaunay "
+                f"tolerance {common_mesh_kwargs['tolerance_initial_delaunay']:g}, "
+                f"shape healing "
+                f"{'enabled' if common_mesh_kwargs['heal_shapes'] else 'disabled'}."
+            )
             smoothing_route = None
             constructor_kwargs = dict(common_mesh_kwargs)
             if smoothing_override and "smoothing_steps" in generator_parameters:
@@ -2303,8 +2672,30 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     else 0.0
                 )
                 tess_kwargs = {
-                    "clip_to_boundary": self.clip_boundary.isChecked()
+                    "clip_to_boundary": self.clip_boundary.isChecked(),
+                    "boundary_centering": self.boundary_centering.currentData(),
+                    "boundary_inset_fraction": self.boundary_inset_fraction.value(),
+                    "boundary_corner_angle": self.boundary_corner_angle.value(),
                 }
+                self.add_diagnostic(
+                    "Boundary-cell centring: "
+                    f"{tess_kwargs['boundary_centering']}; clipping "
+                    f"{'enabled' if tess_kwargs['clip_to_boundary'] else 'disabled'}, "
+                    f"inset fraction {tess_kwargs['boundary_inset_fraction']:g}, "
+                    f"corner angle {tess_kwargs['boundary_corner_angle']:g} degrees."
+                )
+                if (
+                    self.boundary_centering.currentData() != "clip"
+                    and not self.accepts_keyword(
+                        VoronoiTessellator, "boundary_centering"
+                    )
+                ):
+                    raise RuntimeError(
+                        "Inset boundary centring is selected, but the installed "
+                        "Vorflow does not expose boundary_centering. Install the "
+                        "Vorflow version bundled with this plugin branch or select "
+                        "Clip only."
+                    )
                 tess_status_parts = []
                 if lloyd_count:
                     if not self.accepts_keyword(
@@ -2317,8 +2708,23 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                             "Rui's point-centring change (#32)."
                         )
                     tess_kwargs["lloyd_iterations"] = lloyd_count
+                    for keyword, value in (
+                        ("lloyd_damping", self.lloyd_damping.value()),
+                        ("lloyd_tolerance", self.lloyd_tolerance.value()),
+                        ("lloyd_size_smoothing", self.lloyd_size_smoothing.value()),
+                    ):
+                        if not self.accepts_keyword(VoronoiTessellator, keyword):
+                            raise RuntimeError(
+                                f"Weighted Lloyd relaxation requires {keyword}, but "
+                                "the installed Vorflow does not expose it. Install "
+                                "the Vorflow version bundled with this plugin branch."
+                            )
+                        tess_kwargs[keyword] = value
                     self.add_diagnostic(
-                        f"Weighted Lloyd iterations requested: {lloyd_count}"
+                        f"Weighted Lloyd requested: {lloyd_count} iterations, "
+                        f"damping {self.lloyd_damping.value():g}, tolerance "
+                        f"{self.lloyd_tolerance.value():g}, size smoothing "
+                        f"{self.lloyd_size_smoothing.value()} pass(es)."
                     )
                     tess_status_parts.append(
                         f"{lloyd_count} weighted Lloyd iterations"
