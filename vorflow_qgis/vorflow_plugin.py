@@ -267,6 +267,19 @@ PARAMETER_HELP = {
         "A value of 0.2 is recommended. Fixed generators at wells, lines and boundaries "
         "stay in place; 0 disables the clean-up."
     ),
+    "junction_tolerance": (
+        "Line-junction tolerance",
+        "Vorflow-only tolerance for normalising embedded line crossings before Gmsh. "
+        "Exact crossings are made explicit as shared line vertices. Nearby line "
+        "endpoints are connected only when they are within this distance. Parallel "
+        "lines are not merged. Use project map units, normally metres."
+    ),
+    "normalize_line_junctions": (
+        "Normalise embedded line junctions",
+        "Makes embedded line/line crossings explicit inside Vorflow before meshing. "
+        "This is not QGIS pre-processing and does not merge Voronoi cells. Disable "
+        "only for strict backward-comparison runs."
+    ),
 }
 
 
@@ -1204,6 +1217,20 @@ class VorflowDialog(QDialog):
             self.connectivity_tolerance
         )
 
+        # These controls are forwarded to Vorflow. QGIS does not alter the
+        # line geometry before the conceptual model is generated.
+        self.normalize_line_junctions = QCheckBox("Normalise embedded line junctions")
+        self.normalize_line_junctions.setChecked(True)
+        self.normalize_line_junctions.setToolTip(
+            PARAMETER_HELP["normalize_line_junctions"][1]
+        )
+        conceptual_form.addRow(self.normalize_line_junctions)
+        self.junction_tolerance = make_double(
+            self.connectivity_tolerance.value(), 0.0, 1.0e12, 8
+        )
+        self.junction_tolerance.setToolTip(PARAMETER_HELP["junction_tolerance"][1])
+        conceptual_form.addRow("Line-junction tolerance:", self.junction_tolerance)
+
         mesh_group = QGroupBox("Gmsh / MeshGenerator")
         mesh_form = QFormLayout(mesh_group)
         self.background_lc = make_double(100.0, 0.000001, 1.0e12, 4)
@@ -2083,11 +2110,15 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             prefix = safe_name(self.output_name.text().strip() or "vorflow_grid")
             background_lc = self.background_lc.value()
             connectivity = self.connectivity_tolerance.value()
+            junction_tolerance = self.junction_tolerance.value()
+            normalize_junctions = self.normalize_line_junctions.isChecked()
 
             self.set_progress(12, "Building conceptual model…")
             blueprint = call_supported(
                 ConceptualMesh, crs=crs.authid(),
-                connectivity_tolerance=connectivity
+                connectivity_tolerance=connectivity,
+                junction_tolerance=junction_tolerance,
+                normalize_line_junctions=normalize_junctions,
             )
             self.add_domain(blueprint, background_lc)
             self.add_sources(
@@ -2102,6 +2133,15 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
 
             self.set_progress(None, "Cleaning and connecting geometries…", busy=True)
             clean_polygons, clean_lines, clean_points = blueprint.generate()
+            junction_report = getattr(blueprint, "junction_diagnostics", None)
+            if junction_report is not None:
+                self.add_diagnostic(
+                    "Embedded line-junction normalisation: "
+                    f"{'enabled' if junction_report.get('enabled', False) else 'disabled'}; "
+                    f"{junction_report.get('junction_count', 0)} junction(s), "
+                    f"{junction_report.get('noded_pairs', 0)} exact pair(s) noded, "
+                    f"{junction_report.get('endpoint_snaps', 0)} endpoint connection(s)."
+                )
             self.set_progress(27, "Conceptual model completed.")
 
             self.set_progress(32, "Checking the MeshGenerator API…")

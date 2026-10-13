@@ -1,7 +1,7 @@
 [general]
 name=Vorflow for QGIS
-description=Generate Vorflow/Gmsh meshes in QGIS with smooth 1.1 grading, hex-ring well cells, weighted Lloyd relaxation, short-face clean-up, quality inspection, and MODFLOW 6 DISV export.
-version=0.15.0
+description=Generate Vorflow/Gmsh meshes in QGIS with internal embedded-line junction normalisation, smooth 1.1 grading, hex-ring well cells, weighted Lloyd relaxation, short-face clean-up, quality inspection, and MODFLOW 6 DISV export.
+version=0.16.0
 qgisMinimumVersion=3.28
 author=David Ström
 email=

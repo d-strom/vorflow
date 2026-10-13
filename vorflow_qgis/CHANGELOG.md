@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.0
+
+- Added controls for Vorflow internal embedded-line junction normalisation.
+- QGIS now passes `junction_tolerance` and `normalize_line_junctions` to
+  `ConceptualMesh` when supported.
+- Added run diagnostics reporting exact line crossings noded and nearby
+  endpoints connected.
+- No QGIS-side line splitting or Voronoi post-processing is performed.
+
 ## 0.15.0
 
 - Updated the recommended defaults from the Vorflow developer's grid-quality

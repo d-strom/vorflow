@@ -9,6 +9,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Embedded line-junction normalisation before Gmsh. Exact intersections are
+  made explicit as shared line vertices, while nearby endpoint-to-line
+  connections can be repaired conservatively within `junction_tolerance`.
+- `ConceptualMesh(..., junction_tolerance=..., normalize_line_junctions=...)`
+  and per-run `generate(junction_tolerance=...)` control the new behaviour.
+  Results are exposed in `ConceptualMesh.junction_diagnostics`.
 - `VoronoiTessellator(..., lloyd_size_smoothing=5)` smooths the per-node
   sizes behind the Lloyd density before relaxing
   ([#31](https://github.com/rhugman/vorflow/issues/31)). Gmsh's node sizes
@@ -51,6 +57,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   share of cells with very short faces peaks. Head accuracy depends mainly on
   `growth_factor`: in a Thiem test, 100 passes improved the head RMSE by at
   most about 5% at 5-10 times the build time.
+- Embedded field-only lines (`embed=False`) remain unchanged, and lateral
+  near-parallel lines are not connected by junction normalisation.
 
 ## [0.2.0] - 2026-10-05
 

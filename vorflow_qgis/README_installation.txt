@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.15.0
+VORFLOW FOR QGIS 0.16.0
 ======================
 
 AUTHOR
@@ -104,6 +104,24 @@ count, centroid-based orthogonality, and CVFD-skewness diagnostics. The
 quality GeoPackage contains one feature per Voronoi cell and the QGIS quality
 group provides themed views of the principal metrics.
 
+
+EMBEDDED LINE JUNCTION NORMALISATION
+------------------------------------
+Version 0.16 adds two conceptual-model controls:
+
+- Normalise embedded line junctions (enabled by default)
+- Line-junction tolerance (default: the connectivity tolerance)
+
+The QGIS plugin passes these values to Vorflow. Vorflow then makes exact
+embedded line crossings explicit as shared line vertices and connects nearby
+line endpoints within the junction tolerance. Field-only lines (`embed=False`)
+are not modified, and nearby parallel lines are not merged. QGIS performs no
+geometry pre-processing for this feature.
+
+The new controls require a Vorflow package that supports
+`junction_tolerance` and `normalize_line_junctions`. With an older Vorflow
+version, the plugin's compatibility filter safely omits the new arguments,
+but junction normalisation will not be active.
 
 GMSH SMOOTHING, WEIGHTED LLOYD AND SHORT FACES
 Gmsh `smoothing_steps` performs Laplacian smoothing of the auxiliary triangle

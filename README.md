@@ -229,6 +229,26 @@ steady radial-flow (Thiem) test
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
 
+## Embedded line-junction normalisation
+
+Vorflow normalises embedded line networks before Gmsh meshing. Exact
+intersections are made explicit as shared line vertices, and nearby
+endpoint-to-line connections can be repaired within `junction_tolerance`.
+Field-only lines (`embed=False`) and nearby parallel lines are not merged.
+
+```python
+blueprint = ConceptualMesh(
+    crs="EPSG:3006",
+    connectivity_tolerance=0.001,
+    junction_tolerance=0.001,
+    normalize_line_junctions=True,
+)
+```
+
+The run result is available in `blueprint.junction_diagnostics`. See
+[`JUNCTION_PATCH.md`](JUNCTION_PATCH.md) for the API, algorithmic scope, and
+limitations.
+
 ## Examples
 
 The [examples/](https://github.com/rhugman/vorflow/tree/main/examples)
