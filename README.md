@@ -9,13 +9,19 @@
 [![PyPI](https://img.shields.io/pypi/v/vorflow)](https://pypi.org/project/vorflow/)
 [![Python](https://img.shields.io/pypi/pyversions/vorflow)](https://pypi.org/project/vorflow/)
 [![Tests](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml/badge.svg)](https://github.com/rhugman/vorflow/actions/workflows/python-app.yml)
+[![Docs](https://github.com/rhugman/vorflow/actions/workflows/docs.yml/badge.svg)](https://rhugman.github.io/vorflow/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rhugman/vorflow/blob/main/LICENSE)
 
 Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas.
 
+Documentation, including the API reference and executed example notebooks:
+<https://rhugman.github.io/vorflow/>
+
 `vorflow` is a Python package for creating 2D unstructured Voronoi cell meshes for groundwater modeling, particularly for MODFLOW 6. It leverages the power of `Gmsh` for robust triangular meshing and `Shapely`/`GeoPandas` for geometric operations.
 
 The process is designed to translate a conceptual model—defined by geometric features like polygons, lines, and points—into a high-quality Voronoi grid suitable for numerical simulation.
+
+<!-- docs:overview-start -->
 
 ## Core Components
 
@@ -33,9 +39,11 @@ The typical workflow follows these steps:
 
 1.  **Define Geometry**: Create `shapely` objects for your model features (domain boundary, rivers, wells, etc.).
 2.  **Create a Blueprint**: Instantiate `ConceptualMesh` and add your geometries, specifying parameters like mesh resolution, refinement distances, and feature types (e.g., barriers).
-3.  **Generate Mesh**: Instantiate `MeshGenerator` and call its `generate()` method with the processed geometries from the blueprint. This produces a triangular mesh.
-4.  **Tessellate to Voronoi**: Instantiate `VoronoiTessellator` with the generated mesh and the blueprint. Calling its `generate()` method produces the final `GeoDataFrame` of Voronoi cells.
+3.  **Generate Mesh**: Instantiate `MeshGenerator` with the blueprint (`conceptual_mesh=blueprint`) and call its `generate()` method. It cleans the blueprint's features and produces a triangular mesh.
+4.  **Tessellate to Voronoi**: Instantiate `VoronoiTessellator` with the mesh generator. Calling its `generate()` method produces the final `GeoDataFrame` of Voronoi cells, also kept as `tessellator.grid`.
 5.  **Export**: The resulting `GeoDataFrame` can be easily saved to a shapefile or other formats.
+
+<!-- docs:installation-start -->
 
 ## Installation
 
@@ -81,10 +89,11 @@ cd vorflow
 pip install -e ".[dev]"
 ```
 
-For plotting examples and notebooks without all development tools:
+The `plot()` methods need Matplotlib, from the `plot` extra; the `examples`
+extra installs it for the example scripts and notebooks:
 
 ```bash
-pip install -e ".[examples]"
+pip install -e ".[plot]"
 ```
 
 Alternatively, create the Conda development environment from
@@ -94,6 +103,8 @@ which installs the package in editable mode with the `dev` extra:
 ```bash
 micromamba env create -f etc/environment.yml
 ```
+
+<!-- docs:usage-start -->
 
 ## Basic Usage
 
@@ -126,15 +137,77 @@ blueprint.add_line(
     is_barrier=True,
 )
 
-clean_polys, clean_lines, clean_pts = blueprint.generate()
+mesher = MeshGenerator(background_lc=100, conceptual_mesh=blueprint)
+mesher.generate()
 
-mesher = MeshGenerator(background_lc=100)
-mesher.generate(clean_polys, clean_lines, clean_pts)
-
-tessellator = VoronoiTessellator(mesher, blueprint, clip_to_boundary=True)
+tessellator = VoronoiTessellator(mesher, clip_to_boundary=True)
 grid_gdf = tessellator.generate()
 if grid_gdf.empty:
     raise RuntimeError("Basic Usage generated an empty Voronoi grid")
+```
+
+`mesher.generate()` runs `blueprint.generate()` itself. To inspect or edit the
+cleaned features before meshing, call it yourself and pass the three
+GeoDataFrames on; keep their index, which links refinement fields back to
+their features:
+
+```python
+clean_polys, clean_lines, clean_pts = blueprint.generate()
+mesher = MeshGenerator(background_lc=100)
+mesher.generate(clean_polys, clean_lines, clean_pts)
+tessellator = VoronoiTessellator(mesher, blueprint)
+```
+
+### Plotting
+
+Each stage has a `plot()` method (Matplotlib, from the `plot` extra). Each
+takes an optional `ax` and returns the axes, so the stages can be overlaid:
+
+```python
+blueprint.plot()                    # registered features; plot(clean=True) after generate()
+mesher.plot()                       # triangular mesh; column="zone_id" to colour it
+tessellator.plot(column="zone_id")  # Voronoi cells; show_generators=True adds x/y
+```
+
+Keyword arguments go to `GeoDataFrame.plot`, and the returned axes take
+further layers:
+
+```python
+import matplotlib.pyplot as plt
+
+ax = tessellator.plot(column=None, facecolor="whitesmoke", edgecolor="0.4")
+ax.plot(*fault_line.xy, color="tab:red", label="Fault-1 (barrier)")
+ax.plot(well_point.x, well_point.y, "o", color="tab:blue", label="Well-A")
+ax.legend()
+plt.show()
+```
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rhugman/vorflow/main/docs/images/basic_usage.png"
+       alt="Basic Usage grid: cells refine towards the fault barrier at x = 100 and around the well at (25, 25)"
+       width="60%">
+</p>
+
+### MODFLOW 6 export
+
+`to_disv()` returns the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`,
+`vertices`, `cell2d`), zero-based as flopy takes them. Cell centres are the
+generator points, vertices are listed clockwise and shared between neighbours,
+and `node_id` maps each `icell2d` back to its grid row:
+
+```python
+disv = tessellator.to_disv()
+```
+
+With flopy installed, `to_modflowgwfdisv()` adds the DISV package to a model
+directly; further keywords go to `flopy.mf6.ModflowGwfdisv`:
+
+```python
+import flopy
+
+sim = flopy.mf6.MFSimulation(sim_ws="model")
+gwf = flopy.mf6.ModflowGwf(sim, modelname="vorflow")
+tessellator.to_modflowgwfdisv(gwf, top=10.0, botm=[0.0, -10.0], nlay=2)
 ```
 
 ### Optional file export
@@ -143,7 +216,7 @@ GeoPandas writes formats such as Shapefile and GeoPackage through an I/O engine
 such as Pyogrio or Fiona. Install one of those engines before calling:
 
 ```python
-grid_gdf.to_file("mf6_grid.gpkg", driver="GPKG")
+tessellator.to_file("mf6_grid.gpkg", driver="GPKG")
 ```
 
 ### Mesh gradation
@@ -229,25 +302,7 @@ steady radial-flow (Thiem) test
 threefold, while 100 Lloyd passes improved it by at most about 5%. Lower
 `growth_factor` (or the resolution) where accuracy matters.
 
-## Embedded line-junction normalisation
-
-Vorflow normalises embedded line networks before Gmsh meshing. Exact
-intersections are made explicit as shared line vertices, and nearby
-endpoint-to-line connections can be repaired within `junction_tolerance`.
-Field-only lines (`embed=False`) and nearby parallel lines are not merged.
-
-```python
-blueprint = ConceptualMesh(
-    crs="EPSG:3006",
-    connectivity_tolerance=0.001,
-    junction_tolerance=0.001,
-    normalize_line_junctions=True,
-)
-```
-
-The run result is available in `blueprint.junction_diagnostics`. See
-[`JUNCTION_PATCH.md`](JUNCTION_PATCH.md) for the API, algorithmic scope, and
-limitations.
+<!-- docs:usage-end -->
 
 ## Examples
 
@@ -259,10 +314,34 @@ buffers, active-domain workflows, and triangular element-grid export.
 compares Gmsh smoothing, `hex_ring` and `lloyd_iterations` for centring cells
 around wells.
 
-## Roadmap
+## Contributing
 
-See [ROADMAP.md](https://github.com/rhugman/vorflow/blob/main/ROADMAP.md)
-for planned and completed milestones.
+Bug reports, questions and pull requests are welcome; see
+[CONTRIBUTING.md](https://github.com/rhugman/vorflow/blob/main/CONTRIBUTING.md).
+Everyone taking part follows the
+[Code of Conduct](https://github.com/rhugman/vorflow/blob/main/CODE_OF_CONDUCT.md).
+
+## Citing
+
+If you use `vorflow` in your work, please cite it using the metadata in
+[CITATION.cff](https://github.com/rhugman/vorflow/blob/main/CITATION.cff)
+(GitHub's "Cite this repository" button formats it).
+
+## Acknowledgements
+
+Thanks to David ([@d-strom](https://github.com/d-strom)) for reporting the
+line-junction problem in [#31](https://github.com/rhugman/vorflow/issues/31)
+and for [#35](https://github.com/rhugman/vorflow/pull/35), whose parallel-line
+guard and junction diagnostics are part of the line-junction handling.
+
+## QGIS integration in this fork
+
+The `dev` branch of [d-strom/vorflow](https://github.com/d-strom/vorflow/tree/dev)
+includes the independent **Vorflow for QGIS 0.18.0** wrapper. It integrates
+upstream `develop` through `27712b2` (20 October 2026), with native upstream
+line-junction handling and DISV topology. See
+[installation instructions](vorflow_qgis/README_installation.txt) and the
+[upstream feature assessment](vorflow_qgis/UPSTREAM_SYNC.md).
 
 ## License
 

@@ -221,3 +221,11 @@ benchmarks/
 
 # Local conda environment in repo root
 .conda/
+
+# Sphinx build artefacts
+docs/generated/
+docs/examples/
+docs/jupyter_execute/
+
+# JOSS paper build output
+paper/paper.pdf

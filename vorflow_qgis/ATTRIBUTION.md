@@ -19,15 +19,15 @@ For current and authoritative information about the original authors,
 repository and licence, use:
 
 - Vorflow project page: https://pypi.org/project/vorflow/
-- The upstream source-repository link published on that project page
+- Upstream source: https://github.com/rhugman/vorflow
+- Licence: MIT; see https://github.com/rhugman/vorflow/blob/develop/LICENSE
 - The licence and author metadata included with the installed Vorflow package
 
 The plugin does not bundle Vorflow and does not claim authorship of it. Keep
 this notice when redistributing or modifying the plugin.
 
-> Before publishing your fork, add the exact upstream GitHub URL and licence
-> identifier here if they are known from your Vorflow installation or fork.
-> Do not guess an author name or licence.
+The upstream package metadata credits Rui Hugman, Oscar Sanchez and the
+project's contributors. The integration baseline is recorded in UPSTREAM_SYNC.md.
 
 ## Other referenced projects
 

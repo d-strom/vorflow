@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.17.0
+VORFLOW FOR QGIS 0.18.0
 ======================
 
 AUTHOR
@@ -22,8 +22,15 @@ INSTALLATION
 For the matching Vorflow features on this development branch, open OSGeo4W
 Shell on Windows and run:
 
-    python -m pip install geopandas shapely scipy gmsh pyogrio
-    python -m pip install --no-deps --force-reinstall "vorflow @ git+https://github.com/d-strom/vorflow.git@dev"
+    python -m pip install --upgrade "vorflow @ git+https://github.com/d-strom/vorflow.git@dev" pyogrio
+
+Vorflow 0.3.0 or newer supports the required API. The fork's dev branch also
+includes upstream develop fixes through 20 October 2026. To install that
+exact upstream source without Git, use this alternative:
+
+    python -m pip install --upgrade "https://github.com/rhugman/vorflow/archive/27712b2fc937688b66ca23f7f6d61f0c78146f94.zip" pyogrio
+
+pip resolves declared runtime dependencies. Use QGIS's Python environment.
 
 4. Restart QGIS.
 
@@ -38,7 +45,7 @@ MAIN WORKFLOW
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
 
-QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.17
+QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.18
 - Refinement model: Geometric growth (GeometricGrowthField)
 - Growth model: continuous_metric
 - Growth factor: 1.1 for points, lines, polygons and optional domain-boundary refinement
@@ -49,6 +56,7 @@ QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.17
 - Lloyd damping / tolerance / size smoothing: 1.0 / 0.001 / 5
 - Minimum face fraction: 0.2
 - Sampling: 25
+- Embedded line-junction spacing fraction: 0.5 (0 disables normalisation)
 
 The continuous-metric interpretation uses log(growth_factor), making 1.1 about
 4.7% gentler than the legacy edge-ratio interpretation. Hex rings create
@@ -97,6 +105,13 @@ conditions, wells, recharge or storage packages. TOP, BOTM, starting head and
 hydraulic conductivity are constant in this version. Review all geometry and
 model data before simulation.
 
+DISV geometry uses upstream grid_to_disv(): cell centres are Vorflow generator
+x/y coordinates, shared vertices are preserved, and hanging vertices are
+inserted into neighbouring edges. File indices are one-based. The cell2d CSV
+includes node_id to map each MODFLOW cell back to the original grid.
+Edge-vertex tolerance 0 uses upstream's scale-aware default; positive values
+set the edge insertion tolerance without rounding or merging coordinates.
+
 ICON
 The included icon is original plugin artwork based on a Voronoi-cell motif.
 It is not copied from the upstream Vorflow repository. This avoids reusing
@@ -119,21 +134,22 @@ group provides themed views of the principal metrics.
 
 EMBEDDED LINE JUNCTION NORMALISATION
 ------------------------------------
-Version 0.16 adds two conceptual-model controls:
+Version 0.18 uses upstream's current conceptual-model controls:
 
 - Normalise embedded line junctions (enabled by default)
-- Line-junction tolerance (default: the connectivity tolerance)
+- Line-junction spacing fraction (default: 0.5)
 
-The QGIS plugin passes these values to Vorflow. Vorflow then makes exact
-embedded line crossings explicit as shared line vertices and connects nearby
-line endpoints within the junction tolerance. Field-only lines (`embed=False`)
-are not modified, and nearby parallel lines are not merged. QGIS performs no
-geometry pre-processing for this feature.
+The fraction multiplies each line's numeric densification spacing or its
+resolution. Vorflow snaps near-miss endpoints, trims short overshoots and
+pins shared junctions before densification. Connectivity tolerance remains
+the absolute touching tolerance. Field-only, barrier/straddle and quad-buffer
+lines are excluded, nearby parallel lines stay separate, and polygon-boundary
+anchors stay fixed. QGIS performs no geometry pre-processing for this feature.
 
-The new controls require a Vorflow package that supports
-`junction_tolerance` and `normalize_line_junctions`. With an older Vorflow
-version, the plugin's compatibility filter safely omits the new arguments,
-but junction normalisation will not be active.
+The plugin passes line_junction_fraction=0 when normalisation is disabled.
+Vorflow 0.3.0 or newer is required. Older fork-only junction_tolerance and
+normalize_line_junctions arguments have been replaced. The plugin stops with
+an update instruction if the installed API is incompatible.
 
 GMSH SMOOTHING, WEIGHTED LLOYD AND SHORT FACES
 Gmsh `smoothing_steps` performs Laplacian smoothing of the auxiliary triangle
@@ -170,14 +186,10 @@ The algorithms themselves belong to the upstream ``vorflow`` package, not
 to this QGIS plugin. The plugin checks the installed API and stops with a
 clear error rather than silently ignoring an unsupported option.
 
-For testing the feature branch in a fresh environment:
-
-    python -m venv vorflow-pr
-    vorflow-pr\Scripts\activate
-    pip install "vorflow @ git+https://github.com/rhugman/vorflow.git@feat/lloyd-size-smoothing"
-
 If QGIS uses a different Python interpreter, install the package into that
 exact interpreter/environment. Restart QGIS after installation.
+
+See UPSTREAM_SYNC.md for the complete upstream feature assessment.
 
 Progress reporting
 ------------------

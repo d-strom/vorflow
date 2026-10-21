@@ -78,6 +78,22 @@ def _callable_parameter_info(function):
     return signature, parameters, accepts_kwargs
 
 
+def build_conceptual_mesh(mesh_class, *, crs, connectivity_tolerance,
+                          line_junction_fraction):
+    """Require the upstream junction API so selected controls take effect."""
+    _, parameters, accepts_kwargs = _callable_parameter_info(mesh_class)
+    if "line_junction_fraction" not in parameters and not accepts_kwargs:
+        raise RuntimeError(
+            "This plugin requires Vorflow 0.3.0 or newer with "
+            "ConceptualMesh(line_junction_fraction=...). Update Vorflow in "
+            "the QGIS Python environment; see README_installation.txt."
+        )
+    return mesh_class(
+        crs=crs, connectivity_tolerance=connectivity_tolerance,
+        line_junction_fraction=line_junction_fraction,
+    )
+
+
 def build_fields(kwargs):
     """Convert JSON definitions of Vorflow fields to MeshField objects."""
     kwargs = dict(kwargs)
@@ -354,12 +370,14 @@ PARAMETER_HELP = {
         "A value of 0.2 is recommended. Fixed generators at wells, lines and boundaries "
         "stay in place; 0 disables the clean-up."
     ),
-    "junction_tolerance": (
-        "Line-junction tolerance",
-        "Vorflow-only tolerance for normalising embedded line crossings before Gmsh. "
-        "Exact crossings are made explicit as shared line vertices. Nearby line "
-        "endpoints are connected only when they are within this distance. Parallel "
-        "lines are not merged. Use project map units, normally metres."
+    "line_junction_fraction": (
+        "Line-junction spacing fraction",
+        "Vorflow connects near-miss line ends, trims short overshoots and spaces "
+        "vertices away from shared junctions before densification. The threshold "
+        "is this fraction of each line's densification spacing, or resolution. "
+        "The upstream default is 0.5; 0 disables the step. Connectivity tolerance "
+        "remains the absolute touching tolerance. Parallel, field-only, barrier "
+        "and quad-buffer lines are excluded; polygon-boundary anchors stay fixed."
     ),
     "normalize_line_junctions": (
         "Normalise embedded line junctions",
@@ -973,7 +991,7 @@ class ParameterHelpDialog(QDialog):
             "tolerance_initial_delaunay", "heal_shapes", "smoothing_steps",
             "boundary_centering", "lloyd_iterations", "lloyd_damping",
             "lloyd_tolerance", "lloyd_size_smoothing", "min_face_fraction",
-            "normalize_line_junctions", "junction_tolerance"
+            "normalize_line_junctions", "line_junction_fraction"
         ):
             title, body = PARAMETER_HELP[key]
             sections.append(f"<h3>{title}</h3><p>{body}</p>")
@@ -1399,36 +1417,15 @@ class VorflowDialog(QDialog):
             PARAMETER_HELP["normalize_line_junctions"][1]
         )
         conceptual_form.addRow(self.normalize_line_junctions)
-        self.use_connectivity_for_junctions = QCheckBox(
-            "Use connectivity tolerance for line junctions"
-        )
-        self.use_connectivity_for_junctions.setChecked(True)
-        self.use_connectivity_for_junctions.setToolTip(
-            "Keeps the line-junction tolerance tied to the conceptual model's "
-            "connectivity tolerance. Clear only when line endpoints need a "
-            "separate repair distance."
-        )
-        self.junction_tolerance = make_double(
-            self.connectivity_tolerance.value(), 0.0, 1.0e12, 8
-        )
-        self.junction_tolerance.setSingleStep(0.001)
-        self.junction_tolerance.setEnabled(False)
-        self.junction_tolerance.setToolTip(PARAMETER_HELP["junction_tolerance"][1])
-        self.use_connectivity_for_junctions.toggled.connect(
-            lambda checked: self.junction_tolerance.setEnabled(
-                self.normalize_line_junctions.isChecked() and not checked
-            )
+        self.line_junction_fraction = make_double(0.5, 0.0, 1.0e6, 4)
+        self.line_junction_fraction.setSingleStep(0.1)
+        self.line_junction_fraction.setToolTip(
+            PARAMETER_HELP["line_junction_fraction"][1]
         )
         self.normalize_line_junctions.toggled.connect(
-            self.use_connectivity_for_junctions.setEnabled
+            self.line_junction_fraction.setEnabled
         )
-        self.normalize_line_junctions.toggled.connect(
-            lambda checked: self.junction_tolerance.setEnabled(
-                checked and not self.use_connectivity_for_junctions.isChecked()
-            )
-        )
-        conceptual_form.addRow(self.use_connectivity_for_junctions)
-        conceptual_form.addRow("Line-junction tolerance:", self.junction_tolerance)
+        conceptual_form.addRow("Line-junction spacing fraction:", self.line_junction_fraction)
 
         mesh_group = QGroupBox("Gmsh / MeshGenerator")
         mesh_form = QFormLayout(mesh_group)
@@ -1670,10 +1667,11 @@ class VorflowDialog(QDialog):
         mf6_grid_group = QGroupBox("DISV geometry")
         mf6_grid_form = QFormLayout(mf6_grid_group)
         self.mf6_model_name = QLineEdit("vorflow_model")
-        self.mf6_vertex_tolerance = make_double(0.001, 0.000000001, 1.0e6, 9)
+        self.mf6_vertex_tolerance = make_double(0.0, 0.0, 1.0e6, 9)
         self.mf6_vertex_tolerance.setToolTip(
-            "Vertices closer than the tolerance receive the same vertex ID. "
-            "Choose a small value in the project's length unit."
+            "Distance for inserting a neighbouring cell's vertex into a shared "
+            "edge. 0 uses Vorflow's scale-aware default. A positive value uses "
+            "project map units; it does not merge or round vertex coordinates."
         )
         self.mf6_length_units = QComboBox()
         self.mf6_length_units.addItem("Metres", "METERS")
@@ -1681,7 +1679,7 @@ class VorflowDialog(QDialog):
         self.mf6_length_units.addItem("Centimetres", "CENTIMETERS")
         self.mf6_length_units.addItem("Unknown", "UNKNOWN")
         mf6_grid_form.addRow("Model name:", self.mf6_model_name)
-        mf6_grid_form.addRow("Vertex tolerance:", self.mf6_vertex_tolerance)
+        mf6_grid_form.addRow("Edge-vertex tolerance (0 = automatic):", self.mf6_vertex_tolerance)
         mf6_grid_form.addRow("Length unit:", self.mf6_length_units)
         mf6_layout.addWidget(mf6_grid_group)
 
@@ -1922,6 +1920,7 @@ class VorflowDialog(QDialog):
         domain_kwargs["resolution"] = background_lc
         domain_kwargs["embed"] = True
         domain_kwargs["z_order"] = -1000
+        domain_kwargs.setdefault("label", layer.name())
         domain_kwargs.pop("fields", None)
         call_supported(
             blueprint.add_polygon, domain_geometry,
@@ -1950,6 +1949,7 @@ class VorflowDialog(QDialog):
                 if geometry is None or geometry.is_empty:
                     continue
                 kwargs = dict(base_kwargs)
+                kwargs.setdefault("label", layer.name())
                 kwargs[id_argument] = feature_identifier(
                     feature, id_field, prefix, layer.name()
                 )
@@ -2078,89 +2078,37 @@ class VorflowDialog(QDialog):
             )
         run_group.setExpanded(True)
 
-    @staticmethod
-    def _signed_ring_area(coordinates):
-        return 0.5 * sum(
-            x1 * y2 - x2 * y1
-            for (x1, y1), (x2, y2) in zip(
-                coordinates, coordinates[1:] + coordinates[:1]
-            )
-        )
-
     def build_disv_geometry(self, grid, tolerance):
-        """Build MODFLOW 6 VERTICES and CELL2D from Voronoi polygons."""
-        from shapely.geometry import Polygon, MultiPolygon
+        """Adapt upstream's zero-based DISV topology to one-based text files."""
+        try:
+            from vorflow.utils import grid_to_disv
+        except ImportError as exc:
+            raise RuntimeError(
+                "DISV export requires Vorflow 0.3.0 or newer with grid_to_disv(). "
+                "Update Vorflow in the QGIS Python environment."
+            ) from exc
 
         if grid is None or grid.empty:
             raise ValueError("No generated Voronoi grid is available.")
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("Edge-vertex tolerance must be finite and non-negative.")
+        if not grid.geometry.is_valid.all() or grid.geometry.is_empty.any():
+            raise ValueError("DISV export requires valid, non-empty cell geometries.")
 
-        vertices = []
-        vertex_lookup = {}
-        cell2d = []
-        cell_rows = []
-
-        def vertex_id(x, y):
-            key = (round(float(x) / tolerance), round(float(y) / tolerance))
-            if key not in vertex_lookup:
-                vertex_lookup[key] = len(vertices) + 1
-                vertices.append((len(vertices) + 1, float(x), float(y)))
-            return vertex_lookup[key]
-
-        for row_number, (_, row) in enumerate(grid.iterrows(), start=1):
-            geometry = row.geometry
-            if geometry is None or geometry.is_empty:
-                raise ValueError(f"Cell {row_number} has no geometry.")
-            if not geometry.is_valid:
-                geometry = geometry.buffer(0)
-            if isinstance(geometry, MultiPolygon):
-                if len(geometry.geoms) != 1:
-                    raise ValueError(
-                        f"Cell {row_number} consists of multiple separate polygons. "
-                        "DISV export requires one contiguous polygon per cell."
-                    )
-                geometry = geometry.geoms[0]
-            if not isinstance(geometry, Polygon):
-                raise ValueError(
-                    f"Cell {row_number} has geometry type "
-                    f"{geometry.geom_type}; Polygon is required."
-                )
-            if geometry.interiors:
-                raise ValueError(
-                    f"Cell {row_number} contains holes. This is not supported in CELL2D."
-                )
-
-            coordinates = [(float(x), float(y)) for x, y, *rest
-                           in list(geometry.exterior.coords)[:-1]]
-            if len(coordinates) < 3:
-                raise ValueError(f"Cell {row_number} has fewer than three vertices.")
-
-            # MODFLOW 6 expects vertices in clockwise order.
-            if self._signed_ring_area(coordinates) > 0:
-                coordinates.reverse()
-
-            ids = []
-            for x, y in coordinates:
-                vid = vertex_id(x, y)
-                if not ids or ids[-1] != vid:
-                    ids.append(vid)
-            if len(ids) > 1 and ids[0] == ids[-1]:
-                ids.pop()
-            if len(set(ids)) < 3:
-                raise ValueError(
-                    f"Cell {row_number} collapses at the selected vertex tolerance."
-                )
-
-            center = geometry.centroid
-            if not geometry.covers(center):
-                center = geometry.representative_point()
-            cell2d.append((
-                row_number, float(center.x), float(center.y), len(ids), ids
-            ))
-            cell_rows.append((
-                row_number, float(center.x), float(center.y),
-                float(geometry.area), len(ids)
-            ))
-
+        disv = grid_to_disv(grid, tolerance=tolerance or None)
+        if not all(math.isfinite(value) for cell in disv["cell2d"] for value in cell[1:3]):
+            raise ValueError("DISV export requires finite generator coordinates in x and y.")
+        vertices = [(iv + 1, x, y) for iv, x, y in disv["vertices"]]
+        cell2d = [
+            (cell[0] + 1, cell[1], cell[2], cell[3], [iv + 1 for iv in cell[4:]])
+            for cell in disv["cell2d"]
+        ]
+        cell_rows = [
+            (cell_id, xc, yc, float(area), count, node_id)
+            for (cell_id, xc, yc, count, _), area, node_id in zip(
+                cell2d, grid.geometry.area, disv["node_id"]
+            )
+        ]
         return vertices, cell2d, cell_rows
 
     @staticmethod
@@ -2328,7 +2276,7 @@ END PERIOD"""
             "w", encoding="utf-8", newline=""
         ) as handle:
             writer = csv.writer(handle)
-            writer.writerow(["icell2d", "xc", "yc", "area", "nvert"])
+            writer.writerow(["icell2d", "xc", "yc", "area", "nvert", "node_id"])
             writer.writerows(cell_rows)
 
         self._write_text(
@@ -2342,6 +2290,10 @@ Cells per layer (NCPL): {ncpl}
 Unique vertices (NVERT): {nvert}
 Top elevation: {top}
 Lowest bottom elevation: {bottom}
+
+Cell centres are Vorflow generator coordinates (x/y), not polygon centroids.
+Geometry uses Vorflow grid_to_disv(), including shared edge vertices.
+File indices are one-based. The cell2d CSV maps icell2d back to Vorflow node_id.
 
 Open or import mfsim.nam in an application that supports MODFLOW 6 DISV.
 
@@ -2445,19 +2397,16 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             prefix = safe_name(self.output_name.text().strip() or "vorflow_grid")
             background_lc = self.background_lc.value()
             connectivity = self.connectivity_tolerance.value()
-            junction_tolerance = (
-                None
-                if self.use_connectivity_for_junctions.isChecked()
-                else self.junction_tolerance.value()
+            junction_fraction = (
+                self.line_junction_fraction.value()
+                if self.normalize_line_junctions.isChecked() else 0.0
             )
-            normalize_junctions = self.normalize_line_junctions.isChecked()
 
             self.set_progress(12, "Building conceptual model…")
-            blueprint = call_supported(
+            blueprint = build_conceptual_mesh(
                 ConceptualMesh, crs=crs.authid(),
                 connectivity_tolerance=connectivity,
-                junction_tolerance=junction_tolerance,
-                normalize_line_junctions=normalize_junctions,
+                line_junction_fraction=junction_fraction,
             )
             self.add_domain(blueprint, background_lc)
             self.add_sources(
@@ -2476,11 +2425,13 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             if junction_report is not None:
                 self.add_diagnostic(
                     "Embedded line-junction normalisation: "
-                    f"{'enabled' if junction_report.get('enabled', False) else 'disabled'}; "
-                    f"{junction_report.get('junction_count', 0)} junction(s), "
-                    f"{junction_report.get('noded_pairs', 0)} exact pair(s) noded, "
-                    f"{junction_report.get('endpoint_snaps', 0)} endpoint connection(s)."
+                    f"{'enabled' if junction_fraction > 0 else 'disabled'} "
+                    f"(spacing fraction {junction_fraction:g}); "
+                    f"{len(junction_report.get('junctions', []))} junction(s), "
+                    f"{len(junction_report.get('snapped_ends', []))} end(s) snapped, "
+                    f"{len(junction_report.get('trimmed_ends', []))} overshoot(s) trimmed."
                 )
+                self.add_diagnostic("Line-junction details: " + repr(junction_report))
             self.set_progress(27, "Conceptual model completed.")
 
             self.set_progress(32, "Checking the MeshGenerator API…")

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.18.0
+
+- Merged all upstream `develop` changes through `27712b2` (20 October 2026),
+  including Vorflow 0.3.0, vectorised connectivity/DISV/Voronoi operations and
+  consistent int64 generator IDs with inset boundary centring.
+- Replaced the fork's older junction implementation with upstream's maintained
+  algorithm. The UI now exposes `line_junction_fraction=0.5`; disabling
+  normalisation explicitly passes 0. Diagnostics show junctions, snapped ends
+  and trimmed overshoots. Incompatible installations fail with an update hint.
+- DISV topology now comes from upstream `grid_to_disv()`. Cell centres use
+  generator x/y, hanging edge vertices are inserted, and shared vertices are
+  preserved. Text-file indices are converted to one-based form exactly once.
+- Added `node_id` to the cell2d CSV so MODFLOW cell numbers map back to the
+  original Vorflow grid. Edge-vertex tolerance defaults to upstream automatic
+  scaling and no longer rounds or merges nearby coordinates.
+- Pass QGIS layer names as upstream feature labels. Kept the existing QGIS
+  rendering, explicit geometry-cleaning workflow and GeoPackage export.
+- Added integration regressions for junction controls, DISV topology and
+  file mapping, plus a Gmsh/Lloyd/DISV round trip. CI now runs on `dev` pushes.
+- See `UPSTREAM_SYNC.md` for the feature assessment and source baseline.
+
 ## 0.17.0
 
 - Replaced the duplicated basic/advanced growth controls with one effective

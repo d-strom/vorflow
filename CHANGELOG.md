@@ -9,12 +9,63 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Embedded line-junction normalisation before Gmsh. Exact intersections are
-  made explicit as shared line vertices, while nearby endpoint-to-line
-  connections can be repaired conservatively within `junction_tolerance`.
-- `ConceptualMesh(..., junction_tolerance=..., normalize_line_junctions=...)`
-  and per-run `generate(junction_tolerance=...)` control the new behaviour.
-  Results are exposed in `ConceptualMesh.junction_diagnostics`.
+- The release workflow creates the GitHub Release for each final tag once it
+  is on PyPI, with notes from the tag's changelog section and the wheel and
+  sdist attached (`scripts/release_notes.py`). A tag without a changelog
+  section now fails the build before anything is uploaded.
+
+## [0.3.0] - 2026-10-15
+
+MODFLOW 6 DISV export (`to_disv()`, `to_modflowgwfdisv()`), `plot()` methods
+with legend labels and line colours, `to_file()`, and a documentation site.
+`MeshGenerator.generate()` now returns the generator instead of `True`.
+
+### Added
+
+- `VoronoiTessellator.to_disv()` and `vorflow.utils.grid_to_disv()` return
+  the grid as MODFLOW 6 DISV arrays (`ncpl`, `nvert`, `vertices`, `cell2d`,
+  zero-based as flopy takes them) plus the `node_id` of each `icell2d`
+  ([#44](https://github.com/rhugman/vorflow/issues/44)). Cell centres are the
+  generator points; vertices are clockwise and shared between neighbours, and
+  a vertex lying on another cell's edge is inserted into that edge so
+  MODFLOW 6 finds the connection. `to_modflowgwfdisv(gwf, top, botm, nlay=1)`
+  builds the flopy package directly; flopy stays optional.
+- `VoronoiTessellator.to_file()`: writes the grid with `GeoDataFrame.to_file`,
+  passing keywords through.
+- `plot()` methods on `ConceptualMesh` (registered features, or the cleaned
+  ones with `clean=True`), `MeshGenerator` (the element grid) and
+  `VoronoiTessellator` (the cells, optionally with their generators)
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). Each takes an
+  optional `ax` and returns the axes. Matplotlib stays optional: it is
+  imported only when `plot()` is called, and the new `plot` extra installs it.
+- `label=` on `ConceptualMesh.add_polygon`, `add_line` and `add_point`:
+  `ConceptualMesh.plot()` gives each label one legend entry, so
+  `ax.legend()` needs no arguments
+  ([#50](https://github.com/rhugman/vorflow/issues/50)). Features sharing a
+  label share an entry; unlabelled features get none. Before, all lines (and
+  all points) were drawn as one artist, so a hand-written legend could label
+  only the first of them.
+- `color=` on `ConceptualMesh.add_line`: the line's colour in `plot()`
+  (default: barriers red, others blue).
+- `examples/plotting_demo.ipynb`: the three `plot()` methods, legend labels
+  and layering the conceptual model over the grid.
+- `MeshGenerator(conceptual_mesh=...)`: `generate()` called without the clean
+  frames runs `conceptual_mesh.generate()` itself, and
+  `VoronoiTessellator(mesher)` takes the conceptual mesh from the generator
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). Passing the three
+  clean frames and the conceptual mesh explicitly still works.
+- `VoronoiTessellator.grid`: the grid from the last `generate()`, raising a
+  `RuntimeError` before it has run. `final_grid` remains as before.
+
+- Documentation site at <https://rhugman.github.io/vorflow/>
+  ([#39](https://github.com/rhugman/vorflow/issues/39)): a Sphinx API
+  reference built from the docstrings, the README's user guide, and the
+  example notebooks, executed on every build. A `docs` extra installs the
+  toolchain; `.github/workflows/docs.yml` builds it on pull requests and
+  deploys it to GitHub Pages: `main` at the site root and `develop`
+  under `/dev/`. The deprecated keywords of
+  `add_polygon`, `add_line` and `add_point` are now listed in their own
+  "Deprecated parameters" docstring section.
 - `VoronoiTessellator(..., lloyd_size_smoothing=5)` smooths the per-node
   sizes behind the Lloyd density before relaxing
   ([#31](https://github.com/rhugman/vorflow/issues/31)). Gmsh's node sizes
@@ -45,6 +96,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `VoronoiTessellator.export_to_shapefile()` is deprecated in favour of
+  `to_file()`.
+- `MeshGenerator.generate()` returns the mesh generator instead of `True`
+  ([#42](https://github.com/rhugman/vorflow/issues/42)). It is still truthy,
+  so `assert mesher.generate(...)` keeps working; code comparing the result
+  with `is True` or `== True` needs updating.
+
+- Documentation follow-ups from
+  [#39](https://github.com/rhugman/vorflow/issues/39): the constructor
+  docstrings of `ConceptualMesh`, `MeshGenerator` and `VoronoiTessellator`
+  move to the class, `ThresholdField` and
+  `VoronoiTessellator.export_to_shapefile` gain docstrings (so they appear in
+  the API reference), the example notebooks log warnings only
+  (`set_verbosity(0)`), and Basic Usage shows a plot of the grid.
+  `examples/basic_usage.py --plot PATH` saves that figure.
 - With `lloyd_iterations > 0` the grid differs from 0.2.0, because the Lloyd
   density now uses the smoothed sizes. Pass `lloyd_size_smoothing=0` for the
   0.2.0 grid. Without `hex_ring`, the cells of refined points can grow by
@@ -57,8 +123,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   share of cells with very short faces peaks. Head accuracy depends mainly on
   `growth_factor`: in a Thiem test, 100 passes improved the head RMSE by at
   most about 5% at 5-10 times the build time.
-- Embedded field-only lines (`embed=False`) remain unchanged, and lateral
-  near-parallel lines are not connected by junction normalisation.
+
+### Fixed
+
+- Embedded lines that meet at a T-junction or cross no longer put two mesh
+  nodes a few metres apart at the junction
+  ([#31](https://github.com/rhugman/vorflow/issues/31)). Each line was
+  densified from its own ends, and Gmsh then added the junction node wherever
+  it fell, 0 to `resolution` from the nearest line vertex. `ConceptualMesh.generate()`
+  now, after clipping and before densification: snaps a line end that misses
+  another line by less than `line_junction_fraction` x its vertex spacing
+  (`densify` if numeric, else `resolution`) onto that line; trims an
+  overshoot shorter than that at the crossing; makes each junction a vertex
+  of every line through it, with one shared coordinate; and drops line
+  vertices closer than that to a junction, so densification starts at the
+  junction. Line ends and vertices on polygon boundaries are never moved,
+  trimmed or dropped. On a 160 m background with two lines at resolution 30,
+  the smallest node spacing goes from 6.0 to 18.4 m (line ending on the
+  other), 7.5 to 17.3 m (ending 5 m short), 3.4 to 21.4 m (overshooting by
+  5 m) and 2.6 to 17.7 m (crossing; 2.6 to 6.0 m at resolution 10). The new
+  `ConceptualMesh(line_junction_fraction=0.5)` sets the threshold; 0 turns
+  the step off. It is separate from `connectivity_tolerance`, which is an
+  absolute distance; in this step it only sets what counts as touching.
+  Barrier and straddle lines, quad-buffer lines and field-only lines are left
+  out. An end is not snapped when the gap to the other line points more than 80
+  degrees away from the line's own direction, so parallel lines closer than
+  the threshold stay apart. `ConceptualMesh.junction_diagnostics` records each
+  run's junctions (point and line IDs), snapped ends and trimmed ends. The
+  parallel-line guard and the diagnostics follow
+  [@d-strom](https://github.com/d-strom)'s
+  [#35](https://github.com/rhugman/vorflow/pull/35).
 
 ## [0.2.0] - 2026-10-05
 
@@ -335,7 +429,8 @@ First release on PyPI. There are no changes since 0.1.0rc1.
   and `dist_max_in`.
 - `dist_min`/`dist_max` on features; use `growth_factor` or explicit `fields`.
 
-[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rhugman/vorflow/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rhugman/vorflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rhugman/vorflow/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rhugman/vorflow/compare/v0.1.0rc1...v0.1.0
 [0.1.0rc1]: https://github.com/rhugman/vorflow/tree/v0.1.0rc1

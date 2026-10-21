@@ -1,9 +1,16 @@
-# Version 0.17 integration note
+# Version 0.18 integration note
 
 The QGIS plugin uses Vorflow's upstream algorithms rather than reimplementing
-them. Version 0.17 targets the integrated API on `d-strom/vorflow@dev`:
+them. Version 0.18 targets upstream `develop` at `27712b2` (Vorflow 0.3.0
+plus the 20 October fixes), integrated on `d-strom/vorflow@dev`:
 
 ```python
+blueprint = ConceptualMesh(
+    crs="EPSG:3006",
+    connectivity_tolerance=0.001,
+    line_junction_fraction=0.5,
+)
+
 blueprint.add_point(
     ...,
     fields=[GeometricGrowthField(
@@ -30,6 +37,17 @@ grid = tess.generate()
 It surfaces `mesher.diagnostics["hex_rings"]`, `tess.lloyd_report` and
 `tess.short_face_report`. The exported GeoDataFrame is written without
 dropping columns, so upstream `lloyd_shift` is retained.
+
+Junction normalisation now uses upstream's spacing fraction, not the previous
+fork-only absolute junction tolerance. Disabling it passes 0. Diagnostics use
+the upstream `junctions`, `snapped_ends` and `trimmed_ends` lists.
+
+The DISV adapter calls `vorflow.utils.grid_to_disv(grid, tolerance=...)` and
+only converts its arrays to one-based text-file indices. It keeps generator
+centres and the upstream hanging-vertex topology. `node_id` is saved in the
+cell2d CSV. Zero in the GUI maps to `tolerance=None` for scale-aware defaults.
+QGIS layer names are passed as feature labels. See `UPSTREAM_SYNC.md` for
+the assessment of all new APIs and maintained QGIS behavior.
 
 The progress bar is phase-based and a separate timer measures total run time.
 Gmsh, Lloyd and short-face clean-up are synchronous and do not expose granular

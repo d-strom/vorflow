@@ -1,12 +1,18 @@
-# Implementation verification - Vorflow QGIS 0.17
+# Implementation verification - Vorflow QGIS 0.18
 
-Source baseline: the integrated `d-strom/vorflow` `dev` branch, including
-Vorflow 0.2.1 line-junction normalisation and QGIS plugin 0.16.0.
+Source baseline: upstream `rhugman/vorflow@develop` at `27712b2`, integrated
+on `d-strom/vorflow@dev`. The core source tree is unchanged from upstream.
+See `UPSTREAM_SYNC.md` for the complete feature assessment.
 
 ## Upstream API mapping
 
 | Requested behavior | Plugin implementation |
 |---|---|
+| `ConceptualMesh(line_junction_fraction=0.5)` | Spacing-fraction control; disabled checkbox passes 0. Older APIs are rejected. |
+| Upstream junction diagnostics | Counts and full `junctions`, `snapped_ends`, `trimmed_ends` lists. |
+| `grid_to_disv()` | Native generator centres, clockwise rings and hanging-vertex insertion; adapter converts indices to one-based text files. |
+| Result mapping | cell2d CSV includes original `node_id`. |
+| Feature labels | QGIS layer names passed to upstream feature registration. |
 | `blueprint.add_point(..., hex_ring=True)` | Point-layer global and per-layer `Hex ring` control; forwarded to `add_point`. |
 | Reject unsupported `hex_ring` | Explicit signature check and actionable error. |
 | `VoronoiTessellator(..., lloyd_iterations=100)` | Enabled-by-default weighted Lloyd control in the Voronoi tessellation group; forwarded to the constructor. |

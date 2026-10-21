@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vorflow"
-version = "0.2.1"
+version = "0.3.0"
 description = "Voronoi mesh generation for MODFLOW 6 using Gmsh and GeoPandas"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
+    {name = "Rui Hugman"},
     {name = "Oscar Sanchez", email = "oscarfasanchez@gmail.com"},
-    {name = "rhugman"},
 ]
 maintainers = [
+    {name = "Rui Hugman"},
     {name = "Oscar Sanchez", email = "oscarfasanchez@gmail.com"},
-    {name = "rhugman"},
 ]
 requires-python = ">=3.10"
 keywords = ["modflow", "groundwater", "voronoi", "mesh", "gmsh"]
@@ -40,11 +40,25 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/rhugman/vorflow"
 Issues = "https://github.com/rhugman/vorflow/issues"
+Documentation = "https://rhugman.github.io/vorflow/"
 Changelog = "https://github.com/rhugman/vorflow/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+plot = [
+    "matplotlib",         # The plot() methods import it lazily; the library works without it
+]
 examples = [
     "matplotlib",         # Plotting in examples/ and notebooks; the library itself never imports it
+    "flopy>=3.10",        # MODFLOW 6 examples; the library itself never imports it
+]
+docs = [
+    "sphinx>=7",
+    "myst-nb>=1.1",       # Markdown pages and executed example notebooks
+    "pydata-sphinx-theme>=0.15",
+    "sphinx-copybutton",
+    "ipykernel",
+    "matplotlib",
+    "flopy>=3.10",        # MODFLOW 6 example notebooks (they also need the mf6 binary)
 ]
 dev = [
     "pytest",

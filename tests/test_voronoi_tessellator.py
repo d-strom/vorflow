@@ -82,6 +82,21 @@ def _two_cell_grid():
     )
 
 
+def test_raw_voronoi_keeps_bounded_cells_with_their_tags():
+    tessellator, _ = _plain_barrier_tessellator()
+    inner = np.array([[0.4, 0.5], [0.6, 0.5], [0.5, 0.4], [0.5, 0.6]])
+    ghosts = np.array([[-5.0, -5.0], [6.0, -5.0], [6.0, 6.0], [-5.0, 6.0], [0.5, 0.5]])
+    tags = np.array([11, 12, 13, 14], dtype=np.uint64)
+
+    raw = tessellator._build_raw_voronoi(np.vstack([inner, ghosts]), tags)
+
+    # Only the inner four cells and the untagged centre node are bounded.
+    assert raw["node_id"].tolist() == [11, 12, 13, 14, -1]
+    assert raw[["x", "y"]].to_numpy().tolist() == np.vstack([inner, ghosts[-1:]]).tolist()
+    assert raw.geometry.is_valid.all()
+    assert shapely.contains_xy(raw.geometry.to_numpy(), raw["x"].to_numpy(), raw["y"].to_numpy()).all()
+
+
 def test_enforce_barriers_leaves_cells_whose_face_lies_on_the_barrier():
     """Guards against splitting cells whose face merely lies on the barrier."""
     tessellator = _barrier_tessellator(LineString([(1, 0), (1, 1)]), densify=False)
@@ -582,7 +597,8 @@ class TestExportToShapefile:
         tess = self._tessellator_with_grid()
         grid = tess.generate()
         path = tmp_path / "grid.shp"
-        tess.export_to_shapefile(str(path))
+        with pytest.warns(DeprecationWarning, match="to_file"):
+            tess.export_to_shapefile(str(path))
         assert path.exists()
         back = gpd.read_file(path)
         assert len(back) == len(grid)
@@ -592,8 +608,21 @@ class TestExportToShapefile:
     def test_no_grid_writes_nothing(self, tmp_path):
         tess = self._tessellator_with_grid()  # generate() never called
         path = tmp_path / "grid.shp"
-        tess.export_to_shapefile(str(path))
+        with pytest.warns(DeprecationWarning):
+            tess.export_to_shapefile(str(path))
         assert not path.exists()
+
+    def test_to_file_writes_geopackage_layer(self, tmp_path):
+        tess = self._tessellator_with_grid()
+        grid = tess.generate()
+        path = tmp_path / "grid.gpkg"
+        tess.to_file(path, layer="cells")
+        back = gpd.read_file(path, layer="cells")
+        assert len(back) == len(grid)
+
+    def test_to_file_before_generate_raises(self, tmp_path):
+        with pytest.raises(RuntimeError, match="generate"):
+            self._tessellator_with_grid().to_file(tmp_path / "grid.gpkg")
 
 
 def _lattice_nodes(minx, miny, maxx, maxy, n):

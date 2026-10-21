@@ -2,7 +2,7 @@ name: pytest
 
 on:
   push:
-    branches: ["main", "master", "develop"]
+    branches: ["main", "master", "develop", "dev"]
   pull_request:
   schedule:
     - cron: "0 0 * * 0"
@@ -18,7 +18,7 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Ruff check
-        run: ruff check src tests scripts
+        run: ruff check src tests scripts vorflow_qgis
 
   test:
     runs-on: ${{ matrix.os }}

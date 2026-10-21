@@ -1,7 +1,7 @@
 # QGIS defaults and control audit
 
 This audit covers the settings exposed by the QGIS wrapper and the matching
-Vorflow 0.2.1 APIs on the `dev` branch. The selected defaults are intended as a
+Vorflow 0.3.0 APIs and subsequent develop fixes on `dev`. The selected defaults are intended as a
 quality-oriented starting point for groundwater models. Model-specific spatial
 resolution still has to follow the hydraulic problem; no universal cell size is
 possible.
@@ -20,7 +20,8 @@ possible.
 | Point hex ring | Enabled | Produces a regular, generator-centred well cell when local clearance permits. |
 | Domain-boundary refinement | Disabled | The domain normally defines extent; the background size should control its interior unless the outer boundary itself needs refinement. |
 | Connectivity tolerance | 0.001 map units | Conservative projected-coordinate topology repair. |
-| Junction tolerance | Same as connectivity | Prevents two nearly identical tolerances drifting apart. |
+| Line-junction spacing fraction | 0.5 | Upstream default relative to each line's spacing; checkbox disabled passes 0. Connectivity tolerance remains the absolute touching tolerance. |
+| DISV edge-vertex tolerance | Automatic (GUI 0) | Uses upstream scaling for inserting hanging vertices, without coordinate rounding. |
 | Gmsh algorithm | 6, Frontal-Delaunay | Quality-oriented 2D triangulation. Algorithm 5 remains available for speed or difficult cases. |
 | Gmsh smoothing | Vorflow default, 10 | Preserves the tested core default; the plugin only overrides it on request. |
 | Gmsh optimisation cycles | 2 | Vorflow's post-mesh quality default. |
