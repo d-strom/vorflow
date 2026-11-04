@@ -258,8 +258,15 @@ PARAMETER_HELP = {
     ),
     "embed": (
         "Embed geometry",
-        "Attempts to make the geometry part of the mesh topology. Use this "
-        "when nodes and cell edges should follow the object."
+        "Places mesh nodes on the point or line. Clear this to use the geometry "
+        "only as a size field. Use Treat as barrier for a line that should "
+        "follow Voronoi cell faces."
+    ),
+    "create_model_zone": (
+        "Create model zone",
+        "Embed the polygon when cells need a separate zone ID. By default the "
+        "polygon only controls cell size, including in overlaps. Zone priority "
+        "controls ownership where model zones overlap."
     ),
     "simplify_tolerance": (
         "Simplification tolerance",
@@ -494,10 +501,14 @@ class ParameterEditorWidget(QWidget):
                 "boundary, the mesh may grow to the Global background size."
             )
         if geometry_kind != "domain":
+            embed_help = PARAMETER_HELP[
+                "create_model_zone" if geometry_kind == "polygon" else "embed"
+            ]
             self._add_control(
-                basic_form, "embed", "Embed geometry:",
+                basic_form, "embed", embed_help[0] + ":",
                 self._checkbox(defaults.get("embed", True)),
             )
+            self.controls["embed"].setToolTip(embed_help[1])
         self._add_control(
             basic_form, "simplify_tolerance", "Simplification tolerance:",
             make_double(defaults.get("simplify_tolerance", 0.0), 0.0),
@@ -782,16 +793,20 @@ class ParameterEditorWidget(QWidget):
                 }]
         return values
 
-    def summary(self, inherited_refinement=None):
+    def summary(self, inherited_defaults=None):
         values = self.values()
+        inherited_defaults = inherited_defaults or {}
         if self.geometry_kind == "domain" and not values.get(
             "refine_domain_boundary", False
         ):
             return "Domain extent only; boundary refinement disabled"
         parts = []
+        if self.geometry_kind == "polygon":
+            model_zone = values.get("embed", inherited_defaults.get("embed", False))
+            parts.append("Model zone" if model_zone else "Cell sizing only")
         if "resolution" in values:
             parts.append(f"size {values['resolution']:g}")
-        effective = values if "field_model" in values else (inherited_refinement or {})
+        effective = values if "field_model" in values else inherited_defaults
         origin = "Inherited " if effective is not values else ""
         if effective.get("field_model") == "geometric" and "fields" in effective:
             field = effective["fields"][0]
@@ -841,7 +856,7 @@ class LayerSourceWidget(QGroupBox):
         self.remove_callback = remove_callback
         self.geometry_kind = geometry_kind
         self.direct_settings = direct_settings
-        self.inherited_refinement = None
+        self.inherited_defaults = None
         form = QFormLayout(self)
 
         layer_row = QWidget()
@@ -897,12 +912,7 @@ class LayerSourceWidget(QGroupBox):
 
     def update_summary(self):
         try:
-            inherited = (
-                self.inherited_refinement()
-                if self.inherited_refinement is not None
-                and not self.editor.field_override.isChecked()
-                else None
-            )
+            inherited = self.inherited_defaults() if self.inherited_defaults else None
             self.settings_summary.setText(self.editor.summary(inherited))
         except Exception:
             self.settings_summary.setText("Review settings")
@@ -999,6 +1009,8 @@ class MultiLayerInputWidget(QWidget):
         self.global_editor.field_model.currentIndexChanged.connect(self.update_summaries)
         self.global_editor.field_growth_factor.valueChanged.connect(self.update_summaries)
         self.global_editor.growth_model.currentIndexChanged.connect(self.update_summaries)
+        if self.geometry_kind == "polygon":
+            self.global_editor.controls["embed"].toggled.connect(self.update_summaries)
         self.add_source()
 
     def add_source(self):
@@ -1007,7 +1019,7 @@ class MultiLayerInputWidget(QWidget):
             self.remove_source, self.container,
             direct_settings=False, defaults=self.defaults
         )
-        source.inherited_refinement = self.global_editor.values
+        source.inherited_defaults = self.global_editor.values
         source.update_summary()
         self.sources.append(source)
         self.container_layout.insertWidget(
@@ -1052,12 +1064,14 @@ class ParameterHelpDialog(QDialog):
             "interpreted in metres.</p>",
             "<h2>How sizes are combined</h2>"
             "<p>Vorflow/Gmsh combines contributions from the domain, points, lines, "
-            "polygons and mesh fields. Where requirements overlap, the finest "
-            "size normally controls. A specified target size therefore does not mean "
-            "that every cell will have exactly that size.</p>",
+            "polygons and mesh fields. Where size fields overlap, the finest "
+            "local target size controls. Overlapping model zones are partitioned "
+            "by zone priority before meshing. A target size is a guide for the "
+            "mesh and individual cell sizes can vary.</p>",
         ]
         for key in (
             "resolution", "refine_domain_boundary", "growth_factor", "embed",
+            "create_model_zone",
             "simplify_tolerance",
             "densify", "densify_spacing", "snap_to_polygons", "is_barrier",
             "quad_buffer",
@@ -1463,7 +1477,7 @@ class VorflowDialog(QDialog):
             {
                 "resolution": 25.0, "background_size": DEFAULT_BACKGROUND_SIZE,
                 "z_order": 1, "densify": True,
-                "simplify_tolerance": 0.0, "embed": True,
+                "simplify_tolerance": 0.0, "embed": False,
                 "quad_buffer": False, "quad_buffer_thickness": 1,
                 "field_model": "geometric",
                 "field_growth_factor": RECOMMENDED_GROWTH_FACTOR,

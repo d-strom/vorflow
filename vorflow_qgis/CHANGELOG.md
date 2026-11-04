@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Polygon inputs control cell size by default. Opt in to "Create model
+  zone" when a polygon should be embedded and assign zone IDs. Layer
+  summaries show which mode is in effect.
+
 ## 0.19.1
 
 - Fix the quality report crash when a shapefile introduces Z or M into a

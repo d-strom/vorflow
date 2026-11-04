@@ -43,6 +43,18 @@ MAIN WORKFLOW
 6. If a Voronoi grid was generated, open "MODFLOW 6 / DISV" and click
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
+POLYGON REFINEMENT AND MODEL ZONES
+Polygon input layers control cell size by default. In overlaps, Vorflow
+uses the finest applicable local size field. These polygons do not add
+mesh edges or assign zone IDs.
+
+Enable "Create model zone" in the polygon defaults or as a layer override
+when the model needs a separate zone ID or a meshed polygon outline.
+Zone priority controls ownership where these polygons overlap. Clip zone
+inputs to the model domain before meshing. Use "Create model zone" when
+requesting a polygon quad corridor.
+
+The polygon selected under Model domain defines the outer model boundary.
 
 QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.19
 - Refinement model: Geometric growth (GeometricGrowthField)
