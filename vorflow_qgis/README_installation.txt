@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.19.0
+VORFLOW FOR QGIS 0.19.1
 ======================
 
 AUTHOR

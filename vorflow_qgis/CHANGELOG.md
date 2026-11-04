@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.1
+
+- Fix the quality report crash when a shapefile introduces Z or M into a
+  planar Voronoi grid. New QGIS inputs are converted to XY in memory;
+  quality metrics also work on existing grids with extra coordinates.
+- Handle shared cell boundaries that contain both a line and isolated
+  points. Source layers and saved grid geometry are left unchanged.
+
 ## 0.19.0
 
 - Merged upstream `develop` through `63d1f6e`, including exact barrier faces,

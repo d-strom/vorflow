@@ -637,7 +637,7 @@ guard and junction diagnostics are part of the line-junction handling.
 ## QGIS integration in this fork
 
 The `dev` branch of [d-strom/vorflow](https://github.com/d-strom/vorflow/tree/dev)
-includes the independent **Vorflow for QGIS 0.19.0** wrapper. It integrates
+includes the independent **Vorflow for QGIS 0.19.1** wrapper. It integrates
 upstream `develop` through `63d1f6e` (30 October 2026). See the
 [installation instructions](vorflow_qgis/README_installation.txt) and the
 [snapping and Lloyd review](vorflow_qgis/MESHING_REVIEW.md).

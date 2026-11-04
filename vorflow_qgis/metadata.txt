@@ -1,7 +1,7 @@
 [general]
 name=Vorflow for QGIS
 description=Generate Vorflow/Gmsh meshes in QGIS with continuous-metric 1.1 grading, optional domain-boundary refinement, inset boundary centring, line-junction normalisation, hex-ring well cells, weighted Lloyd relaxation, quality inspection, and MODFLOW 6 DISV export.
-version=0.19.0
+version=0.19.1
 qgisMinimumVersion=3.28
 author=David Ström
 email=

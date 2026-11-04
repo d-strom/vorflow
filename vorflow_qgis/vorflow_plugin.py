@@ -203,13 +203,10 @@ def normalise_feature_parameters(kwargs):
 
 
 def qgis_to_shapely(qgs_geometry):
-    data = bytes(qgs_geometry.asWkb())
-    try:
-        import shapely
-        return shapely.from_wkb(data)
-    except AttributeError:
-        from shapely import wkb
-        return wkb.loads(data)
+    """Convert to XY for the planar mesh, leaving the QGIS layer unchanged."""
+    from shapely import force_2d, from_wkb
+
+    return force_2d(from_wkb(bytes(qgs_geometry.asWkb())))
 
 
 def transformed_geometry(feature, layer):
@@ -1113,7 +1110,9 @@ def _polygon_ring_metrics(geometry):
         polygon = max(polygon.geoms, key=lambda item: item.area, default=None)
     if polygon is None or polygon.is_empty:
         return {}
-    coords = list(polygon.exterior.coords)
+    # Existing grids can carry Z or M from overlay with input geometries.
+    # Shape measurements are planar, regardless of the stored dimensions.
+    coords = [coordinate[:2] for coordinate in polygon.exterior.coords]
     lengths = [
         math.hypot(x2 - x1, y2 - y1)
         for (x1, y1), (x2, y2) in zip(coords, coords[1:])
@@ -1171,10 +1170,17 @@ def _shared_face_metrics(left, right):
     # For a Voronoi dual this is close to one. This is a centroid-based
     # orthogonality diagnostic and is deliberately reported separately from
     # Vorflow's native generator-based diagnostics when available.
-    # The normal to the face is obtained from the longest segment of the face.
-    if face.geom_type == "MultiLineString":
-        face = max(face.geoms, key=lambda item: item.length, default=None)
-    coords = list(face.coords) if face is not None and hasattr(face, "coords") else []
+    # A shared edge plus an isolated point is a GeometryCollection. Use
+    # the longest line component as before, ignoring point-only contacts.
+    def line_parts(part):
+        if part.geom_type in {"LineString", "LinearRing"}:
+            yield part
+        elif part.geom_type in {"MultiLineString", "GeometryCollection"}:
+            for child in part.geoms:
+                yield from line_parts(child)
+
+    face = max(line_parts(face), key=lambda item: item.length, default=None)
+    coords = list(face.coords) if face is not None else []
     if len(coords) >= 2:
         fx, fy = coords[-1][0] - coords[0][0], coords[-1][1] - coords[0][1]
         flength = math.hypot(fx, fy)
