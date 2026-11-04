@@ -1,4 +1,4 @@
-VORFLOW FOR QGIS 0.18.0
+VORFLOW FOR QGIS 0.19.0
 ======================
 
 AUTHOR
@@ -19,18 +19,13 @@ INSTALLATION
 3. Install Vorflow and its Python dependencies in the Python environment used
    by QGIS.
 
-For the matching Vorflow features on this development branch, open OSGeo4W
-Shell on Windows and run:
+For the matching Vorflow build, open OSGeo4W Shell on Windows and run:
 
-    python -m pip install --upgrade "vorflow @ git+https://github.com/d-strom/vorflow.git@dev" pyogrio
+    python -m pip install --upgrade "https://github.com/rhugman/vorflow/archive/63d1f6e811b4fbfb7fdefe51c513dfc1e67fbba3.zip" pyogrio
 
-Vorflow 0.3.0 or newer supports the required API. The fork's dev branch also
-includes upstream develop fixes through 20 October 2026. To install that
-exact upstream source without Git, use this alternative:
-
-    python -m pip install --upgrade "https://github.com/rhugman/vorflow/archive/27712b2fc937688b66ca23f7f6d61f0c78146f94.zip" pyogrio
-
-pip resolves declared runtime dependencies. Use QGIS's Python environment.
+This develop build reports 0.3.0, like the earlier PyPI release. Use the
+pinned build for the new APIs. If pip skips replacing an installed 0.3.0,
+repeat with --force-reinstall --no-deps once dependencies are present.
 
 4. Restart QGIS.
 
@@ -38,14 +33,18 @@ MAIN WORKFLOW
 1. Select a polygon layer as the model domain.
 2. Add any point, line and polygon refinement layers.
 3. Configure global defaults and optional overrides for individual layers.
+   Optional selectors start empty. Drag the horizontal divider above the
+   input list to enlarge it. Click Run diagnostics to show or hide the log;
+   when open, drag its upper divider to adjust its height.
 4. Choose output products under "Output and quality".
 5. Click "Generate mesh". The progress bar shows the current phase and the
-   total timer measures the complete run from click to completion.
+   total timer continues counting during calculations and exports. It shows
+   seconds, min/s from one minute, and h/min/s from one hour.
 6. If a Voronoi grid was generated, open "MODFLOW 6 / DISV" and click
    "Generate DISV grid..." to create a minimal MODFLOW 6 dataset.
 
 
-QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.18
+QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.19
 - Refinement model: Geometric growth (GeometricGrowthField)
 - Growth model: continuous_metric
 - Growth factor: 1.1 for points, lines, polygons and optional domain-boundary refinement
@@ -57,6 +56,7 @@ QUALITY-ORIENTED DEFAULT PROFILE IN VERSION 0.18
 - Minimum face fraction: 0.2
 - Sampling: 25
 - Embedded line-junction spacing fraction: 0.5 (0 disables normalisation)
+- Snap to polygons: off unless an intentional connection is needed
 
 The continuous-metric interpretation uses log(growth_factor), making 1.1 about
 4.7% gentler than the legacy edge-ratio interpretation. Hex rings create
@@ -77,7 +77,19 @@ REFINEMENT TERMINOLOGY
 - Exponential: ExponentialField with size_min, size_max and decay_length.
 - Sampling: number of samples used to represent the mesh field.
 - Densification spacing: optional geometry-segment limit; 0 uses resolution.
-- Barrier straddle width: optional paired-generator spacing; 0 uses Vorflow automatic sizing.
+- Treat as barrier: Vorflow places cell faces along the line automatically.
+
+Geometric growth has one effective factor under Refinement model. A layer
+override replaces its inherited model and all of that model's values. There
+is no separate Basic factor.
+
+SNAP TO POLYGONS
+Uses vertices on the cleaned boundaries of the model domain and selected,
+enabled, embedded polygons. Refinement-only polygons, unselected project
+layers and generated mesh cells are not targets. A snap can insert a vertex
+within Connectivity tolerance anywhere along a line and leave a short
+segment or kink. Use Check input geometry before meshing to find problem
+locations in Run diagnostics. See MESHING_REVIEW.md.
 
 Different input layers may use different refinement models in the same mesh,
 subject to support in the installed Vorflow version.
@@ -134,7 +146,7 @@ group provides themed views of the principal metrics.
 
 EMBEDDED LINE JUNCTION NORMALISATION
 ------------------------------------
-Version 0.18 uses upstream's current conceptual-model controls:
+The plugin uses upstream's current conceptual-model controls:
 
 - Normalise embedded line junctions (enabled by default)
 - Line-junction spacing fraction (default: 0.5)
@@ -147,7 +159,7 @@ lines are excluded, nearby parallel lines stay separate, and polygon-boundary
 anchors stay fixed. QGIS performs no geometry pre-processing for this feature.
 
 The plugin passes line_junction_fraction=0 when normalisation is disabled.
-Vorflow 0.3.0 or newer is required. Older fork-only junction_tolerance and
+The pinned Vorflow develop build is required. Older fork-only junction_tolerance and
 normalize_line_junctions arguments have been replaced. The plugin stops with
 an update instruction if the installed API is incompatible.
 

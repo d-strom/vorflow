@@ -31,13 +31,26 @@ def _plugin_adapters():
     dialog = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                   and node.name == "VorflowDialog")
     methods = [node for node in dialog.body if isinstance(node, ast.FunctionDef)
-               and node.name in {"build_disv_geometry", "_write_text", "write_disv_dataset"}]
+               and node.name in {"build_disv_geometry", "_write_text", "write_disv_dataset",
+                                 "format_elapsed_time"}]
     bridge = ast.ClassDef(name="PluginBridge", bases=[], keywords=[], body=methods,
                          decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[*functions, bridge], type_ignores=[]))
     namespace = {"inspect": inspect, "math": math, "os": os, "csv": csv}
     exec(compile(module, str(PLUGIN), "exec"), namespace)
     return namespace["build_conceptual_mesh"], namespace["PluginBridge"]()
+
+
+@pytest.mark.parametrize(("seconds", "expected"), [
+    (0, "0.0 s"),
+    (59.99, "59.9 s"),
+    (60, "1 min 00.0 s"),
+    (3599.99, "59 min 59.9 s"),
+    (3661.25, "1 h 01 min 01.2 s"),
+])
+def test_elapsed_time_changes_units_without_rounding_into_the_next_minute(seconds, expected):
+    _, bridge = _plugin_adapters()
+    assert bridge.format_elapsed_time(seconds) == expected
 
 
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 0.25])

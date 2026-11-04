@@ -57,4 +57,4 @@ def test_quality_profile_and_new_controls_are_present():
 
 def test_plugin_metadata_version_matches_audit_release():
     metadata = (ROOT / "vorflow_qgis" / "metadata.txt").read_text(encoding="utf-8")
-    assert "version=0.18.0" in metadata
+    assert "version=0.19.0" in metadata

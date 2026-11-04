@@ -14,14 +14,14 @@ import re
 import traceback
 import time
 
-from qgis.PyQt.QtCore import QDateTime, QTimer
+from qgis.PyQt.QtCore import QDateTime, QEventLoop, QThread, QTimer, Qt
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QProgressBar, QScrollArea, QSpinBox, QStackedWidget, QTabWidget,
-    QTextBrowser, QVBoxLayout, QWidget
+    QPushButton, QProgressBar, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
+    QTabWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget
 )
 from qgis.core import (
     QgsCategorizedSymbolRenderer, QgsCoordinateTransform,
@@ -36,6 +36,58 @@ DEFAULT_BACKGROUND_SIZE = 100.0
 RECOMMENDED_GROWTH_FACTOR = 1.1
 RECOMMENDED_GROWTH_MODEL = "continuous_metric"
 RECOMMENDED_FIELD_SAMPLING = 25
+
+
+class _PhaseWorker(QThread):
+    """Run numerical or file work without calling Qt widgets or QGIS objects."""
+
+    def __init__(self, function, args, kwargs):
+        super().__init__()
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+        self.result = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.result = self.function(*self.args, **self.kwargs)
+        except BaseException as exc:
+            self.error = exc
+
+
+def run_phase(function, *args, **kwargs):
+    worker = _PhaseWorker(function, args, kwargs)
+    loop = QEventLoop()
+    worker.finished.connect(loop.quit, Qt.QueuedConnection)
+    worker.start()
+    loop.exec_()
+    worker.wait()
+    if worker.error is not None:
+        raise worker.error
+    return worker.result
+
+
+def background_mesher_class(mesh_class):
+    """Use upstream's Gmsh options without installing a Python signal handler."""
+    import gmsh
+
+    class BackgroundMeshGenerator(mesh_class):
+        def _initialize_gmsh(self):
+            if gmsh.is_initialized():
+                raise RuntimeError("Gmsh is already in use. Close the other Gmsh session and retry.")
+            gmsh.initialize(interruptible=False)
+            try:
+                gmsh.option.setNumber("General.Verbosity", self._verbosity)
+                gmsh.option.setNumber("Geometry.Tolerance", 1e-6)
+                gmsh.option.setNumber("Geometry.OCCBooleanPreserveNumbering", 1)
+                gmsh.model.add("mesh_model")
+            except BaseException:
+                gmsh.finalize()
+                raise
+            self.initialized = True
+
+    return BackgroundMeshGenerator
 
 
 def parse_json(text, title):
@@ -230,18 +282,17 @@ PARAMETER_HELP = {
     ),
     "snap_to_polygons": (
         "Snap to polygons",
-        "Snaps lines to nearby polygon boundaries where supported by vorflow. "
-        "This may improve topology at connections."
+        "Uses boundary vertices from the domain and selected, enabled, embedded "
+        "polygon inputs. Field-only polygons, project-only layers and mesh "
+        "cells are not targets. Within Connectivity tolerance, Vorflow can "
+        "move or insert vertices along the entire line. Enable only for "
+        "intended connections; snapping can create short segments or kinks."
     ),
     "is_barrier": (
         "Barrier",
-        "Treats the line as a barrier in the conceptual model. Use "
-        "for objects across which connectivity or flow should not pass freely."
-    ),
-    "straddle_width": (
-        "Barrier straddle width",
-        "Distance between the paired generators used to align Voronoi faces "
-        "with a line. 0 lets Vorflow choose from the local resolution."
+        "Makes Voronoi cell faces follow the line. Vorflow sets the generator "
+        "positions automatically. The DISV grid does not assign a flow barrier "
+        "package; configure that separately in the groundwater model."
     ),
     "quad_buffer": (
         "Quad corridor",
@@ -359,9 +410,9 @@ PARAMETER_HELP = {
         "Weighted Lloyd iterations",
         "Moves free interior nodes towards size-weighted Voronoi-cell centroids "
         "before the grid is built. Boundary, zone-edge, point and line nodes stay "
-        "fixed. The recommended comparison profile uses 100 passes. Lloyd mainly "
-        "improves appearance and cell regularity; local resolution and smooth grading "
-        "normally matter more for MODFLOW head accuracy."
+        "fixed. Use 20 passes for a quick trial, or 50 for a closer comparison "
+        "with the 100-pass quality profile. Fewer passes can leave less regular "
+        "cells. Lloyd cannot repair short segments or other input topology."
     ),
     "min_face_fraction": (
         "Minimum face fraction",
@@ -487,16 +538,11 @@ class ParameterEditorWidget(QWidget):
                 self._add_control(
                     geometry_form, "snap_to_polygons",
                     "Snap to polygons:",
-                    self._checkbox(defaults.get("snap_to_polygons", True)),
+                    self._checkbox(defaults.get("snap_to_polygons", False)),
                 )
                 self._add_control(
                     geometry_form, "is_barrier", "Treat as barrier:",
                     self._checkbox(defaults.get("is_barrier", False)),
-                )
-                self._add_control(
-                    geometry_form, "straddle_width",
-                    "Barrier straddle width (0 = automatic):",
-                    make_double(defaults.get("straddle_width", 0.0), 0.0),
                 )
             if geometry_kind in ("line", "polygon"):
                 self._add_control(
@@ -511,7 +557,7 @@ class ParameterEditorWidget(QWidget):
                 )
             layout.addWidget(geometry)
 
-        refinement = QGroupBox("Size transition away from geometry")
+        refinement = QGroupBox("Refinement model — size transition away from geometry")
         refinement_form = QFormLayout(refinement)
         self.field_model = QComboBox()
         self.field_model.addItem("Geometric growth (recommended)", "geometric")
@@ -560,7 +606,11 @@ class ParameterEditorWidget(QWidget):
         self.field_sampling_g = self._intspin(
             defaults.get("sampling", RECOMMENDED_FIELD_SAMPLING), 1, 100000
         )
-        gf.addRow("Growth factor:", self.field_growth_factor)
+        self.field_growth_factor.setToolTip(
+            "The only growth factor used by Geometric growth. A layer override "
+            "replaces the inherited refinement model and its values."
+        )
+        gf.addRow("Geometric growth factor:", self.field_growth_factor)
         gf.addRow("Growth model:", self.growth_model)
         gf.addRow("Sampling:", self.field_sampling_g)
         self.field_stack.addWidget(geometric)
@@ -735,7 +785,7 @@ class ParameterEditorWidget(QWidget):
                 }]
         return values
 
-    def summary(self):
+    def summary(self, inherited_refinement=None):
         values = self.values()
         if self.geometry_kind == "domain" and not values.get(
             "refine_domain_boundary", False
@@ -744,19 +794,21 @@ class ParameterEditorWidget(QWidget):
         parts = []
         if "resolution" in values:
             parts.append(f"size {values['resolution']:g}")
-        if values.get("field_model") == "geometric" and "fields" in values:
-            field = values["fields"][0]
+        effective = values if "field_model" in values else (inherited_refinement or {})
+        origin = "Inherited " if effective is not values else ""
+        if effective.get("field_model") == "geometric" and "fields" in effective:
+            field = effective["fields"][0]
             parts.append(
-                f"growth {field['growth_factor']:g} ({field['growth_model']})"
+                f"{origin}growth {field['growth_factor']:g} ({field['growth_model']})"
             )
+        elif effective.get("field_model"):
+            parts.append(origin + str(effective["field_model"]))
         if values.get("is_barrier"):
             parts.append("barrier")
         if values.get("quad_buffer"):
             parts.append(f"quad × {values.get('quad_buffer_thickness', 1)}")
         if values.get("hex_ring"):
             parts.append("hex ring")
-        if values.get("field_model") is not None:
-            parts.append(str(values["field_model"]))
         return ", ".join(parts) if parts else "Inherits all global values"
 
 
@@ -792,6 +844,7 @@ class LayerSourceWidget(QGroupBox):
         self.remove_callback = remove_callback
         self.geometry_kind = geometry_kind
         self.direct_settings = direct_settings
+        self.inherited_refinement = None
         form = QFormLayout(self)
 
         layer_row = QWidget()
@@ -802,6 +855,7 @@ class LayerSourceWidget(QGroupBox):
         self.layer_combo = QgsMapLayerComboBox()
         self.layer_combo.setFilters(geometry_filter)
         self.layer_combo.setAllowEmptyLayer(True)
+        self.layer_combo.setLayer(None)
         browse = QPushButton("Open file…")
         browse.clicked.connect(self.open_file)
         layer_layout.addWidget(self.enabled)
@@ -846,7 +900,13 @@ class LayerSourceWidget(QGroupBox):
 
     def update_summary(self):
         try:
-            self.settings_summary.setText(self.editor.summary())
+            inherited = (
+                self.inherited_refinement()
+                if self.inherited_refinement is not None
+                and not self.editor.field_override.isChecked()
+                else None
+            )
+            self.settings_summary.setText(self.editor.summary(inherited))
         except Exception:
             self.settings_summary.setText("Review settings")
 
@@ -906,6 +966,10 @@ class MultiLayerInputWidget(QWidget):
         self.sources = []
 
         layout = QVBoxLayout(self)
+        self.input_splitter = QSplitter(Qt.Vertical)
+        self.input_splitter.setChildrenCollapsible(False)
+        self.input_splitter.setHandleWidth(8)
+        layout.addWidget(self.input_splitter, 1)
         global_group = QGroupBox(f"Global default parameters – {title}")
         global_layout = QVBoxLayout(global_group)
         global_scroll = QScrollArea()
@@ -914,13 +978,14 @@ class MultiLayerInputWidget(QWidget):
             geometry_kind, defaults=defaults, individual=False
         )
         global_scroll.setWidget(self.global_editor)
-        global_scroll.setMinimumHeight(275)
         global_layout.addWidget(global_scroll)
-        layout.addWidget(global_group)
+        self.input_splitter.addWidget(global_group)
 
+        input_group = QGroupBox(f"{title} input layers")
+        input_layout = QVBoxLayout(input_group)
         add_button = QPushButton(f"Add {title.lower()} layer")
         add_button.clicked.connect(self.add_source)
-        layout.addWidget(add_button)
+        input_layout.addWidget(add_button)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -928,7 +993,15 @@ class MultiLayerInputWidget(QWidget):
         self.container_layout = QVBoxLayout(self.container)
         self.container_layout.addStretch()
         self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, 1)
+        input_layout.addWidget(self.scroll, 1)
+        self.input_splitter.addWidget(input_group)
+        self.input_splitter.setStretchFactor(0, 1)
+        self.input_splitter.setStretchFactor(1, 1)
+        self.input_splitter.setSizes([260, 240])
+        self.input_splitter.handle(1).setToolTip("Drag to resize the input layer list")
+        self.global_editor.field_model.currentIndexChanged.connect(self.update_summaries)
+        self.global_editor.field_growth_factor.valueChanged.connect(self.update_summaries)
+        self.global_editor.growth_model.currentIndexChanged.connect(self.update_summaries)
         self.add_source()
 
     def add_source(self):
@@ -937,10 +1010,16 @@ class MultiLayerInputWidget(QWidget):
             self.remove_source, self.container,
             direct_settings=False, defaults=self.defaults
         )
+        source.inherited_refinement = self.global_editor.values
+        source.update_summary()
         self.sources.append(source)
         self.container_layout.insertWidget(
             self.container_layout.count() - 1, source
         )
+
+    def update_summaries(self):
+        for source in self.sources:
+            source.update_summary()
 
     def remove_source(self, source):
         if source in self.sources:
@@ -984,7 +1063,7 @@ class ParameterHelpDialog(QDialog):
             "resolution", "refine_domain_boundary", "growth_factor", "embed",
             "simplify_tolerance",
             "densify", "densify_spacing", "snap_to_polygons", "is_barrier",
-            "straddle_width", "quad_buffer",
+            "quad_buffer",
             "quad_buffer_thickness", "z_order", "field_model", "size_min",
             "size_max", "dist_min", "dist_max", "decay_length", "sampling",
             "growth_model", "mesh_algorithm", "optimization_cycles",
@@ -1285,8 +1364,11 @@ class VorflowDialog(QDialog):
         self.last_prefix = None
         self.diagnostic_lines = []
         self.run_started = None
+        self.operation_active = False
+        self._last_input_refresh = 0.0
         self.run_timer = QTimer(self)
-        self.run_timer.setInterval(250)
+        self.run_timer.setInterval(100)
+        self.run_timer.setTimerType(Qt.PreciseTimer)
         self.run_timer.timeout.connect(self.update_elapsed_timer)
 
         main = QVBoxLayout(self)
@@ -1309,7 +1391,11 @@ class VorflowDialog(QDialog):
 
         tabs = QTabWidget()
         self.tabs = tabs
-        main.addWidget(tabs, 1)
+        self.workspace_splitter = QSplitter(Qt.Vertical)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(8)
+        self.workspace_splitter.addWidget(tabs)
+        main.addWidget(self.workspace_splitter, 1)
 
         geometry_tabs = QTabWidget()
         domain_tab = QWidget()
@@ -1356,7 +1442,7 @@ class VorflowDialog(QDialog):
             "Line", QgsMapLayerProxyModel.LineLayer, "line",
             {
                 "resolution": 10.0, "background_size": DEFAULT_BACKGROUND_SIZE,
-                "snap_to_polygons": True, "is_barrier": False,
+                "snap_to_polygons": False, "is_barrier": False,
                 "densify": True, "simplify_tolerance": 0.0,
                 "embed": True, "quad_buffer": False,
                 "quad_buffer_thickness": 1, "z_order": 0,
@@ -1426,6 +1512,12 @@ class VorflowDialog(QDialog):
             self.line_junction_fraction.setEnabled
         )
         conceptual_form.addRow("Line-junction spacing fraction:", self.line_junction_fraction)
+        self.check_inputs = QCheckBox("Check input geometry before meshing")
+        self.check_inputs.setToolTip(
+            "Report short segments, close vertices, near misses, slivers and narrow "
+            "gaps in Run diagnostics. Adds a check before Gmsh without changing the mesh."
+        )
+        conceptual_form.addRow(self.check_inputs)
 
         mesh_group = QGroupBox("Gmsh / MeshGenerator")
         mesh_form = QFormLayout(mesh_group)
@@ -1579,7 +1671,7 @@ class VorflowDialog(QDialog):
         ):
             self.use_lloyd.toggled.connect(option.setEnabled)
         tess_form.addRow(self.use_lloyd)
-        tess_form.addRow("Lloyd iterations:", self.lloyd_iterations)
+        tess_form.addRow("Maximum Lloyd passes:", self.lloyd_iterations)
         tess_form.addRow("Lloyd damping:", self.lloyd_damping)
         tess_form.addRow("Lloyd stopping tolerance:", self.lloyd_tolerance)
         tess_form.addRow("Lloyd size-smoothing passes:", self.lloyd_size_smoothing)
@@ -1716,17 +1808,30 @@ class VorflowDialog(QDialog):
         mf6_layout.addStretch()
         tabs.addTab(mf6_tab, "MODFLOW 6 / DISV")
 
-        diagnostics_group = QGroupBox("Run diagnostics")
-        diagnostics_layout = QVBoxLayout(diagnostics_group)
+        self.diagnostics_panel = QWidget()
+        diagnostics_layout = QVBoxLayout(self.diagnostics_panel)
+        diagnostics_layout.setContentsMargins(0, 0, 0, 0)
+        self.diagnostics_toggle = QToolButton()
+        self.diagnostics_toggle.setText("Run diagnostics")
+        self.diagnostics_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.diagnostics_toggle.setCheckable(True)
+        self.diagnostics_toggle.setToolTip("Show or hide run diagnostics")
+        diagnostics_layout.addWidget(self.diagnostics_toggle, alignment=Qt.AlignLeft)
         self.diagnostics = QTextBrowser()
         self.diagnostics.setReadOnly(True)
-        self.diagnostics.setMinimumHeight(110)
+        self.diagnostics.setMinimumHeight(80)
         self.diagnostics.setPlaceholderText(
             "The installed Vorflow API, hex-ring diagnostics and Lloyd report "
             "will be shown here after you start a run."
         )
         diagnostics_layout.addWidget(self.diagnostics)
-        main.addWidget(diagnostics_group)
+        self.workspace_splitter.addWidget(self.diagnostics_panel)
+        self.workspace_splitter.setStretchFactor(0, 1)
+        self.workspace_splitter.setStretchFactor(1, 0)
+        self.workspace_splitter.handle(1).setToolTip("Drag to resize run diagnostics")
+        self._diagnostics_height = 175
+        self.diagnostics_toggle.toggled.connect(self.set_diagnostics_visible)
+        self.set_diagnostics_visible(False)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1739,9 +1844,9 @@ class VorflowDialog(QDialog):
         )
         main.addWidget(self.progress)
 
-        self.elapsed_time_label = QLabel("Total time: 00:00:00.0")
+        self.elapsed_time_label = QLabel("Total time: 0.0 s")
         self.elapsed_time_label.setToolTip(
-            "Total elapsed time from clicking Generate mesh until completion or failure."
+            "Total elapsed time of the current mesh run or DISV export."
         )
         main.addWidget(self.elapsed_time_label)
 
@@ -1758,6 +1863,7 @@ class VorflowDialog(QDialog):
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         self.generate_button = buttons.button(QDialogButtonBox.Ok)
+        self.close_button = buttons.button(QDialogButtonBox.Cancel)
         self.generate_button.setText("Generate mesh")
         buttons.accepted.connect(self.run_model)
         buttons.rejected.connect(self.reject)
@@ -1768,6 +1874,41 @@ class VorflowDialog(QDialog):
 
     def show_parameter_help(self):
         ParameterHelpDialog(self).exec_()
+
+    def reject(self):
+        if not self.operation_active:
+            super().reject()
+
+    def closeEvent(self, event):
+        if self.operation_active:
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
+    def set_operation_active(self, active):
+        self.operation_active = active
+        self.tabs.setEnabled(not active)
+        self.generate_button.setEnabled(not active)
+        self.close_button.setEnabled(not active)
+
+    def set_diagnostics_visible(self, visible):
+        if not visible and not self.diagnostics.isHidden() and self.isVisible():
+            self._diagnostics_height = self.diagnostics_panel.height()
+        self.diagnostics.setVisible(visible)
+        self.diagnostics_toggle.setArrowType(Qt.DownArrow if visible else Qt.RightArrow)
+        self.workspace_splitter.handle(1).setEnabled(visible)
+        self.diagnostics_panel.setMaximumHeight(
+            16777215 if visible else self.diagnostics_toggle.sizeHint().height()
+        )
+        if visible:
+            self.workspace_splitter.setSizes([
+                max(1, self.workspace_splitter.height() - self._diagnostics_height),
+                self._diagnostics_height,
+            ])
+        else:
+            self.workspace_splitter.setSizes([
+                self.workspace_splitter.height(), self.diagnostics_toggle.sizeHint().height()
+            ])
 
     def select_output(self):
         directory = QFileDialog.getExistingDirectory(
@@ -1782,7 +1923,7 @@ class VorflowDialog(QDialog):
         if len(self.diagnostic_lines) > 80:
             self.diagnostic_lines = self.diagnostic_lines[-80:]
         if hasattr(self, "diagnostics"):
-            self.diagnostics.setPlainText("\\n".join(self.diagnostic_lines))
+            self.diagnostics.setPlainText("\n".join(self.diagnostic_lines))
             scrollbar = self.diagnostics.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
         try:
@@ -1797,18 +1938,20 @@ class VorflowDialog(QDialog):
 
     @staticmethod
     def format_elapsed_time(seconds):
-        """Format elapsed seconds as HH:MM:SS.t."""
-        seconds = max(0.0, float(seconds))
-        total_seconds = int(seconds)
+        """Show seconds, minutes/seconds or hours/minutes/seconds as needed."""
+        total_seconds, tenths = divmod(int(max(0.0, float(seconds)) * 10), 10)
         hours, remainder = divmod(total_seconds, 3600)
         minutes, whole_seconds = divmod(remainder, 60)
-        tenths = int((seconds - total_seconds) * 10)
-        return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}.{tenths}"
+        if hours:
+            return f"{hours} h {minutes:02d} min {whole_seconds:02d}.{tenths} s"
+        if minutes:
+            return f"{minutes} min {whole_seconds:02d}.{tenths} s"
+        return f"{whole_seconds}.{tenths} s"
 
     def start_run_timer(self, started=None):
         """Start the total timer when Generate mesh is clicked."""
         self.run_started = started if started is not None else time.perf_counter()
-        self.elapsed_time_label.setText("Total time: 00:00:00.0")
+        self.elapsed_time_label.setText("Total time: 0.0 s")
         self.run_timer.start()
         QApplication.processEvents()
 
@@ -1865,6 +2008,14 @@ class VorflowDialog(QDialog):
             )
         return crs
 
+    def refresh_during_input_read(self):
+        # Layer features must be read on the QGIS thread. Let the timer and
+        # paints run between features without allowing edits to the input list.
+        now = time.perf_counter()
+        if self.operation_active and now - self._last_input_refresh >= 0.05:
+            self._last_input_refresh = now
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
     def add_domain(self, blueprint, background_lc):
         from shapely.ops import unary_union
         source = self.domain_source
@@ -1874,13 +2025,14 @@ class VorflowDialog(QDialog):
 
         geometries = []
         for feature in layer.getFeatures():
+            self.refresh_during_input_read()
             geometry = transformed_geometry(feature, layer)
             if geometry is not None and not geometry.is_empty:
                 geometries.append(geometry)
         if not geometries:
             raise ValueError("The model domain contains no valid geometry.")
 
-        domain_geometry = unary_union(geometries)
+        domain_geometry = run_phase(unary_union, geometries)
         kwargs = source.merged_parameters({})
         zone_id = kwargs.pop("zone_id", "domain")
         refine_boundary = bool(kwargs.pop("refine_domain_boundary", False))
@@ -1935,6 +2087,7 @@ class VorflowDialog(QDialog):
         boundary_kwargs = dict(kwargs)
         boundary_kwargs["embed"] = False
         boundary_kwargs["z_order"] = -1000
+        boundary_kwargs["snap_to_polygons"] = False
         call_supported(
             blueprint.add_line, domain_geometry.boundary,
             line_id=f"{zone_id}::boundary", **boundary_kwargs
@@ -1945,6 +2098,7 @@ class VorflowDialog(QDialog):
         for source, layer, base_kwargs in manager.active_sources():
             id_field = source.selected_id_field()
             for feature in layer.getFeatures():
+                self.refresh_during_input_read()
                 geometry = transformed_geometry(feature, layer)
                 if geometry is None or geometry.is_empty:
                     continue
@@ -1964,6 +2118,26 @@ class VorflowDialog(QDialog):
                         "version containing Rui's point-centring change (#32)."
                     )
                 call_supported(method, geometry, **kwargs)
+
+    def report_input_checks(self, blueprint, background_lc):
+        issues = run_phase(blueprint.check, background_lc=background_lc)
+        counts = issues["severity"].value_counts()
+        self.add_diagnostic(
+            f"Input geometry check: {counts.get('error', 0)} error site(s), "
+            f"{counts.get('warning', 0)} warning site(s)."
+        )
+        for row in issues.head(12).itertuples(index=False):
+            other = (
+                f" near {row.other_type} {row.other_id}"
+                if row.other_type in {"line", "point", "polygon"} else ""
+            )
+            self.add_diagnostic(
+                f"{row.severity}: {row.site_kinds}; {row.feature_type} "
+                f"{row.feature_id}{other} at ({row.x:.3f}, {row.y:.3f}); "
+                f"distance {row.distance:g}, local size {row.h:g}."
+            )
+        if len(issues) > 12:
+            self.add_diagnostic(f"Showing the first 12 of {len(issues)} input sites.")
 
     def export_gdf(self, gdf, path):
         if gdf is None or gdf.empty:
@@ -2308,6 +2482,9 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
         )
 
     def generate_disv_dataset(self):
+        if self.operation_active:
+            return
+        started = None
         try:
             if self.last_voronoi_grid is None:
                 raise ValueError(
@@ -2334,12 +2511,17 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             if os.path.abspath(directory) == os.path.abspath(default_parent):
                 directory = default_directory
 
+            started = time.perf_counter()
+            self.set_operation_active(True)
+            self.start_run_timer(started)
             self.set_status("Validating Voronoi cells and building DISV topology…")
-            vertices, cell2d, cell_rows = self.build_disv_geometry(
-                self.last_voronoi_grid, self.mf6_vertex_tolerance.value()
+            vertices, cell2d, cell_rows = run_phase(
+                self.build_disv_geometry, self.last_voronoi_grid,
+                self.mf6_vertex_tolerance.value()
             )
             self.set_status("Writing MODFLOW 6 files…")
-            self.write_disv_dataset(
+            run_phase(
+                self.write_disv_dataset,
                 directory=directory,
                 model_name=model_name,
                 vertices=vertices,
@@ -2351,9 +2533,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 start_head=self.mf6_start_head.value(),
                 hk=self.mf6_hk.value(),
                 length_units=self.mf6_length_units.currentData(),
-                crs_authid=QgsProject.instance().crs().authid(),
+                crs_authid=self.last_voronoi_grid.crs.to_string(),
             )
-            self.set_status("DISV export completed.")
+            elapsed = time.perf_counter() - started
+            self.stop_run_timer(elapsed)
+            self.set_status(f"DISV export completed in {self.format_elapsed_time(elapsed)}.")
             QMessageBox.information(
                 self, "MODFLOW 6 / DISV",
                 "The DISV dataset has been created. Import mfsim.nam into a "
@@ -2364,13 +2548,25 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             )
         except Exception as exc:
             traceback.print_exc()
-            self.set_status("DISV export failed.")
+            if started is not None:
+                elapsed = time.perf_counter() - started
+                self.stop_run_timer(elapsed)
+                self.set_status(f"DISV export failed after {self.format_elapsed_time(elapsed)}.")
+            else:
+                self.set_status("DISV export failed.")
             QMessageBox.critical(self, "MODFLOW 6 / DISV – Error", str(exc))
+        finally:
+            if started is not None:
+                if self.run_timer.isActive():
+                    self.stop_run_timer()
+                self.set_operation_active(False)
 
     def run_model(self):
+        if self.operation_active:
+            return
         started = time.perf_counter()
+        self.set_operation_active(True)
         self.start_run_timer(started)
-        self.generate_button.setEnabled(False)
         self.diagnostic_lines = []
         self.diagnostics.clear()
         self.set_progress(2, "Checking Vorflow installation…")
@@ -2388,6 +2584,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     "See README_installation.txt in the ZIP package."
                 ) from exc
 
+            if not callable(getattr(ConceptualMesh, "check", None)):
+                raise RuntimeError(
+                    "This plugin needs the Vorflow develop build listed in "
+                    "README_installation.txt. Update Vorflow and restart QGIS."
+                )
             crs = self.validate_crs()
             output_dir = self.output_directory.text().strip()
             if not output_dir:
@@ -2419,8 +2620,12 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 blueprint, self.points, "add_point", "point_id", "point"
             )
 
+            if self.check_inputs.isChecked():
+                self.diagnostics_toggle.setChecked(True)
+                self.set_progress(None, "Checking input geometry…", busy=True)
+                self.report_input_checks(blueprint, background_lc)
             self.set_progress(None, "Cleaning and connecting geometries…", busy=True)
-            clean_polygons, clean_lines, clean_points = blueprint.generate()
+            clean_polygons, clean_lines, clean_points = run_phase(blueprint.generate)
             junction_report = getattr(blueprint, "junction_diagnostics", None)
             if junction_report is not None:
                 self.add_diagnostic(
@@ -2510,7 +2715,7 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                     "constructor; checking generate()."
                 )
 
-            mesher = call_supported(MeshGenerator, **constructor_kwargs)
+            mesher = call_supported(background_mesher_class(MeshGenerator), **constructor_kwargs)
             generate_signature, generate_parameters, generate_kwargs = (
                 _callable_parameter_info(mesher.generate)
             )
@@ -2566,8 +2771,8 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 f"(Laplacian smoothing: {status_smoothing})…",
                 busy=True,
             )
-            mesher.generate(
-                clean_polygons, clean_lines, clean_points, **generate_options
+            run_phase(
+                mesher.generate, clean_polygons, clean_lines, clean_points, **generate_options
             )
             self.set_progress(55, "Gmsh mesh generation completed.")
 
@@ -2586,6 +2791,12 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 self.add_diagnostic(
                     "The installed Vorflow does not expose mesher.diagnostics."
                 )
+            barrier_report = getattr(mesher, "barrier_report", None)
+            if barrier_report:
+                counts = ", ".join(f"{key}: {len(value)}" for key, value in barrier_report.items()
+                                   if isinstance(value, list) and value)
+                if counts:
+                    self.add_diagnostic("Barrier geometry adjustments: " + counts + ".")
 
             exported = []
             quality_path = None
@@ -2599,13 +2810,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
 
             for suffix, selection in requests:
                 self.set_progress(62, f"Exporting {suffix}…")
-                grid = (
-                    mesher.get_element_grid()
-                    if selection is None
-                    else mesher.get_element_grid(selection)
+                grid = run_phase(
+                    mesher.get_element_grid, *(() if selection is None else (selection,))
                 )
                 path = os.path.join(output_dir, f"{prefix}_{suffix}.gpkg")
-                if self.export_gdf(grid, path):
+                if run_phase(self.export_gdf, grid, path):
                     exported.append((path, f"Vorflow {suffix}", suffix))
 
             # The Voronoi grid is now the authoritative quality grid. Generate it
@@ -2714,7 +2923,7 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
                 tessellator = call_supported(
                     VoronoiTessellator, mesher, blueprint, **tess_kwargs
                 )
-                voronoi_grid = tessellator.generate()
+                voronoi_grid = run_phase(tessellator.generate)
                 lloyd_report = getattr(tessellator, "lloyd_report", None)
                 if lloyd_report is not None:
                     self.add_diagnostic("Lloyd report: " + repr(lloyd_report))
@@ -2748,15 +2957,15 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
 
                 if self.export_voronoi.isChecked():
                     path = os.path.join(output_dir, f"{prefix}_voronoi.gpkg")
-                    if self.export_gdf(voronoi_grid, path):
+                    if run_phase(self.export_gdf, voronoi_grid, path):
                         exported.append((path, "Vorflow Voronoi", "voronoi"))
                     self.last_voronoi_path = path
 
                 if self.export_quality.isChecked():
                     self.set_progress(86, "Calculating Voronoi-cell quality metrics…")
-                    quality_grid = build_voronoi_quality_grid(voronoi_grid)
+                    quality_grid = run_phase(build_voronoi_quality_grid, voronoi_grid)
                     quality_path = os.path.join(output_dir, f"{prefix}_quality.gpkg")
-                    if self.export_gdf(quality_grid, quality_path):
+                    if run_phase(self.export_gdf, quality_grid, quality_path):
                         exported.append((
                             quality_path, "Vorflow Voronoi quality", "quality"
                         ))
@@ -2770,10 +2979,11 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
 
             elapsed = time.perf_counter() - started
             self.stop_run_timer(elapsed)
-            self.set_progress(100, f"Done in {elapsed:.1f} seconds.")
+            duration = self.format_elapsed_time(elapsed)
+            self.set_progress(100, f"Done in {duration}.")
             QMessageBox.information(
                 self, "Vorflow",
-                f"Mesh generation completed in {elapsed:.1f} seconds.\n\n"
+                f"Mesh generation completed in {duration}.\n\n"
                 "The quality group uses red for low/invalid quality "
                 "and green for high quality.\n\n"
                 + "\n".join(path for path, _, _ in exported)
@@ -2786,12 +2996,12 @@ For multiple layers, layer boundaries are evenly distributed between TOP and the
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             self.progress.setFormat("Failed")
-            self.set_status(f"Processing failed after {elapsed:.1f} seconds.")
+            self.set_status(f"Processing failed after {self.format_elapsed_time(elapsed)}.")
             QMessageBox.critical(self, "Vorflow – Error", str(exc))
         finally:
             if self.run_timer.isActive():
                 self.stop_run_timer()
-            self.generate_button.setEnabled(True)
+            self.set_operation_active(False)
 
 
 class VorflowPlugin:
@@ -2816,7 +3026,8 @@ class VorflowPlugin:
             self.action.deleteLater()
 
     def show_dialog(self):
-        self.dialog = VorflowDialog(self.iface.mainWindow())
+        if self.dialog is None:
+            self.dialog = VorflowDialog(self.iface.mainWindow())
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()

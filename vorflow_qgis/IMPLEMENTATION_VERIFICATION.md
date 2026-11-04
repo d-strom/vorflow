@@ -1,8 +1,8 @@
-# Implementation verification - Vorflow QGIS 0.18
+# Implementation verification - Vorflow QGIS 0.19
 
-Source baseline: upstream `rhugman/vorflow@develop` at `27712b2`, integrated
+Source baseline: upstream `rhugman/vorflow@develop` at `63d1f6e`, integrated
 on `d-strom/vorflow@dev`. The core source tree is unchanged from upstream.
-See `UPSTREAM_SYNC.md` for the complete feature assessment.
+See `MESHING_REVIEW.md` for the snapping and Lloyd assessment.
 
 ## Upstream API mapping
 
@@ -24,7 +24,8 @@ See `UPSTREAM_SYNC.md` for the complete feature assessment.
 | `MeshGenerator(heal_shapes=..., heal_tolerance=..., heal_fix_*=...)` | Exposed as an opt-in recovery tool; disabled by default. |
 | `VoronoiTessellator(boundary_centering="inset_mirror", ...)` | Exposed with quality defaults 0.25 inset and 135-degree corner threshold. |
 | `lloyd_damping`, `lloyd_tolerance`, `lloyd_size_smoothing` | Exposed and forwarded with defaults 1.0, 0.001 and 5. |
-| `add_line(..., straddle_width=...)` | Exposed; 0 is converted to `None` for Vorflow automatic sizing. |
+| `add_line(..., is_barrier=True)` | Uses exact upstream barrier faces and automatic generator placement. |
+| `ConceptualMesh.check()` | Optional input diagnostics with feature IDs, coordinates and local target size. |
 | Numeric `densify` | A positive spacing is forwarded as float; 0 uses resolution through `densify=True`. |
 | Reject unsupported short-face clean-up | Explicit signature check and actionable error. |
 | `mesher.diagnostics["hex_rings"]` | Displayed in Run diagnostics after meshing. |
@@ -33,7 +34,7 @@ See `UPSTREAM_SYNC.md` for the complete feature assessment.
 | `grid["lloyd_shift"]` | Not removed or transformed; preserved when the upstream GeoDataFrame is exported to GeoPackage. |
 | Gmsh smoothing distinction | UI and diagnostics now call it Laplacian Gmsh smoothing, not Lloyd. |
 | Progress | Phase-based progress bar; Gmsh and Lloyd phases use indeterminate mode because no granular callback is available. |
-| Total timer | Starts on Generate mesh and retains the final duration on completion or failure. |
+| Total timer | Qt keeps the elapsed counter live during worker phases. Completion and error status use the same time format. |
 
 ## Important boundary
 

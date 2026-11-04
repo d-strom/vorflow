@@ -30,7 +30,8 @@ possible.
 | Boundary-cell centring | `inset_mirror` | Improves typical boundary-connection orthogonality compared with clipping boundary generators in place. |
 | Boundary inset fraction | 0.25 | Inside Vorflow's tested 0.2–0.3 range. |
 | Sharp-corner angle | 135 degrees | Keeps sharp corners fixed while centring smoother boundary sections. |
-| Weighted Lloyd | Enabled, 100 passes | Improves visual and centroidal regularity; it remains secondary to resolution and grading. |
+| Snap to polygons | Disabled | Opt in for intended connections. Snapping can create short line segments. |
+| Weighted Lloyd | Enabled, 100 passes | Retains the quality profile; use 20 for previews or 50 for an intermediate check. |
 | Lloyd damping | 1.0 | Vorflow's tested full-shift default. |
 | Lloyd stopping tolerance | 0.001 | Vorflow default; graded meshes usually run the requested number of passes. |
 | Lloyd size smoothing | 5 passes | Removes Gmsh node-size jitter without noticeably flattening intended grading. |
@@ -65,7 +66,8 @@ the mesh extent invalid.
 ## Newly exposed useful controls
 
 - Numeric densification spacing, independent of local cell resolution.
-- Explicit barrier straddle width, with 0 retaining Vorflow's automatic width.
+- Automatic barrier-face alignment in upstream; the old numeric straddle
+  width no longer controls geometry and is no longer exposed.
 - Gmsh algorithm, post-mesh optimisation cycles and initial insertion tolerance.
 - Optional OCC healing with its tolerance and three repair switches.
 - Boundary centring mode, inset fraction and corner threshold.

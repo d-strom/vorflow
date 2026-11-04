@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.19.0
+
+- Merged upstream `develop` through `63d1f6e`, including exact barrier faces,
+  input checks, faster point embedding and boundary fixes. Removed the
+  numeric straddle-width control because it no longer controls the offset.
+- Polygon snapping is opt-in. Added upstream input geometry checks with
+  locations in Run diagnostics. Input layer selectors start empty.
+- Resize the layer lists and diagnostics with drag handles. Diagnostics start
+  collapsed and retain their contents when hidden.
+- Layer summaries show the effective inherited or overridden refinement
+  model. Geometric growth uses one growth factor.
+- The elapsed clock updates during Gmsh, Lloyd, quality calculation and
+  export, using seconds, min/s or h/min/s as appropriate.
+- Keep the 100-pass quality profile; use 20 Lloyd passes for a fast trial.
+  See `MESHING_REVIEW.md` for measured tradeoffs.
+
 ## 0.18.0
 
 - Merged all upstream `develop` changes through `27712b2` (20 October 2026),
